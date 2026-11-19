@@ -31,6 +31,33 @@ pub enum PlatformError {
     /// This crate provides no capture backend for the current platform.
     #[error("screen capture is not supported on this platform")]
     Unsupported,
+    /// The capture backend could not initialize or deliver a frame.
+    #[error("screen capture failed")]
+    Failed(#[source] CaptureFailure),
+}
+
+/// Failure reported by the platform capture backend.
+///
+/// Only the platform error code is kept, so callers can classify the failure
+/// without this crate exposing platform types in its public surface.
+#[derive(Debug, Error)]
+#[error("capture failed with platform error 0x{code:X}")]
+pub struct CaptureFailure {
+    code: i32,
+}
+
+impl CaptureFailure {
+    /// Creates a failure from a platform error code.
+    #[must_use]
+    pub const fn new(code: i32) -> Self {
+        Self { code }
+    }
+
+    /// Returns the platform error code.
+    #[must_use]
+    pub const fn code(&self) -> i32 {
+        self.code
+    }
 }
 
 /// Why the H.264 encoder could not run.

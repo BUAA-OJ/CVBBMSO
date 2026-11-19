@@ -14,11 +14,13 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+mod capture;
+mod container;
 mod error;
 mod event;
 mod recorder;
 mod store;
 
-pub use error::{EncoderError, MergeError, PlatformError, RecordingError};
+pub use error::{CaptureFailure, EncoderError, MergeError, PlatformError, RecordingError};
 pub use event::RecorderEvent;
 pub use recorder::Recorder;
