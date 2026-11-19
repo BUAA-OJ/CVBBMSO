@@ -77,7 +77,7 @@ pub enum ServerMessage {
     },
     /// Start or end command.
     Command {
-        /// Stable command identity; identical across resends.
+        /// Unique command identity; every command gets a fresh id.
         command_id: Uuid,
         /// Command name.
         name: CommandName,
@@ -85,10 +85,10 @@ pub enum ServerMessage {
         #[serde(with = "crate::utc::rfc3339")]
         effective_at: OffsetDateTime,
     },
-    /// Highest contiguous persisted event sequence.
-    Ack {
-        /// Highest contiguous event sequence the server has persisted.
-        ack_event_through: u64,
+    /// Confirms that a `command_result` was processed.
+    CommandAck {
+        /// Command whose result was processed.
+        command_id: Uuid,
     },
     /// Protocol or authorization error.
     Error {

@@ -23,7 +23,7 @@ pub enum ProtocolError {
     /// A segment index is zero; indices start at one.
     #[error("segment index must start at 1")]
     InvalidSegmentIndex,
-    /// A manifest is not ordered by strictly increasing segment index.
-    #[error("segments must be ordered by strictly increasing index")]
+    /// A manifest is empty or its segment indices are not contiguous from one.
+    #[error("segments must be non-empty with contiguous indices starting at 1")]
     InvalidSegmentOrder,
 }

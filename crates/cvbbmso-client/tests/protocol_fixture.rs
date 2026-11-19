@@ -31,8 +31,8 @@ use axum::{
 use cvbbmso_accoding::AccodingCookies;
 use cvbbmso_protocol::{
     AccodingUser, ClientHello, ClientMessage, ClientState, ExamListResponse, ExamPhase,
-    ExamSummary, ExecutionState, NetworkState, Platform, RecordingPolicy, RecordingState,
-    ServerMessage, error_code,
+    ExamSummary, ExecutionState, Platform, RecordingPolicy, RecordingState, ServerMessage,
+    error_code,
 };
 use futures_util::{SinkExt, StreamExt, stream};
 use reqwest::Client;
@@ -279,7 +279,6 @@ async fn websocket_checks_identity_and_answers_hello_with_sync() {
         state: ClientState {
             execution: ExecutionState::Ready,
             recording: RecordingState::Idle,
-            network: NetworkState::Clear,
         },
     });
     ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))

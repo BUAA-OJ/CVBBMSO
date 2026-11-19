@@ -26,8 +26,6 @@ pub enum ExecutionState {
     Finalizing,
     /// The recording summary has been acknowledged.
     Finished,
-    /// The runtime cannot continue until it recovers.
-    Error,
 }
 
 /// Stage of the local recorder.
@@ -47,28 +45,16 @@ pub enum RecordingState {
     Failed,
 }
 
-/// Result of the client network inspection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum NetworkState {
-    /// No proxy was detected and the server is reachable.
-    Clear,
-    /// A system proxy, PAC, or proxy environment variable was detected.
-    ProxyDetected,
-    /// The server could not be reached.
-    Unreachable,
-    /// The inspection could not complete.
-    Unknown,
-}
-
 /// Snapshot of the client runtime.
+///
+/// Only the documented `execution` / `recording` pairs are valid:
+/// `ready/idle`, `recording/capturing`, `recording/failed`,
+/// `finalizing/finalizing`, `finalizing/complete`, `finalizing/failed`,
+/// `finished/complete`, and `finished/failed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientState {
     /// Exam runtime stage.
     pub execution: ExecutionState,
     /// Recorder stage.
     pub recording: RecordingState,
-    /// Latest network inspection result.
-    pub network: NetworkState,
 }
