@@ -47,6 +47,7 @@ url = "2.5"
 uuid = { version = "1.11", default-features = false, features = ["serde"] }
 webview2-com = "0.38"
 windows-core = "0.61"
+windows-sys = "0.61"
 wiremock = "0.6"
 
 [workspace.lints.rust]

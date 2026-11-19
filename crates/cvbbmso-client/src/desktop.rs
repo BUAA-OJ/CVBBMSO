@@ -13,8 +13,10 @@ use tauri::{
 use url::Url;
 
 use crate::{
+    host_probe,
     monitor::{Monitor, MonitorError},
     policy::{IDENTITY_URL, LOGIN_URL, permits, server_origin},
+    preflight::{Preflight, Verdict},
 };
 
 #[cfg_attr(target_os = "macos", path = "desktop/macos.rs")]
@@ -70,8 +72,17 @@ impl Desktop {
 pub fn run() -> tauri::Result<()> {
     #[cfg(test)]
     {
-        if std::env::args_os().any(|arg| arg == "--native-smoke") {
-            return smoke::run();
+        match std::env::args().nth(1).as_deref() {
+            Some("--native-smoke") => return smoke::run(false),
+            Some("--native-smoke-detected") => return smoke::run(true),
+            Some("--native-vm-probe") => {
+                let verdict = async_runtime::block_on(host_probe::detect());
+                println!(
+                    "{}",
+                    serde_json::to_string(&verdict).map_err(io::Error::other)?
+                );
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -79,7 +90,6 @@ pub fn run() -> tauri::Result<()> {
     builder()
         .setup(|app| {
             let data_dir = app.path().app_local_data_dir()?;
-            std::fs::create_dir_all(&data_dir)?;
             app.manage(Desktop::deployed(
                 data_dir,
                 option_env!("CVBBMSO_SERVER_ORIGIN"),
@@ -93,6 +103,7 @@ pub fn run() -> tauri::Result<()> {
 fn builder() -> tauri::Builder<Wry> {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
+            vm_preflight,
             open_accoding,
             inspect_session,
             list_exams
@@ -113,6 +124,8 @@ fn builder() -> tauri::Builder<Wry> {
 }
 
 fn build_ui(app: &AppHandle) -> tauri::Result<WebviewWindow> {
+    app.manage(Preflight::new());
+    schedule_preflight(app, false);
     WebviewWindowBuilder::new(app, UI, WebviewUrl::App("index.html".into()))
         .title("CVBBMSO")
         .inner_size(560.0, 540.0)
@@ -133,9 +146,39 @@ fn build_ui(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .build()
 }
 
+fn schedule_preflight(app: &AppHandle, retry: bool) {
+    let probe = {
+        #[cfg(test)]
+        let app = app.clone();
+        async move {
+            #[cfg(test)]
+            if let Some(probe) = app.try_state::<smoke::FakeProbe>() {
+                return probe.next();
+            }
+            host_probe::detect().await
+        }
+    };
+    if let Some(work) = app.state::<Preflight>().schedule(retry, probe) {
+        async_runtime::spawn(work);
+    }
+}
+
+#[tauri::command]
+async fn vm_preflight(app: AppHandle, retry: bool) -> Verdict {
+    if retry {
+        schedule_preflight(&app, true);
+    }
+    app.state::<Preflight>().verdict().await
+}
+
+const PREFLIGHT_BLOCKED: &str = "设备检查通过后才能继续。";
+
 #[tauri::command]
 async fn open_accoding(app: AppHandle) -> Result<(), &'static str> {
     const ERROR: &str = "无法打开 Accoding 窗口。";
+    if !app.state::<Preflight>().is_admitted() {
+        return Err(PREFLIGHT_BLOCKED);
+    }
     async_runtime::spawn_blocking(move || open_browser(&app, &app.state::<Desktop>()))
         .await
         .map_err(|_| ERROR)?
@@ -148,6 +191,7 @@ fn open_browser(app: &AppHandle, desktop: &Desktop) -> tauri::Result<()> {
         return existing.set_focus();
     }
 
+    std::fs::create_dir_all(&desktop.data_dir)?;
     let origin = desktop.login.origin();
     let popup_origin = origin.clone();
     let popup_app = app.clone();
@@ -233,6 +277,9 @@ async fn current_cookies(app: &AppHandle) -> Result<AccodingCookies, ReadSession
 
 #[tauri::command]
 async fn inspect_session(app: AppHandle) -> Result<(), &'static str> {
+    if !app.state::<Preflight>().is_admitted() {
+        return Err(PREFLIGHT_BLOCKED);
+    }
     let observation = match current_cookies(&app).await {
         Ok(_) => SessionObservation::CookieAvailable,
         Err(ReadSessionError::Invalid(AccodingError::MissingSession)) => {
@@ -249,6 +296,7 @@ async fn inspect_session(app: AppHandle) -> Result<(), &'static str> {
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ListExamsError {
+    PreflightBlocked,
     SignInRequired,
     SessionUnreadable,
     MonitorUnconfigured,
@@ -274,6 +322,9 @@ impl From<&MonitorError> for ListExamsError {
 
 #[tauri::command]
 async fn list_exams(app: AppHandle) -> Result<Vec<ExamSummary>, ListExamsError> {
+    if !app.state::<Preflight>().is_admitted() {
+        return Err(ListExamsError::PreflightBlocked);
+    }
     let desktop = app.state::<Desktop>();
     let monitor = desktop.monitor.as_ref().map_err(ListExamsError::from)?;
     let cookies = current_cookies(&app).await.map_err(|error| match error {

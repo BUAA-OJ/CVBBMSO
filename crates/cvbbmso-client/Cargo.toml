@@ -21,6 +21,7 @@ serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "process", "sync", "time"] }
 url.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -31,6 +32,7 @@ objc2-web-kit.workspace = true
 [target.'cfg(windows)'.dependencies]
 webview2-com.workspace = true
 windows-core.workspace = true
+windows-sys = { workspace = true, features = ["Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [target.'cfg(any(target_os = "macos", windows))'.build-dependencies]
 tauri-build.workspace = true
@@ -43,11 +45,12 @@ futures-util.workspace = true
 rcgen.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 rustls.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "sync", "test-util", "time"] }
 tokio-rustls.workspace = true
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"] }
 url.workspace = true

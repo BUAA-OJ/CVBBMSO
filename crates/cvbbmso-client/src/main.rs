@@ -8,9 +8,15 @@
 #[cfg(any(target_os = "macos", windows))]
 mod desktop;
 #[cfg(any(target_os = "macos", windows))]
+#[cfg_attr(target_os = "macos", path = "preflight/macos.rs")]
+#[cfg_attr(windows, path = "preflight/windows.rs")]
+mod host_probe;
+#[cfg(any(target_os = "macos", windows))]
 mod monitor;
 #[cfg(any(target_os = "macos", windows))]
 mod policy;
+#[cfg(any(target_os = "macos", windows))]
+mod preflight;
 
 #[cfg(any(target_os = "macos", windows))]
 fn main() -> tauri::Result<()> {

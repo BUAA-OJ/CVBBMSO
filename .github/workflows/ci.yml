@@ -82,13 +82,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Record Windows version
         if: runner.os == 'Windows'
-        run: Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber
+        run: |
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber
+          Get-CimInstance Win32_ComputerSystem -Property Manufacturer,Model,HypervisorPresent |
+            Select-Object Manufacturer,Model,HypervisorPresent | Format-List
       - name: Record macOS and WebKit versions
         if: runner.os == 'macOS'
         run: |
           sw_vers
+          sysctl hw.model kern.hv_vmm_present || true
           defaults read /System/Library/Frameworks/WebKit.framework/Resources/Info CFBundleVersion
       - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke
+      - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke-detected
+      - name: Record the native probe result on the hosted runner
+        run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-vm-probe
 
   deny:
     name: Dependency policy
