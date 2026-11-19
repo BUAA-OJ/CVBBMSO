@@ -135,6 +135,9 @@ Write idiomatic Rust and keep the design boring.
   `pub`. Re-export only what other crates need.
 - **Modules follow responsibility, not file count.** A module should have one
   reason to change. Split by responsibility, not by line count.
+- **Use the sibling module layout.** A module with child modules lives in
+  `module.rs` next to a `module/` directory (for example `src/wire.rs` plus
+  `src/wire/`); never use the old `module/mod.rs` layout.
 - **Comments explain why.** Do not narrate what the code already says. Public
   items get doc comments that state the contract and failure modes.
 - **No dead code, no commented-out code, no debug prints.** Use `tracing`.
