@@ -82,6 +82,11 @@ impl SegmentStore {
     /// The caller must have finished writing the video file. The digest is
     /// computed before the metadata is published atomically, so a metadata file
     /// always describes a complete segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordingError::Io`] when `index` is not the next index, when
+    /// the segment is already sealed, or when the video cannot be hashed.
     pub(crate) fn seal(
         &mut self,
         index: u32,
@@ -93,6 +98,10 @@ impl SegmentStore {
             return Err(invalid_input(format!(
                 "segment index {index} does not follow {next}"
             )));
+        }
+        // A sealed segment is evidence: never publish over an existing one.
+        if self.meta_path(index).try_exists()? {
+            return Err(invalid_input(format!("segment {index} is already sealed")));
         }
         let digest = hash_file(&self.video_path(index))?;
         let meta = SegmentMeta::new(index, start_at, end_at, digest).map_err(rejected_segment)?;

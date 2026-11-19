@@ -8,27 +8,22 @@ use std::{
 
 use cvbbmso_protocol::SegmentMeta;
 
-use super::{META_EXTENSION, ORDINAL_WIDTH, VIDEO_EXTENSION, file_name};
+use super::{META_EXTENSION, ORDINAL_WIDTH, VIDEO_EXTENSION, file_name, hash_file, invalid_input};
 use crate::RecordingError;
 
-/// Restores the segments found in `segments_dir`.
+/// Restores the sealed segments of `segments_dir`.
 ///
-/// A segment counts only when its video and metadata files both exist, the
-/// metadata parses, and its index matches the file name. Files left behind by an
-/// interrupted seal are ignored so their index can be reused.
+/// A segment is sealed once its video and its metadata file both exist. Sealed
+/// segments must form the run `1..=n`: a gap, an unreadable or malformed
+/// metadata file, a mismatched index, or a video that no longer matches its
+/// digest all fail recovery and leave every file untouched. Treating such a
+/// segment as absent would let a later recording reuse an index that already
+/// holds evidence.
 ///
-/// A metadata file that exists but cannot be read fails recovery instead of
-/// counting as an unsealed leftover: the segment is sealed, and reporting it as
-/// absent would let a later recording reuse its index and overwrite evidence.
-/// The files are left untouched so the fault can be repaired and retried.
-///
-/// The video digest is not recomputed: metadata is published only after the
-/// video was written and synchronized, so its presence already proves the
-/// segment is complete.
-///
-/// Only the longest run that starts at index one is restored. A manifest must be
-/// non-empty and contiguous, so a segment after a gap could never be reported,
-/// and keeping it would stop its index from being recorded again.
+/// A video without metadata was never sealed, so it is ignored and its index can
+/// be recorded again. The digest is recomputed for every restored segment,
+/// because the metadata only proves what the video looked like when it was
+/// written, not that it is intact now.
 pub(super) fn recover(segments_dir: &Path) -> Result<BTreeMap<u32, SegmentMeta>, RecordingError> {
     let mut videos = BTreeSet::new();
     let mut metas = BTreeSet::new();
@@ -52,19 +47,40 @@ pub(super) fn recover(segments_dir: &Path) -> Result<BTreeMap<u32, SegmentMeta>,
     let mut expected = 1_u32;
     for index in videos.intersection(&metas) {
         if *index != expected {
-            break;
+            return Err(invalid_input(format!(
+                "sealed segment {index} follows a missing segment"
+            )));
         }
-        let bytes = fs::read(segments_dir.join(file_name(*index, META_EXTENSION)))?;
-        let Ok(meta) = serde_json::from_slice::<SegmentMeta>(&bytes) else {
-            break;
-        };
-        if meta.index != *index {
-            break;
+
+        let meta_path = segments_dir.join(file_name(*index, META_EXTENSION));
+        let meta = parse_meta(&meta_path, *index)?;
+
+        let video_path = segments_dir.join(file_name(*index, VIDEO_EXTENSION));
+        if hash_file(&video_path)? != meta.sha256 {
+            return Err(invalid_input(format!(
+                "segment {index} no longer matches its digest"
+            )));
         }
+
         segments.insert(*index, meta);
         expected = expected.saturating_add(1);
     }
     Ok(segments)
+}
+
+/// Reads and validates the metadata file of `index`.
+fn parse_meta(path: &Path, index: u32) -> Result<SegmentMeta, RecordingError> {
+    let bytes = fs::read(path)?;
+    let meta = serde_json::from_slice::<SegmentMeta>(&bytes)
+        .map_err(|error| invalid_input(format!("segment {index} metadata: {error}")))?;
+    if meta.index == index {
+        Ok(meta)
+    } else {
+        Err(invalid_input(format!(
+            "segment {index} metadata names index {}",
+            meta.index
+        )))
+    }
 }
 
 /// Splits a segment file name into its index and extension.

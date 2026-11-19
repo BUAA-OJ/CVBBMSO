@@ -54,7 +54,12 @@ impl Recorder {
         _policy: RecordingPolicy,
     ) -> Result<(Self, Receiver<RecorderEvent>), RecordingError> {
         require_candidate_dir(&candidate_dir, exam_id, oj_user_id)?;
-        let store = SegmentStore::open(&candidate_dir)?;
+        // Recovery reads and hashes every sealed segment, so keep it off the
+        // runtime worker instead of stalling unrelated tasks on disk latency.
+        let directory = candidate_dir.clone();
+        let store = tokio::task::spawn_blocking(move || SegmentStore::open(&directory))
+            .await
+            .map_err(io::Error::other)??;
         let restored = store.segments();
         let (events, receiver) = mpsc::channel(restored.len() + EVENT_BUFFER);
         let recorder = Self {

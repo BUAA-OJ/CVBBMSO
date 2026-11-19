@@ -114,7 +114,7 @@ fn ignores_a_video_without_metadata() {
 }
 
 #[test]
-fn skips_unreadable_metadata() {
+fn fails_on_unreadable_metadata() {
     let directory = TempDir::new().expect("temp dir");
     let mut store = store(&directory);
     write_video(&store, 1, b"abc");
@@ -124,14 +124,11 @@ fn skips_unreadable_metadata() {
         .expect("broken metadata");
     drop(store);
 
-    let reopened = SegmentStore::open(directory.path()).expect("reopen");
-
-    assert_eq!(reopened.segments().len(), 1);
-    assert_eq!(reopened.next_index(), 2);
+    assert!(SegmentStore::open(directory.path()).is_err());
 }
 
 #[test]
-fn recovery_stops_at_the_first_gap() {
+fn fails_when_a_sealed_segment_follows_a_gap() {
     let directory = TempDir::new().expect("temp dir");
     let mut store = store(&directory);
     for index in 1..=3_u32 {
@@ -143,12 +140,34 @@ fn recovery_stops_at_the_first_gap() {
     fs::remove_file(segments_dir(&directory).join("000002.json")).expect("remove metadata");
     drop(store);
 
-    let reopened = SegmentStore::open(directory.path()).expect("reopen");
+    assert!(SegmentStore::open(directory.path()).is_err());
+}
 
-    let segments = reopened.segments();
-    assert_eq!(segments.len(), 1);
-    assert_eq!(segments[0].index, 1);
-    assert_eq!(reopened.next_index(), 2);
+#[test]
+fn fails_when_a_video_no_longer_matches_its_digest() {
+    let directory = TempDir::new().expect("temp dir");
+    let mut store = store(&directory);
+    write_video(&store, 1, b"abc");
+    store.seal(1, timestamp(0), timestamp(30)).expect("seal");
+    fs::write(store.video_path(1), b"tampered").expect("tamper");
+    drop(store);
+
+    assert!(SegmentStore::open(directory.path()).is_err());
+}
+
+#[test]
+fn refuses_to_seal_over_existing_metadata() {
+    let directory = TempDir::new().expect("temp dir");
+    let mut store = store(&directory);
+    write_video(&store, 1, b"abc");
+    store.seal(1, timestamp(0), timestamp(30)).expect("seal");
+    write_video(&store, 2, b"abc");
+    fs::write(segments_dir(&directory).join("000002.json"), b"{}").expect("existing metadata");
+
+    assert!(matches!(
+        store.seal(2, timestamp(0), timestamp(30)),
+        Err(RecordingError::Io(_))
+    ));
 }
 
 #[test]
