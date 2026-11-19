@@ -4,6 +4,11 @@
 // platform test exercises it until then.
 #![allow(dead_code)]
 
+mod sampling;
+
+#[allow(unused_imports)] // Consumed by the encoder pipeline in the next milestone.
+pub(crate) use sampling::{SampledFrame, run};
+
 #[cfg(windows)]
 mod windows;
 

@@ -46,9 +46,9 @@ impl Desktop {
     ///
     /// # Errors
     ///
-    /// Returns [`PlatformError::Failed`] when the display cannot be duplicated.
+    /// Returns [`RecordingError::Platform`] when the display cannot be duplicated.
     pub(crate) fn open() -> Result<Self, RecordingError> {
-        Self::open_inner().map_err(|error| failure(&error))
+        Self::open_inner().map_err(failure)
     }
 
     /// Waits for the next changed frame.
@@ -58,10 +58,9 @@ impl Desktop {
     ///
     /// # Errors
     ///
-    /// Returns [`PlatformError::Failed`] when the desktop can no longer be read.
+    /// Returns [`RecordingError::Platform`] when the desktop can no longer be read.
     pub(crate) fn next_frame(&mut self, timeout_ms: u32) -> Result<Option<Frame>, RecordingError> {
-        self.next_frame_inner(timeout_ms)
-            .map_err(|error| failure(&error))
+        self.next_frame_inner(timeout_ms).map_err(failure)
     }
 
     fn open_inner() -> WindowsResult<Self> {
@@ -125,45 +124,63 @@ impl Desktop {
             }
             let _frame = FrameGuard(&self.duplication);
 
-            let resource = resource.ok_or_else(WindowsError::from_win32)?;
-            let texture: ID3D11Texture2D = resource.cast()?;
+            desktop_update(&info, || {
+                let resource = resource.ok_or_else(WindowsError::from_win32)?;
+                let texture: ID3D11Texture2D = resource.cast()?;
 
-            let mut description = D3D11_TEXTURE2D_DESC::default();
-            texture.GetDesc(&raw mut description);
-            description.Usage = D3D11_USAGE_STAGING;
-            description.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-            description.BindFlags = 0;
-            description.MiscFlags = 0;
-            description.MipLevels = 1;
-            description.ArraySize = 1;
+                let mut description = D3D11_TEXTURE2D_DESC::default();
+                texture.GetDesc(&raw mut description);
+                description.Usage = D3D11_USAGE_STAGING;
+                description.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+                description.BindFlags = 0;
+                description.MiscFlags = 0;
+                description.MipLevels = 1;
+                description.ArraySize = 1;
 
-            let mut staging: Option<ID3D11Texture2D> = None;
-            self.device
-                .CreateTexture2D(&raw const description, None, Some(&raw mut staging))?;
-            let staging = staging.ok_or_else(WindowsError::from_win32)?;
-            self.context.CopyResource(&staging, &texture);
+                let mut staging: Option<ID3D11Texture2D> = None;
+                self.device.CreateTexture2D(
+                    &raw const description,
+                    None,
+                    Some(&raw mut staging),
+                )?;
+                let staging = staging.ok_or_else(WindowsError::from_win32)?;
+                self.context.CopyResource(&staging, &texture);
 
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context
-                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&raw mut mapped))?;
-            let _mapping = MapGuard {
-                context: &self.context,
-                texture: &staging,
-            };
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                self.context
+                    .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&raw mut mapped))?;
+                let _mapping = MapGuard {
+                    context: &self.context,
+                    texture: &staging,
+                };
 
-            let packed = copy_rows(&mapped, description.Width, description.Height);
-            let (pixels, width, height) = rotate(
-                &packed,
-                description.Width,
-                description.Height,
-                self.rotation,
-            );
-            Ok(Some(Frame {
-                width,
-                height,
-                pixels,
-            }))
+                let packed = copy_rows(&mapped, description.Width, description.Height);
+                let (pixels, width, height) = rotate(
+                    &packed,
+                    description.Width,
+                    description.Height,
+                    self.rotation,
+                );
+                Ok(Frame {
+                    width,
+                    height,
+                    pixels,
+                })
+            })
         }
+    }
+}
+
+/// A pointer-only acquisition does not contain a newly presented desktop image.
+/// In particular, it must not initialize the sampler's cached image at startup.
+fn desktop_update(
+    info: &DXGI_OUTDUPL_FRAME_INFO,
+    read: impl FnOnce() -> WindowsResult<Frame>,
+) -> WindowsResult<Option<Frame>> {
+    if info.LastPresentTime == 0 {
+        Ok(None)
+    } else {
+        read().map(Some)
     }
 }
 
@@ -210,12 +227,9 @@ impl Drop for MapGuard<'_> {
     }
 }
 
-/// Wraps a platform error so the caller keeps its code and message.
-fn failure(error: &WindowsError) -> RecordingError {
-    RecordingError::Platform(Some(std::io::Error::other(format!(
-        "0x{:08X}: {error}",
-        error.code().0
-    ))))
+/// Preserves the platform error without exposing its type in public signatures.
+fn failure(error: WindowsError) -> RecordingError {
+    RecordingError::Platform(Some(std::io::Error::other(error)))
 }
 
 /// Copies a mapped surface into tightly packed rows.
