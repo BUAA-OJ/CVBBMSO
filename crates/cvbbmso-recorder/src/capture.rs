@@ -109,6 +109,9 @@ mod unsupported {
         /// # Errors
         ///
         /// Always returns [`RecordingError::Platform`].
+        // The signature mirrors the Windows backend so `sampling` compiles
+        // unchanged; this placeholder has no frame state to read.
+        #[allow(clippy::unused_self)]
         pub(crate) fn next_frame(
             &mut self,
             _timeout_ms: u32,

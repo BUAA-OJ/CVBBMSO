@@ -9,7 +9,11 @@ mod ebml;
 mod mkv;
 mod mp4;
 
-pub(crate) use avc::{AvcConfig, annex_b_nals, length_prefixed, nal_type, with_centered_chroma};
+pub(crate) use avc::{AvcConfig, with_centered_chroma};
+// Annex B parsing and AVCC framing exist only for the Media Foundation encoder,
+// which is the sole Windows consumer; other targets never read raw NAL streams.
+#[cfg(windows)]
+pub(crate) use avc::{annex_b_nals, length_prefixed, nal_type};
 pub(crate) use mkv::MkvFile;
 #[allow(unused_imports)] // Wired into the capture pipeline with M5.
 pub(crate) use mkv::MkvWriter;
