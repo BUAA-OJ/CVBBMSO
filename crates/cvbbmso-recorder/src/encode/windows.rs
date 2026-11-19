@@ -3,10 +3,12 @@
 use std::ptr;
 
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, MF_VERSION, MFMediaType_Video, MFSTARTUP_LITE, MFShutdown, MFStartup,
-    MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_SORTANDFILTER,
-    MFT_FRIENDLY_NAME_Attribute, MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoFormat_H264,
-    MFVideoFormat_NV12,
+    IMFActivate, IMFMediaType, MF_MT_VIDEO_CHROMA_SITING, MF_MT_VIDEO_NOMINAL_RANGE,
+    MF_MT_YUV_MATRIX, MF_VERSION, MFMediaType_Video, MFNominalRange_16_235, MFSTARTUP_LITE,
+    MFShutdown, MFStartup, MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_ALL,
+    MFT_ENUM_FLAG_SORTANDFILTER, MFT_FRIENDLY_NAME_Attribute, MFT_REGISTER_TYPE_INFO, MFTEnumEx,
+    MFVideoChromaSubsampling_MPEG1, MFVideoChromaSubsampling_ProgressiveChroma, MFVideoFormat_H264,
+    MFVideoFormat_NV12, MFVideoTransferMatrix_BT709,
 };
 use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
@@ -17,6 +19,34 @@ use crate::RecordingError;
 
 /// Longest friendly name this crate reads back from an encoder activation.
 const NAME_LENGTH: usize = 128;
+
+/// Declares the converter's matrix, range and chroma location on a media type.
+///
+/// Apply to the NV12 input and H.264 output before type negotiation when the
+/// encoder pipeline is connected. Setting these attributes is not proof that an
+/// MFT writes matching VUI; the encoded stream must be checked during acceptance.
+///
+/// # Errors
+///
+/// Returns the original Windows error if an attribute cannot be stored.
+fn set_color_attributes(media_type: &IMFMediaType) -> WindowsResult<()> {
+    // SAFETY: the media type owns its writable attributes; each GUID and enum
+    // value comes from Media Foundation. Chroma is centered by the 2x2 box filter.
+    unsafe {
+        media_type.SetUINT32(
+            &MF_MT_YUV_MATRIX,
+            MFVideoTransferMatrix_BT709.0.cast_unsigned(),
+        )?;
+        media_type.SetUINT32(
+            &MF_MT_VIDEO_NOMINAL_RANGE,
+            MFNominalRange_16_235.0.cast_unsigned(),
+        )?;
+        let siting =
+            MFVideoChromaSubsampling_MPEG1.0 | MFVideoChromaSubsampling_ProgressiveChroma.0;
+        media_type.SetUINT32(&MF_MT_VIDEO_CHROMA_SITING, siting.cast_unsigned())?;
+    }
+    Ok(())
+}
 
 /// Lists the H.264 encoders Media Foundation offers for NV12 input.
 ///
@@ -106,8 +136,147 @@ impl Drop for MediaFoundationGuard {
     }
 }
 
+use std::marker::PhantomData;
+
+use windows::Win32::Media::MediaFoundation::{
+    CMSH264EncoderMFT, IMFTransform, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING, MF_MT_SUBTYPE,
+    MFCreateMediaType, MFVideoInterlace_Progressive,
+};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+
+/// Default bitrate for a desktop recording, in bits per second.
+pub(crate) const DEFAULT_BITRATE: u32 = 4_000_000;
+
+/// Configured H.264 encoder fed with NV12 frames.
+pub(crate) struct Encoder {
+    transform: IMFTransform,
+    // Declared after the transform so the transform is released first.
+    _com: ComGuard,
+    _media: MediaFoundationGuard,
+    // The transform belongs to the thread whose apartment created it.
+    _thread: PhantomData<*const ()>,
+}
+
+impl Encoder {
+    /// Opens an H.264 encoder for `width` by `height` frames at `fps`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordingError::Encoder`] when Media Foundation cannot start,
+    /// no encoder can be created, or the media types are rejected.
+    pub(crate) fn open(
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+    ) -> Result<Self, RecordingError> {
+        open_encoder(width, height, fps, bitrate).map_err(|_| RecordingError::Encoder)
+    }
+}
+
+fn open_encoder(width: u32, height: u32, fps: u32, bitrate: u32) -> WindowsResult<Encoder> {
+    // SAFETY: the guards live in the returned encoder, so Media Foundation and
+    // the apartment outlive the transform they created.
+    unsafe {
+        CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+        let com = ComGuard;
+        MFStartup(MF_VERSION, MFSTARTUP_LITE)?;
+        let media = MediaFoundationGuard;
+
+        let transform: IMFTransform =
+            CoCreateInstance(&CMSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)?;
+        configure(&transform, width, height, fps, bitrate)?;
+        Ok(Encoder {
+            transform,
+            _com: com,
+            _media: media,
+            _thread: PhantomData,
+        })
+    }
+}
+
+/// Negotiates the H.264 output type and the NV12 input type.
+fn configure(
+    transform: &IMFTransform,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate: u32,
+) -> WindowsResult<()> {
+    // SAFETY: both media types are created here, fully described before they are
+    // handed to the transform, and dropped after negotiation.
+    unsafe {
+        let output = MFCreateMediaType()?;
+        output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        output.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
+        output.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
+        output.SetUINT64(&MF_MT_FRAME_SIZE, pack(width, height))?;
+        output.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1))?;
+        output.SetUINT32(
+            &MF_MT_INTERLACE_MODE,
+            MFVideoInterlace_Progressive.0.cast_unsigned(),
+        )?;
+        // A keyframe every two seconds keeps segment boundaries seekable.
+        output.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, fps.saturating_mul(2))?;
+        set_color_attributes(&output)?;
+        transform.SetOutputType(0, &output, 0)?;
+
+        let input = MFCreateMediaType()?;
+        input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
+        input.SetUINT64(&MF_MT_FRAME_SIZE, pack(width, height))?;
+        input.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1))?;
+        input.SetUINT32(
+            &MF_MT_INTERLACE_MODE,
+            MFVideoInterlace_Progressive.0.cast_unsigned(),
+        )?;
+        set_color_attributes(&input)?;
+        transform.SetInputType(0, &input, 0)?;
+    }
+    Ok(())
+}
+
+/// Packs two 32-bit halves into the 64-bit attribute layout Media Foundation uses.
+fn pack(high: u32, low: u32) -> u64 {
+    (u64::from(high) << 32) | u64::from(low)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use windows::Win32::Media::MediaFoundation::MFCreateMediaType;
+
+    #[test]
+    fn color_attributes_match_the_bt709_limited_centered_conversion() {
+        // SAFETY: initialize the test thread and keep all media types within
+        // the lifetime of their COM and Media Foundation guards.
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED)
+                .ok()
+                .expect("COM");
+            let _com = ComGuard;
+            MFStartup(MF_VERSION, MFSTARTUP_LITE).expect("Media Foundation");
+            let _media = MediaFoundationGuard;
+            let media_type = MFCreateMediaType().expect("media type");
+            set_color_attributes(&media_type).expect("color description");
+            assert_eq!(media_type.GetUINT32(&MF_MT_YUV_MATRIX).expect("matrix"), 1);
+            assert_eq!(
+                media_type
+                    .GetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE)
+                    .expect("range"),
+                2
+            );
+            // Progressive, U/V aligned, centered in both axes.
+            assert_eq!(
+                media_type
+                    .GetUINT32(&MF_MT_VIDEO_CHROMA_SITING)
+                    .expect("chroma siting"),
+                9
+            );
+        }
+    }
+
     #[test]
     #[ignore = "requires Media Foundation"]
     fn lists_h264_encoders() {
@@ -118,5 +287,13 @@ mod tests {
             !names.is_empty(),
             "Media Foundation reported no H.264 encoder"
         );
+    }
+
+    #[test]
+    #[ignore = "requires Media Foundation"]
+    fn opens_and_configures_an_h264_encoder() {
+        let encoder =
+            super::Encoder::open(1920, 1080, 15, super::DEFAULT_BITRATE).expect("encoder");
+        drop(encoder);
     }
 }
