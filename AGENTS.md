@@ -10,19 +10,18 @@ controlled WebView to log in to Accoding; the server re-verifies the
 `connect.sid` cookie against Accoding. Exam timing is server-authoritative and
 commands are delivered over one WebSocket per student.
 
-The repository currently contains design documents only. There is no Cargo
-workspace yet. When scaffolding, follow the layout and contracts in `docs/`
-exactly.
+The repository is being scaffolded crate by crate. The design contracts live
+under `docs/design/`; follow their layout and contracts exactly.
 
 ### Source of truth
 
 Read these before changing behavior:
 
-1. `docs/overview.md` — system boundary, terminology, crate graph.
-2. `docs/crates/cvbbmso-protocol.md` — wire format and error codes.
+1. `docs/design/overview.md` — system boundary, terminology, crate graph.
+2. `docs/design/crates/cvbbmso-protocol.md` — wire format and error codes.
 3. The crate document for the crate you are touching.
 
-The documents under `docs/` are written in Chinese and define the public
+The documents under `docs/design/` are written in Chinese and define the public
 contracts. Code, comments, doc comments, and commit messages are written in
 English.
 

@@ -48,9 +48,10 @@ cvbbmso/
 │   ├── cvbbmso-server/     # Axum HTTP / WebSocket 服务
 │   └── cvbbmso-cli/        # 服务端本机管理 CLI
 └── docs/
-    ├── overview.md
-    └── crates/
-        └── <每个 crate 对应的 cvbbmso-*.md>
+    └── design/
+        ├── overview.md
+        └── crates/
+            └── <每个 crate 对应的 cvbbmso-*.md>
 ```
 
 ## Crate 职责与协作
