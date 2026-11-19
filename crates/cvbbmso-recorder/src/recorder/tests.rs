@@ -7,7 +7,11 @@ use tokio::sync::mpsc::Receiver;
 use uuid::Uuid;
 
 use super::{Recorder, State};
+use crate::container::{AvcConfig, MkvWriter, Sample};
 use crate::{RecorderEvent, RecordingError, store::SegmentStore};
+
+const SEQUENCE: [u8; 6] = [0x67, 0x42, 0xC0, 0x1E, 0xD9, 0x01];
+const PICTURE: [u8; 4] = [0x68, 0xCE, 0x38, 0x80];
 
 const OJ_USER_ID: i64 = 42;
 
@@ -49,6 +53,29 @@ fn seal_segments(candidate: &Path, count: u32) {
     }
 }
 
+/// Writes `count` readable segments, each with two H.264 samples.
+fn seal_video_segments(candidate: &Path, count: u32) {
+    let mut store = SegmentStore::open(candidate).expect("store");
+    let config = AvcConfig::new(SEQUENCE.to_vec(), PICTURE.to_vec()).expect("configuration");
+    for index in 1..=count {
+        let mut writer = MkvWriter::new(config.clone(), 320, 240);
+        for (offset, keyframe) in [(0_u64, true), (66, false)] {
+            writer
+                .push(Sample {
+                    timestamp_ms: offset,
+                    keyframe,
+                    data: vec![0x41; 8],
+                })
+                .expect("sample");
+        }
+        let bytes = writer.finish().expect("segment");
+        fs::write(store.video_path(index), bytes).expect("video");
+        store
+            .seal(index, timestamp(0), timestamp(30))
+            .expect("seal");
+    }
+}
+
 async fn open_empty() -> (Recorder, Receiver<RecorderEvent>, TempDir) {
     let directory = TempDir::new().expect("temp dir");
     let candidate = candidate_dir(&directory, OJ_USER_ID);
@@ -62,6 +89,16 @@ async fn open_with_segments(count: u32) -> (Recorder, Receiver<RecorderEvent>, T
     let directory = TempDir::new().expect("temp dir");
     let candidate = candidate_dir(&directory, OJ_USER_ID);
     seal_segments(&candidate, count);
+    let (recorder, events) = Recorder::open(exam_id(), OJ_USER_ID, candidate, policy())
+        .await
+        .expect("open");
+    (recorder, events, directory)
+}
+
+async fn open_with_video_segments(count: u32) -> (Recorder, Receiver<RecorderEvent>, TempDir) {
+    let directory = TempDir::new().expect("temp dir");
+    let candidate = candidate_dir(&directory, OJ_USER_ID);
+    seal_video_segments(&candidate, count);
     let (recorder, events) = Recorder::open(exam_id(), OJ_USER_ID, candidate, policy())
         .await
         .expect("open");
@@ -154,17 +191,33 @@ async fn finish_returns_the_same_manifest_after_completion() {
 }
 
 #[tokio::test]
+async fn finish_merges_the_sealed_segments_and_caches_the_manifest() {
+    let (mut recorder, _events, directory) = open_with_video_segments(2).await;
+
+    let manifest = recorder.finish().await.expect("manifest");
+    let final_path = candidate_dir(&directory, OJ_USER_ID)
+        .join("recording")
+        .join("final.mp4");
+
+    assert_eq!(manifest.segments.len(), 2);
+    assert_eq!(manifest.segments[0].index, 1);
+    assert_eq!(manifest.segments[1].index, 2);
+    assert!(final_path.is_file());
+    assert_eq!(recorder.finish().await.expect("cached"), manifest);
+}
+
+#[tokio::test]
 async fn finish_reports_merge_and_stays_retryable() {
     let (mut recorder, _events, _directory) = open_with_segments(1).await;
 
     assert!(matches!(
         recorder.finish().await,
-        Err(RecordingError::Merge)
+        Err(RecordingError::Merge(_))
     ));
     assert!(matches!(recorder.state, State::Failed));
     assert!(matches!(
         recorder.finish().await,
-        Err(RecordingError::Merge)
+        Err(RecordingError::Merge(_))
     ));
 }
 

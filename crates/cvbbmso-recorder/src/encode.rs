@@ -26,7 +26,7 @@ mod unsupported {
     /// Always returns [`RecordingError::Encoder`]: this crate has no encoder for
     /// the current platform.
     pub(crate) fn available_encoders() -> Result<Vec<String>, RecordingError> {
-        Err(RecordingError::Encoder)
+        Err(RecordingError::Encoder(None))
     }
 }
 

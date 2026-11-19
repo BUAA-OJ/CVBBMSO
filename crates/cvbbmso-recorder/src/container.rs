@@ -7,6 +7,13 @@
 mod avc;
 mod ebml;
 mod mkv;
+mod mp4;
+
+pub(crate) use avc::{AvcConfig, annex_b_nals, length_prefixed, nal_type};
+pub(crate) use mkv::MkvFile;
+#[allow(unused_imports)] // Wired into the capture pipeline with M5.
+pub(crate) use mkv::MkvWriter;
+pub(crate) use mp4::Mp4Writer;
 
 use thiserror::Error;
 

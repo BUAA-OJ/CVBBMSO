@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use cvbbmso_protocol::{RecordingManifest, RecordingPolicy, Sha256Digest};
+use cvbbmso_protocol::{RecordingManifest, RecordingPolicy};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use uuid::Uuid;
 
@@ -112,13 +112,15 @@ impl Recorder {
     /// Stops capture, seals the pending segment, merges the recording, and
     /// returns its manifest.
     ///
+    /// The merge runs on a blocking task because it reads, hashes, and writes
+    /// whole segments; awaiting it does not block a Tokio worker.
+    ///
     /// # Errors
     ///
     /// Returns [`RecordingError::NoSegments`] when nothing was recorded and
-    /// [`RecordingError::Merge`] until merging lands. A failed attempt leaves the
-    /// recorder retryable; repeating the call after a successful finish returns
-    /// the same manifest.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // Signatures are fixed by the crate contract.
+    /// [`RecordingError::Merge`] when the segments cannot be merged. A failed
+    /// attempt leaves the recorder retryable; repeating the call after a
+    /// successful finish returns the same manifest.
     pub async fn finish(&mut self) -> Result<RecordingManifest, RecordingError> {
         if let State::Complete(manifest) = &self.state {
             return Ok(manifest.clone());
@@ -126,25 +128,27 @@ impl Recorder {
         if self.store.segments().is_empty() {
             return Err(RecordingError::NoSegments);
         }
-        match merge(&self.store).and_then(|digest| self.store.manifest(digest)) {
-            Ok(manifest) => {
+        let store = self.store.clone();
+        let merged = tokio::task::spawn_blocking(move || {
+            let digest = store.merge()?;
+            store.manifest(digest)
+        })
+        .await;
+        match merged {
+            Ok(Ok(manifest)) => {
                 self.state = State::Complete(manifest.clone());
                 Ok(manifest)
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 self.state = State::Failed;
                 Err(error)
             }
+            Err(error) => {
+                self.state = State::Failed;
+                Err(RecordingError::Merge(Some(io::Error::other(error))))
+            }
         }
     }
-}
-
-/// Merges the sealed segments into the final video and returns its digest.
-///
-/// The container work lands with the merge milestone; until then a non-empty
-/// recording cannot be finished.
-fn merge(_store: &SegmentStore) -> Result<Sha256Digest, RecordingError> {
-    Err(RecordingError::Merge)
 }
 
 /// Requires `candidate_dir` to end in `<exam_id>/<oj_user_id>`.

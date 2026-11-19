@@ -19,12 +19,17 @@ pub enum RecordingError {
     #[error("platform screen capture failed")]
     Platform(#[source] Option<std::io::Error>),
     /// The H.264 encoder could not run.
+    ///
+    /// Carries the backend failure when one was reported; `None` means this crate
+    /// provides no encoder for the current platform.
     #[error("video encoding failed")]
-    Encoder,
+    Encoder(#[source] Option<std::io::Error>),
     /// The recording holds no sealed segment, so there is nothing to finish.
     #[error("recording has no sealed segments")]
     NoSegments,
     /// Sealed segments could not be merged into the final video.
+    ///
+    /// Carries the container or evidence failure when one was reported.
     #[error("segment merge failed")]
-    Merge,
+    Merge(#[source] Option<std::io::Error>),
 }

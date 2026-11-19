@@ -4,6 +4,7 @@
 // milestone; until then the sealing path is reached only from tests.
 #![allow(dead_code)]
 
+mod merge;
 mod recovery;
 
 use std::{
@@ -23,6 +24,10 @@ use crate::RecordingError;
 const RECORDING_DIR: &str = "recording";
 /// Subdirectory holding sealed segments.
 const SEGMENTS_DIR: &str = "segments";
+/// Name of the merged recording.
+const FINAL_NAME: &str = "final.mp4";
+/// Temporary name used while the merged recording is written.
+const FINAL_TEMP_NAME: &str = "final.mp4.tmp";
 /// Extension of a sealed segment video.
 const VIDEO_EXTENSION: &str = "mkv";
 /// Extension of the metadata file of a sealed segment.
@@ -35,6 +40,7 @@ const ORDINAL_WIDTH: usize = 6;
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Sealed segments of one candidate, ordered by their one-based index.
+#[derive(Clone)]
 pub(crate) struct SegmentStore {
     recording_dir: PathBuf,
     segments: BTreeMap<u32, SegmentMeta>,
@@ -47,6 +53,13 @@ impl SegmentStore {
         let recording_dir = candidate_dir.join(RECORDING_DIR);
         let segments_dir = recording_dir.join(SEGMENTS_DIR);
         fs::create_dir_all(&segments_dir)?;
+        // A previous finish may have stopped between writing and publishing the
+        // merged file; the next finish rebuilds it from the sealed segments.
+        match fs::remove_file(recording_dir.join(FINAL_TEMP_NAME)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let segments = recovery::recover(&segments_dir)?;
         Ok(Self {
             recording_dir,
@@ -58,6 +71,18 @@ impl SegmentStore {
     #[must_use]
     pub(crate) fn segments(&self) -> Vec<SegmentMeta> {
         self.segments.values().cloned().collect()
+    }
+
+    /// Path of the merged recording.
+    #[must_use]
+    pub(crate) fn final_path(&self) -> PathBuf {
+        self.recording_dir.join(FINAL_NAME)
+    }
+
+    /// Path used while the merged recording is being written.
+    #[must_use]
+    pub(crate) fn final_temporary_path(&self) -> PathBuf {
+        self.recording_dir.join(FINAL_TEMP_NAME)
     }
 
     /// Index the next sealed segment must use.
@@ -145,7 +170,7 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), RecordingError> {
 }
 
 /// Streams `path` through SHA-256.
-fn hash_file(path: &Path) -> Result<Sha256Digest, RecordingError> {
+fn hash_file(path: &Path) -> io::Result<Sha256Digest> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; HASH_BUFFER_SIZE];
@@ -157,7 +182,8 @@ fn hash_file(path: &Path) -> Result<Sha256Digest, RecordingError> {
         hasher.update(&buffer[..read]);
     }
     let digest = hasher.finalize();
-    Sha256Digest::parse(&hexadecimal(&digest)).map_err(rejected_segment)
+    Sha256Digest::parse(&hexadecimal(&digest))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
 /// Renders bytes as lowercase hexadecimal text.
