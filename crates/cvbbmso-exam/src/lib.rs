@@ -70,7 +70,8 @@ pub struct ClientView {
     /// Current execution and recording state.
     pub state: ClientState,
     /// Last protocol error code that needs the student's attention, such as
-    /// `ACCODING_AUTH_EXPIRED`; `INTERNAL_ERROR` after a fatal local failure.
+    /// `ACCODING_AUTH_EXPIRED`; `INTERNAL_ERROR` while local runtime data
+    /// cannot be saved.
     pub last_error_code: Option<String>,
 }
 
@@ -150,9 +151,9 @@ impl ExamHandle {
     ///
     /// # Errors
     ///
-    /// [`ExamError::Recording`] or [`ExamError::Storage`] when stopping fails,
-    /// the fatal error that already stopped the runtime, or
-    /// [`ExamError::Closed`] when the runtime is gone.
+    /// [`ExamError::Recording`] or [`ExamError::Storage`] when stopping capture
+    /// or saving the local data fails, and [`ExamError::Closed`] when the
+    /// runtime is gone.
     pub async fn shutdown(self) -> Result<(), ExamError> {
         let (reply, result) = oneshot::channel();
         self.requests

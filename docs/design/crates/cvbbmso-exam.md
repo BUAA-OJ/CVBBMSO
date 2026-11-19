@@ -62,7 +62,7 @@ impl ExamHandle {
 }
 ```
 
-`Exam::connect` 首先调用 `GET /api/exams` 确认用户身份和考试报名，以返回的 `user.id` 定位本地 `(exam_id, oj_user_id)` 数据，然后打开/恢复 recorder、建立 WSS 并等待初始 `sync`。`ExamConfig.instance_id` 由客户端进程启动时生成，在该进程的所有重连中保持一致；`device_id` 是持久设备标识。`Exam::connect` 是该 crate 的唯一启动入口。
+`Exam::connect` 首先调用 `GET /api/exams` 确认用户身份和考试报名，以返回的 `user.id` 定位本地 `(exam_id, oj_user_id)` 数据，然后建立 WSS 并等待初始 `sync`，再按 `sync.recording_policy` 打开/恢复 recorder。`ExamConfig.instance_id` 由客户端进程启动时生成，在该进程的所有重连中保持一致；`device_id` 是持久设备标识。`Exam::connect` 是该 crate 的唯一启动入口。
 
 `ExamError` 是运行时错误类别：`Auth` / `NotEnrolled` 对应认证与报名错误，`Http` / `WebSocket` / `Recording` / `Storage` 对应连接、录像或存储失败，并在有底层原因时携带它，供应用层通过 `anyhow` 输出完整 source 链；`Closed` 表示句柄已关闭。本地数据写盘失败不停止运行时：`ClientView.last_error_code` 置为 `INTERNAL_ERROR`，内存中的队列继续工作，下一次写盘成功后清除；序号锚定保证写盘失败期间崩溃也不会复用服务端已有的 `seq`。
 
@@ -81,11 +81,11 @@ impl ExamHandle {
 | 到结束时间 | `command(end_exam)` | 停止采集、`finish`、上报摘要与 `command_result` |
 | 完成 | `command_ack` | 进入 `finished`，关闭连接 |
 
-字段及消息 Schema 由 [cvbbmso-protocol](cvbbmso-protocol.md) 唯一定义。客户端每 5 秒发送无载荷心跳，业务事件按 `seq` 递增并先持久化后发送。事件确认通过 `sync.ack_event_through` 返回；重连后重新发送 `seq > ack_event_through` 的事件。`CommandAck` 确认命令结果；收到后客户端可清理本地命令结果并关闭连接。
+字段及消息 Schema 由 [cvbbmso-protocol](cvbbmso-protocol.md) 唯一定义。客户端每 5 秒发送无载荷心跳，业务事件按 `seq` 递增并先持久化后发送。事件确认通过 `sync.ack_event_through` 返回；重连后重新发送 `seq > ack_event_through` 的事件。`CommandAck` 确认命令结果；`end_exam` 的 `CommandAck` 到达后，客户端清理本场事件队列并关闭连接。
 
 ### 命令语义
 
-- `start_exam` 表示“确保采集正在运行”：已在采集时幂等成功；有已封存分片但采集已停止时恢复采集；启动失败时按有限退避重试。
+- `start_exam` 表示“确保采集正在运行”：已在采集时幂等成功；有已封存分片但采集已停止时恢复采集；启动失败时持续重试（见[时限与重试](#时限与重试)）。
 - `end_exam` 表示“停止采集、finalize 并收尾”：已在 finalize 或已完成时返回同一 manifest；没有可收尾分片时按失败处理。
 - 每个 `command_id` 唯一；重连时由服务端根据 `hello.state` 和 `phase` 生成新命令。
 - `status` 仅用于状态对齐；命令确认由 `CommandAck` 负责，结束由 `command_result` 驱动。
@@ -119,7 +119,7 @@ stateDiagram-v2
 - **断网跨过结束时间**：客户端使用 `sync.server_time` 计算服务端时钟偏移；到达 `end_at + 60s` 后调用 `Recorder::stop` 封存当前片段，进入 `finalizing/finalizing`，等待 `end_exam`。重连后按服务端下发的 `end_exam` 执行 `finish` 并完成收尾。
 - **Cookie 过期**：运行时继续录屏，保持本地事件队列；通过 `ClientView` 通知 UI 重新登录，并按退避策略重试连接。认证失效期间录像继续。
 - **断线重连**：保留 `instance_id` 和本地状态；完成 `hello/sync` 后补发事件。服务端根据 `hello.state` 决定是否生成新的 `start_exam` / `end_exam`。重连按 1 秒起、每次翻倍、上限 30 秒退避；收到 `CookiesUpdated` 时立即重试。每次 `sync` 都使上一连接的命令失效，未确认的命令结果不再重发。
-- **进程重启**：采集不会跨进程延续。本地记录为 `recording/*` 时，`hello.state` 报 `recording/failed`：考试进行中服务端不再生成命令，运行时自行重启采集，成功后上报 `recording_recovered`；考试已结束时服务端生成 `end_exam` 完成收尾。其他本地状态按原值上报。
+- **进程重启**：采集不会跨进程延续。本地记录为 `recording/*` 时，`hello.state` 报 `recording/failed`：考试进行中服务端不再生成命令，运行时自行重启采集，成功后上报 `recording_recovered`；考试已结束时服务端生成 `end_exam` 完成收尾。本地记录为 `finished/*` 时，完成 `sync` 后即关闭连接且不再重连。其他本地状态按原值上报。
 
 ### 时限与重试
 
@@ -147,6 +147,6 @@ stateDiagram-v2
 
 `Recorder::open` 会重新发出全部已恢复分片；已入队的分片保留其原 `seq` 继续等待确认，已确认的分片不再上报，未入队的分片分配下一个事件序号。服务端按 `seq` 去重，因此重复上报安全。分片事件仍以 `SegmentMeta.index` 作为稳定身份，服务端可按 `(exam_id, oj_user_id, index)` 做辅助去重。
 
-事件序号由本地数据首次收到的 `sync.ack_event_through` 锚定：首次 `sync` 之前产生的事件先入队不编号，之后从 `ack_event_through + 1` 起编号；此后每次 `sync` 都不让序号回退。本地数据丢失或损坏（损坏文件改名保留后重建）时，新序号因此始终位于服务端已持久化的序号之后，不会与服务端已有的 `seq` 冲突。每次变更先原子写入磁盘，再发送对应消息。
+事件序号由本地数据首次收到的 `sync.ack_event_through` 锚定：首次 `sync` 之前产生的事件先入队不编号，之后从 `ack_event_through + 1` 起编号；此后每次 `sync` 都不让序号回退。本地数据丢失或损坏（损坏文件改名保留后重建）时，新序号因此始终位于服务端已持久化的序号之后，不会与服务端已有的 `seq` 冲突。每次变更先原子写入磁盘，再发送对应消息；写盘失败时消息照常发送，处理方式见上文 `ExamError` 一节。
 
 本地运行时数据由本 crate 管理，存储细节封装在 crate 内部；对客户端和其他 crate 提供运行时接口。
