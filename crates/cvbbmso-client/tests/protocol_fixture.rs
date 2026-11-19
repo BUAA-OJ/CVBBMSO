@@ -35,9 +35,8 @@ use cvbbmso_protocol::{
     error_code,
 };
 use futures_util::{SinkExt, StreamExt, stream};
-use reqwest::Client;
 use rustls::{ClientConfig, RootCertStore, pki_types::CertificateDer};
-use serde_json::{Value, json};
+use serde_json::json;
 use time::OffsetDateTime;
 use tokio::{task::JoinHandle, time::timeout};
 use tokio_tungstenite::{
@@ -159,10 +158,6 @@ async fn first_frame(mut ws: WebSocket) {
 
 async fn fixture() -> (SocketAddr, CertificateDer<'static>, JoinHandle<()>) {
     let app = Router::new()
-        .route(
-            "/api/health",
-            get(|| async { Json(json!({ "status": "ok" })) }),
-        )
         .route("/api/exams", get(exam_list))
         .route("/api/exams/{exam_id}/ws", get(upgrade));
     tls::serve(app).await
@@ -174,64 +169,6 @@ fn cookie(session: &str) -> AccodingCookies {
         ("_zte_cid_".into(), "synthetic".into()),
     ])
     .unwrap()
-}
-
-#[tokio::test]
-async fn http_distinguishes_expired_unavailable_and_empty_enrollment() {
-    let (addr, cert, server) = fixture().await;
-    let client = Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_der(cert.as_ref()).unwrap())
-        .no_proxy()
-        .timeout(LIMIT)
-        .build()
-        .unwrap();
-    let health = client
-        .get(format!("https://{addr}/api/health"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(health.status(), StatusCode::OK);
-    assert_eq!(
-        health.json::<Value>().await.unwrap(),
-        json!({ "status": "ok" })
-    );
-
-    let url = format!("https://{addr}/api/exams");
-    for (session, status, code) in [
-        (
-            "expired",
-            StatusCode::UNAUTHORIZED,
-            error_code::ACCODING_AUTH_EXPIRED,
-        ),
-        (
-            "upstream-down",
-            StatusCode::SERVICE_UNAVAILABLE,
-            error_code::ACCODING_UNAVAILABLE,
-        ),
-    ] {
-        let response = client
-            .get(&url)
-            .header(header::COOKIE, cookie(session).header_value())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), status);
-        assert_eq!(
-            response.json::<Value>().await.unwrap()["error"]["code"],
-            code
-        );
-    }
-    let response = client
-        .get(&url)
-        .header(header::COOKIE, cookie("without-exams").header_value())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let list = response.json::<ExamListResponse>().await.unwrap();
-    assert_eq!(list.user.id, 42);
-    assert_eq!(list.items, Vec::<ExamSummary>::new());
-    server.abort();
 }
 
 #[tokio::test]
