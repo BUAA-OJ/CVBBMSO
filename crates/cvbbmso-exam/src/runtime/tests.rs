@@ -35,7 +35,7 @@ use tokio_tungstenite::{
 use url::Url;
 use uuid::Uuid;
 
-use super::{Capture, Launch, Timing, launch};
+use super::{Capture, Launch, Timing, launch, session::Liveness};
 use crate::{ExamConfig, ExamError, ExamHandle, UiNotice, journal::Journal, monitor::Monitor};
 
 const EXAM: Uuid = Uuid::from_u128(0x10);
@@ -46,11 +46,14 @@ const WAIT: Duration = Duration::from_secs(5);
 
 fn timing() -> Timing {
     Timing {
-        heartbeat: Duration::from_secs(60),
-        silence: Duration::from_secs(60),
+        liveness: Liveness {
+            heartbeat: Duration::from_secs(60),
+            silence: Duration::from_secs(60),
+        },
         reconnect_min: Duration::from_millis(20),
         reconnect_max: Duration::from_millis(100),
         retry: Duration::from_millis(20),
+        retry_max: Duration::from_millis(20),
         start_attempts: 3,
         finish_attempts: 2,
         ack_timeout: Duration::from_secs(60),
@@ -543,4 +546,83 @@ async fn a_rejected_session_fails_connect_with_auth() {
     assert!(conn.ws.is_none());
     let error = pending.await.unwrap().unwrap_err();
     assert!(matches!(error, ExamError::Auth), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_failed_journal_write_keeps_the_exam_running() {
+    let mut harness = Harness::new().await;
+    let (mut conn, handle) = harness.connected(ExamPhase::Running).await;
+    let mut view = handle.subscribe();
+    start_recording(&mut conn).await;
+    // A directory where the temporary snapshot goes makes every save fail.
+    let blocker = harness
+        .candidate_dir()
+        .join("runtime")
+        .join("journal.json.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+
+    harness
+        .recorder
+        .send(RecorderEvent::SegmentFinalized(segment(1)))
+        .await
+        .unwrap();
+
+    assert_eq!(expect_event(conn.recv().await).0, 1);
+    timeout(
+        WAIT,
+        view.wait_for(|view| view.last_error_code.as_deref() == Some("INTERNAL_ERROR")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    std::fs::remove_dir(&blocker).unwrap();
+    harness
+        .recorder
+        .send(RecorderEvent::SegmentFinalized(segment(2)))
+        .await
+        .unwrap();
+    assert_eq!(expect_event(conn.recv().await).0, 2);
+    timeout(WAIT, view.wait_for(|view| view.last_error_code.is_none()))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn capture_is_retried_after_start_exam_reports_failure() {
+    let mut harness = Harness::new().await;
+    let (mut conn, _handle) = harness.connected(ExamPhase::Running).await;
+    harness.script.fail_next_starts(4);
+
+    conn.send(command(1, CommandName::StartExam)).await;
+
+    expect_incident(conn.recv().await, IncidentCode::RecordingFailed);
+    expect_status(
+        &conn.recv().await,
+        state(ExecutionState::Recording, RecordingState::Failed),
+    );
+    expect_result(&conn.recv().await, 1, CommandStatus::Failed);
+    conn.send(ack(1)).await;
+    // The third failure used up the attempts; retries go on and the fifth
+    // start recovers.
+    expect_status(
+        &conn.recv().await,
+        state(ExecutionState::Recording, RecordingState::Capturing),
+    );
+    expect_incident(conn.recv().await, IncidentCode::RecordingRecovered);
+    assert_eq!(harness.script.calls().len(), 5);
+}
+
+#[tokio::test]
+async fn reopening_a_finished_exam_closes_the_connection() {
+    let mut harness = Harness::new().await;
+    let mut journal = Journal::open(&harness.candidate_dir()).await.unwrap();
+    journal.set_state(state(ExecutionState::Finished, RecordingState::Complete));
+    journal.save().await.unwrap();
+
+    let (mut conn, handle) = harness.connected(ExamPhase::Ended).await;
+
+    conn.closed().await;
+    assert!(!handle.subscribe().borrow().connected);
 }

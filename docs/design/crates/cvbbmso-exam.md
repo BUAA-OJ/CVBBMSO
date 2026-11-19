@@ -64,7 +64,7 @@ impl ExamHandle {
 
 `Exam::connect` 首先调用 `GET /api/exams` 确认用户身份和考试报名，以返回的 `user.id` 定位本地 `(exam_id, oj_user_id)` 数据，然后打开/恢复 recorder、建立 WSS 并等待初始 `sync`。`ExamConfig.instance_id` 由客户端进程启动时生成，在该进程的所有重连中保持一致；`device_id` 是持久设备标识。`Exam::connect` 是该 crate 的唯一启动入口。
 
-`ExamError` 是运行时错误类别：`Auth` / `NotEnrolled` 对应认证与报名错误，`Http` / `WebSocket` / `Recording` / `Storage` 对应连接、录像或存储失败，并在有底层原因时携带它，供应用层通过 `anyhow` 输出完整 source 链；`Closed` 表示句柄已关闭。无法恢复的本地故障通过 `ClientView.last_error_code` 暴露，并停止运行时。
+`ExamError` 是运行时错误类别：`Auth` / `NotEnrolled` 对应认证与报名错误，`Http` / `WebSocket` / `Recording` / `Storage` 对应连接、录像或存储失败，并在有底层原因时携带它，供应用层通过 `anyhow` 输出完整 source 链；`Closed` 表示句柄已关闭。本地数据写盘失败不停止运行时：`ClientView.last_error_code` 置为 `INTERNAL_ERROR`，内存中的队列继续工作，下一次写盘成功后清除；序号锚定保证写盘失败期间崩溃也不会复用服务端已有的 `seq`。
 
 一个客户端进程内每个 `exam_id` 最多有一个活跃 `ExamHandle`，客户端整体同时承载一场活动考试。`ExamHandle` 提供状态订阅、UI 通知和关闭。
 
@@ -105,7 +105,7 @@ stateDiagram-v2
 `execution` 表示考试运行阶段，`recording` 表示采集阶段；二者必须符合 [protocol](cvbbmso-protocol.md#clientstate-合法组合) 的组合矩阵：
 
 - `ready` 只能与 `idle` 同时出现。
-- `recording` 与 `capturing` 或 `failed` 同时出现；`failed` 表示故障、重试中或重试耗尽，考试仍继续。
+- `recording` 与 `capturing` 或 `failed` 同时出现；`failed` 表示故障或重试中，考试仍继续。
 - `finalizing` 与 `finalizing`、`complete` 或 `failed` 同时出现；`complete` / `failed` 表示 finalize 已结束、等待结束握手。
 - `finished` 与 `complete` 或 `failed` 同时出现。
 
@@ -127,7 +127,7 @@ stateDiagram-v2
 | --- | --- |
 | 心跳 | 每 5 秒发送 `heartbeat`，同时发送 WebSocket Ping |
 | 判定连接失效 | 20 秒内未收到任何帧（含 Pong）；握手与首个 `sync` 同样以 20 秒为限 |
-| 启动采集 | 最多 5 次，间隔 3 秒 |
+| 启动采集 | 前 5 次间隔 3 秒，之后每 60 秒一次，直到成功或考试收尾 |
 | finalize | 最多 3 次，间隔 3 秒；`NoSegments` 不重试 |
 | 等待 `CommandAck` | 30 秒，超时按断线重连处理 |
 
@@ -136,8 +136,8 @@ stateDiagram-v2
 ## 录屏故障与重试
 
 - 录屏采集、编码或写盘失败时，recorder 发送 `Fault`；运行时上报 `recording_failed` incident，并将 `recording` 置为 `failed`，`execution` 保持 `recording`。
-- 运行时按有界退避策略调用 `Recorder::start` 重试；成功后 `recording` 回到 `capturing`，上报 `recording_recovered`。重试耗尽后保持 `recording/failed`，考试继续。
-- `start_exam` 的 `command_result` 在首次成功启动后回 `completed`；若重试耗尽，回 `failed(RECORDING_START_FAILED)`。命令结果在进入终态后固定。
+- 运行时持续调用 `Recorder::start` 重试（间隔见上表）；成功后 `recording` 回到 `capturing`，上报 `recording_recovered`。重试期间保持 `recording/failed`，考试继续。同一次故障只上报一条 `recording_failed`。
+- `start_exam` 的 `command_result` 在首次成功启动后回 `completed`；前 5 次均失败时回 `failed(RECORDING_START_FAILED)`，此后的重试不改变已发送的结果。
 - 采集故障后的 `end_exam` 仍尝试 `Recorder::finish` 收尾已封存分片；没有分片时按 `RECORDING_FINISH_FAILED` 失败。
 - 录屏采集范围为主显示器，音频关闭。屏幕权限探测与申请由 `cvbbmso-client` 负责。
 

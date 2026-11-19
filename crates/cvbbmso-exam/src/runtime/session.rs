@@ -39,9 +39,9 @@ pub(super) enum Inbound {
 
 /// Heartbeat cadence and the silence after which a connection counts as dead.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Liveness {
-    pub(super) heartbeat: Duration,
-    pub(super) silence: Duration,
+pub(crate) struct Liveness {
+    pub(crate) heartbeat: Duration,
+    pub(crate) silence: Duration,
 }
 
 /// Connects in the background and reports to `inbound`.
