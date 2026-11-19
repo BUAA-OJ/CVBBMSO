@@ -1,6 +1,20 @@
 //! Exercises HTTPS and WSS against a loopback monitor with synthetic sessions.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+#[path = "../src/monitor.rs"]
+mod monitor;
+#[path = "support/tls.rs"]
+mod tls;
+
+use monitor::{Monitor, MonitorError};
 
 use axum::{
     Json, Router,
@@ -9,9 +23,8 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::get,
-    serve::Listener,
 };
 use cvbbmso_accoding::AccodingCookies;
 use cvbbmso_protocol::{
@@ -21,18 +34,10 @@ use cvbbmso_protocol::{
 };
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
-use rustls::{
-    ClientConfig, RootCertStore, ServerConfig,
-    pki_types::{CertificateDer, PrivatePkcs8KeyDer},
-};
+use rustls::{ClientConfig, RootCertStore, pki_types::CertificateDer};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
-use tokio::{
-    net::{TcpListener, TcpStream},
-    task::JoinHandle,
-    time::timeout,
-};
-use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use tokio::{task::JoinHandle, time::timeout};
 use tokio_tungstenite::{
     Connector, connect_async_tls_with_config, tungstenite::client::IntoClientRequest,
 };
@@ -94,6 +99,13 @@ fn enrollments(
 }
 
 async fn exam_list(headers: HeaderMap) -> Response {
+    if headers.get(header::COOKIE) == Some(&cookie("malformed").header_value()) {
+        return Json(json!({
+            "user": {"id": 0, "username": "test", "nickname": "Test"},
+            "items": []
+        }))
+        .into_response();
+    }
     match enrollments(&headers) {
         Ok(list) => Json(list).into_response(),
         Err((status, code, message)) => fail(status, code, message),
@@ -136,46 +148,7 @@ async fn first_frame(mut ws: WebSocket) {
         .await;
 }
 
-struct TlsFixture {
-    acceptor: TlsAcceptor,
-    tcp: TcpListener,
-}
-
-impl Listener for TlsFixture {
-    type Io = TlsStream<TcpStream>;
-    type Addr = SocketAddr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            let (stream, addr) = self.tcp.accept().await.unwrap();
-            if let Ok(Ok(stream)) = timeout(LIMIT, self.acceptor.accept(stream)).await {
-                return (stream, addr);
-            }
-        }
-    }
-
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.tcp.local_addr()
-    }
-}
-
 async fn fixture() -> (SocketAddr, CertificateDer<'static>, JoinHandle<()>) {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let rcgen::CertifiedKey { cert, signing_key } =
-        rcgen::generate_simple_self_signed(["127.0.0.1".to_owned()]).unwrap();
-    let cert = cert.der().clone();
-    let tls = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![cert.clone()],
-            PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
-        )
-        .unwrap();
-    let listener = TlsFixture {
-        acceptor: TlsAcceptor::from(Arc::new(tls)),
-        tcp: listener,
-    };
     let app = Router::new()
         .route(
             "/api/health",
@@ -183,8 +156,7 @@ async fn fixture() -> (SocketAddr, CertificateDer<'static>, JoinHandle<()>) {
         )
         .route("/api/exams", get(exam_list))
         .route("/api/exams/{exam_id}/ws", get(upgrade));
-    let server = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
-    (addr, cert, server)
+    tls::serve(app).await
 }
 
 fn cookie(session: &str) -> AccodingCookies {
@@ -319,5 +291,94 @@ async fn websocket_checks_identity_and_answers_hello_with_sync() {
             ack_event_through: 0,
         }
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn monitor_validates_the_https_exam_list_and_returns_only_items() {
+    let (addr, cert, server) = fixture().await;
+    let origin = url::Url::parse(&format!("https://{addr}"))
+        .unwrap()
+        .origin();
+    let root = reqwest::Certificate::from_der(cert.as_ref()).unwrap();
+    let monitor = Monitor::with_root_certificate(origin.clone(), root).unwrap();
+
+    let items = monitor.list_exams(&cookie("enrolled")).await.unwrap();
+    assert_eq!(
+        items,
+        [ExamSummary::new(
+            EXAM_ID,
+            "Synthetic exam".into(),
+            at(0),
+            at(3600),
+            ExamPhase::Scheduled,
+        )
+        .unwrap()]
+    );
+    assert_eq!(
+        monitor.list_exams(&cookie("without-exams")).await.unwrap(),
+        Vec::<ExamSummary>::new()
+    );
+    assert!(matches!(
+        monitor.list_exams(&cookie("expired")).await,
+        Err(MonitorError::SignInRequired)
+    ));
+    assert!(matches!(
+        monitor.list_exams(&cookie("upstream-down")).await,
+        Err(MonitorError::Unavailable)
+    ));
+    assert!(matches!(
+        monitor.list_exams(&cookie("malformed")).await,
+        Err(MonitorError::InvalidResponse(_))
+    ));
+
+    let untrusted = Monitor::new(Some(origin)).unwrap();
+    assert!(matches!(
+        untrusted.list_exams(&cookie("enrolled")).await,
+        Err(MonitorError::Connection(_))
+    ));
+    assert!(matches!(
+        Monitor::new(None),
+        Err(MonitorError::Configuration)
+    ));
+    let plaintext = url::Url::parse("http://127.0.0.1").unwrap().origin();
+    assert!(matches!(
+        Monitor::new(Some(plaintext)),
+        Err(MonitorError::Configuration)
+    ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn monitor_refuses_redirects_even_within_the_configured_origin() {
+    let target_hits = Arc::new(AtomicUsize::new(0));
+    let hits = target_hits.clone();
+    let (addr, cert, server) = tls::serve(
+        Router::new()
+            .route(
+                "/api/exams",
+                get(|| async { Redirect::temporary("/unexpected") }),
+            )
+            .route(
+                "/unexpected",
+                get(move || async move {
+                    hits.fetch_add(1, Ordering::Relaxed);
+                    StatusCode::OK
+                }),
+            ),
+    )
+    .await;
+    let origin = url::Url::parse(&format!("https://{addr}"))
+        .unwrap()
+        .origin();
+    let root = reqwest::Certificate::from_der(cert.as_ref()).unwrap();
+    let monitor = Monitor::with_root_certificate(origin, root).unwrap();
+    assert!(matches!(
+        monitor.list_exams(&cookie("enrolled")).await,
+        Err(MonitorError::UnexpectedStatus(
+            StatusCode::TEMPORARY_REDIRECT
+        ))
+    ));
+    assert_eq!(target_hits.load(Ordering::Relaxed), 0);
     server.abort();
 }

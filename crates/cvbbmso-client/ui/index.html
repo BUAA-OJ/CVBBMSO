@@ -16,7 +16,15 @@
         <button id="open" type="button">打开 Accoding</button>
         <button id="inspect" type="button" disabled>检查会话</button>
       </div>
-      <p id="session" role="status" aria-live="polite"></p>
+      <p id="session" role="status"></p>
+      <section class="exam-panel" aria-labelledby="exam-heading">
+        <div class="exam-heading">
+          <h2 id="exam-heading">报名考试</h2>
+          <button id="refresh-exams" type="button" disabled>加载列表</button>
+        </div>
+        <p id="exam-status" role="status">登录 Accoding 后加载报名列表。</p>
+        <ul id="exams" class="exam-list"></ul>
+      </section>
     </main>
   </body>
 </html>

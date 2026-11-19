@@ -8,6 +8,8 @@
 #[cfg(any(target_os = "macos", windows))]
 mod desktop;
 #[cfg(any(target_os = "macos", windows))]
+mod monitor;
+#[cfg(any(target_os = "macos", windows))]
 mod policy;
 
 #[cfg(any(target_os = "macos", windows))]
