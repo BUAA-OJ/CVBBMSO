@@ -388,7 +388,7 @@ async fn monitor_accepts_the_size_limit_and_stops_reading_chunked_overflow() {
     let monitor = Monitor::with_root_certificate(origin, root).unwrap();
 
     let items = monitor.list_exams(&cookie("at-limit")).await.unwrap();
-    assert!(items.is_empty());
+    assert_eq!(items, Vec::<ExamSummary>::new());
     assert!(matches!(
         timeout(LIMIT, monitor.list_exams(&cookie("oversized")))
             .await
