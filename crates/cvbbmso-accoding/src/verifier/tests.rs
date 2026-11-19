@@ -1,3 +1,7 @@
+use std::net::Ipv4Addr;
+
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use wiremock::matchers::{any, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -5,6 +9,7 @@ use super::{IDENTITY_URL, Verifier};
 use crate::{AccodingCookies, AccodingError};
 
 const IDENTITY_PATH: &str = "/api/users/me";
+const IDENTITY_BODY_LIMIT: usize = 16 * 1024;
 
 async fn mock_identity(server: &MockServer, response: ResponseTemplate) {
     Mock::given(method("GET"))
@@ -21,15 +26,16 @@ async fn mock_identity(server: &MockServer, response: ResponseTemplate) {
 }
 
 async fn verify(server: &MockServer) -> Result<cvbbmso_protocol::AccodingUser, AccodingError> {
+    verify_at(&format!("{}{IDENTITY_PATH}", server.uri())).await
+}
+
+async fn verify_at(url: &str) -> Result<cvbbmso_protocol::AccodingUser, AccodingError> {
     let cookies = AccodingCookies::from_pairs([
         ("connect.sid".into(), "s%3Asynthetic.sig".into()),
         ("_zte_sid_".into(), "auxiliary".into()),
     ])
     .unwrap();
-    Verifier::new()
-        .unwrap()
-        .verify_at(&format!("{}{IDENTITY_PATH}", server.uri()), &cookies)
-        .await
+    Verifier::new().unwrap().verify_at(url, &cookies).await
 }
 
 #[test]
@@ -58,6 +64,59 @@ async fn returns_the_protocol_user_and_sends_all_cookie_pairs() {
     assert_eq!(user.id, 12345);
     assert_eq!(user.username, "student@example.test");
     assert_eq!(user.nickname, "学生");
+}
+
+fn padded_identity(size: usize) -> Vec<u8> {
+    let mut body =
+        br#"{"id":12345,"username":"student@example.test","nickname":"student"}"#.to_vec();
+    body.resize(size, b' ');
+    body
+}
+
+#[tokio::test]
+async fn accepts_an_identity_body_at_the_limit() {
+    let server = MockServer::start().await;
+    mock_identity(
+        &server,
+        ResponseTemplate::new(200)
+            .set_body_raw(padded_identity(IDENTITY_BODY_LIMIT), "application/json"),
+    )
+    .await;
+
+    assert_eq!(verify(&server).await.unwrap().id, 12345);
+}
+
+#[tokio::test]
+async fn rejects_a_chunked_identity_body_over_the_limit_without_content_length() {
+    // Use a loopback socket because Wiremock buffers response bodies into one frame.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let url = format!("http://{}{IDENTITY_PATH}", listener.local_addr().unwrap());
+    let send_response = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            line.clear();
+        }
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+        let body = padded_identity(IDENTITY_BODY_LIMIT + 1);
+        for chunk in body.chunks(IDENTITY_BODY_LIMIT / 2 + 1) {
+            response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            response.extend_from_slice(chunk);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        stream.get_mut().write_all(&response).await.unwrap();
+    });
+    assert!(matches!(
+        verify_at(&url).await,
+        Err(AccodingError::InvalidResponse(None))
+    ));
+    send_response.await.unwrap();
 }
 
 #[tokio::test]
@@ -93,6 +152,21 @@ async fn classifies_login_redirect_without_requesting_the_form() {
     assert!(matches!(
         verify(&server).await,
         Err(AccodingError::Unauthenticated)
+    ));
+}
+
+#[tokio::test]
+async fn rejects_not_modified_even_with_a_login_location() {
+    let server = MockServer::start().await;
+    mock_identity(
+        &server,
+        ResponseTemplate::new(304).insert_header("Location", "/user/login"),
+    )
+    .await;
+
+    assert!(matches!(
+        verify(&server).await,
+        Err(AccodingError::InvalidResponse(None))
     ));
 }
 

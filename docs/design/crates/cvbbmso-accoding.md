@@ -42,9 +42,11 @@ impl Verifier {
 
 `AccodingCookies` 构造时要求恰好有一个非空 `connect.sid`。缺失或空值返回 `MissingSession`，重复的会话 Cookie 或不符合 Cookie 头语法的名值返回 `InvalidHeader`。Cookie 值和顺序原样保留，服务端用整组 Cookie 复验。
 
-`Verifier` 只向固定的学生站身份接口发送 Cookie。HTTP 客户端的请求超时为 10 秒，并禁用重定向。`401`、指向同 Origin `/user/login` 的重定向、`200` 空正文或仅含 ASCII 空白的正文返回 `Unauthenticated`。HTTP 客户端初始化失败、传输错误和其他上游 HTTP 错误状态返回 `Upstream`。其余异常状态、无效 JSON 和不符合 `AccodingUser` 约束的身份数据返回 `InvalidResponse`。
+`Verifier` 只向固定的学生站身份接口发送 Cookie。HTTP 客户端的请求超时为 10 秒，并禁用重定向。`401`、指向同 Origin `/user/login` 的 `301`、`302`、`303`、`307` 或 `308`，以及 `200` 的空正文或纯 ASCII 空白正文，均返回 `Unauthenticated`。
 
-服务端将缺失会话和 `Unauthenticated` 映射为 `ACCODING_AUTH_EXPIRED`，将 `Upstream` / `InvalidResponse` 映射为 `ACCODING_UNAVAILABLE` 或 `INTERNAL_ERROR`。
+身份响应正文最多接收 16 KiB（16,384 字节）。`Verifier` 按实际读取的字节累计，超出上限时立即停止读取并返回 `InvalidResponse`。异常响应状态、无效 JSON 和不满足 `AccodingUser` 约束的身份数据也返回 `InvalidResponse`。HTTP 客户端初始化失败、传输错误和其他上游 HTTP 错误状态返回 `Upstream`。
+
+服务端对 HTTP `/api/exams` 和 WebSocket 升级前的握手使用同一错误映射。非法 Cookie 或重复的 `connect.sid` 产生 `InvalidHeader`，返回 `400 INVALID_REQUEST`。`MissingSession` 和 `Unauthenticated` 返回 `401 ACCODING_AUTH_EXPIRED`。`Upstream` 和 `InvalidResponse` 映射为 `ACCODING_UNAVAILABLE` 或 `INTERNAL_ERROR`。
 
 ## Accoding 登录与认证协议
 
@@ -72,7 +74,7 @@ username=user%40example.com&password=<url-encoded-password>&_csrf=<url-encoded-c
 {"id":12345,"username":"user@example.com","nickname":"示例用户"}
 ```
 
-匿名响应同样为 HTTP `200`，Content-Type 为 `application/json`，正文为空。`Verifier::verify` 在得到有效用户对象时返回 `AccodingUser`；空正文映射为 `Unauthenticated`，监考服务端在握手认证失败时映射为 `401 ACCODING_AUTH_EXPIRED`。
+匿名响应同样为 HTTP `200`，Content-Type 为 `application/json`，正文为空。
 
 ## 与其他 crate 的边界
 

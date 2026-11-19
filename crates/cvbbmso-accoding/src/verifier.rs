@@ -7,6 +7,7 @@ use crate::{AccodingCookies, AccodingError};
 
 const IDENTITY_URL: &str = "https://accoding.buaa.edu.cn/api/users/me";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_IDENTITY_BODY_BYTES: usize = 16 * 1024;
 
 /// Verifies an account against the fixed Accoding student identity endpoint.
 pub struct Verifier {
@@ -35,7 +36,8 @@ impl Verifier {
     ///
     /// Returns [`AccodingError::Unauthenticated`] for anonymous or expired sessions,
     /// [`AccodingError::Upstream`] for request failures, or
-    /// [`AccodingError::InvalidResponse`] for unexpected statuses or invalid identities.
+    /// [`AccodingError::InvalidResponse`] for unexpected statuses, bodies over 16 KiB,
+    /// or invalid identities.
     pub async fn verify(&self, cookies: &AccodingCookies) -> Result<AccodingUser, AccodingError> {
         self.verify_at(IDENTITY_URL, cookies).await
     }
@@ -57,14 +59,20 @@ impl Verifier {
         if response.status() == StatusCode::UNAUTHORIZED || redirects_to_login(&response) {
             return Err(AccodingError::Unauthenticated);
         }
-        let response = response
+        let mut response = response
             .error_for_status()
             .map_err(AccodingError::Upstream)?;
         if response.status() != StatusCode::OK {
             return Err(AccodingError::InvalidResponse(None));
         }
 
-        let body = response.bytes().await.map_err(AccodingError::Upstream)?;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(AccodingError::Upstream)? {
+            if chunk.len() > MAX_IDENTITY_BODY_BYTES - body.len() {
+                return Err(AccodingError::InvalidResponse(None));
+            }
+            body.extend_from_slice(&chunk);
+        }
         match body.iter().find(|byte| !byte.is_ascii_whitespace()) {
             // Accoding uses an empty HTTP 200 response for anonymous users.
             None => Err(AccodingError::Unauthenticated),
@@ -77,15 +85,19 @@ impl Verifier {
 }
 
 fn redirects_to_login(response: &Response) -> bool {
-    response.status().is_redirection()
-        && response
-            .headers()
-            .get(header::LOCATION)
-            .and_then(|location| location.to_str().ok())
-            .and_then(|location| response.url().join(location).ok())
-            .is_some_and(|url| {
-                url.origin() == response.url().origin() && url.path() == "/user/login"
-            })
+    matches!(
+        response.status(),
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    ) && response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|location| location.to_str().ok())
+        .and_then(|location| response.url().join(location).ok())
+        .is_some_and(|url| url.origin() == response.url().origin() && url.path() == "/user/login")
 }
 
 #[cfg(test)]
