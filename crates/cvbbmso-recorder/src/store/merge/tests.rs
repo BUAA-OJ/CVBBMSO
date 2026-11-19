@@ -98,6 +98,43 @@ fn sample_count(file: &[u8]) -> u32 {
     u32::from_be_bytes(stsz[8..12].try_into().expect("sample count"))
 }
 
+fn deltas(file: &[u8]) -> Vec<u32> {
+    let top = Boxes::parse(file);
+    let moov = Boxes::parse(top.child(*b"moov"));
+    let trak = Boxes::parse(moov.child(*b"trak"));
+    let mdia = Boxes::parse(trak.child(*b"mdia"));
+    let minf = Boxes::parse(mdia.child(*b"minf"));
+    let stbl = Boxes::parse(minf.child(*b"stbl"));
+    let stts = stbl.child(*b"stts");
+    let runs = u32::from_be_bytes(stts[4..8].try_into().expect("run count"));
+    let mut deltas = Vec::new();
+    for index in 0..runs {
+        let offset = 8 + 8 * usize::try_from(index).expect("index");
+        let count = u32::from_be_bytes(stts[offset..offset + 4].try_into().expect("count"));
+        let delta = u32::from_be_bytes(stts[offset + 4..offset + 8].try_into().expect("delta"));
+        deltas.extend(std::iter::repeat_n(
+            delta,
+            usize::try_from(count).expect("count"),
+        ));
+    }
+    deltas
+}
+
+/// Reads the duration fields that must agree with the sample table.
+fn durations(file: &[u8]) -> (u32, u32, u32) {
+    let top = Boxes::parse(file);
+    let moov = Boxes::parse(top.child(*b"moov"));
+    let mvhd = moov.child(*b"mvhd");
+    let trak = Boxes::parse(moov.child(*b"trak"));
+    let tkhd = trak.child(*b"tkhd");
+    let mdia = Boxes::parse(trak.child(*b"mdia"));
+    let media_header = mdia.child(*b"mdhd");
+    let read = |payload: &[u8], offset: usize| {
+        u32::from_be_bytes(payload[offset..offset + 4].try_into().expect("duration"))
+    };
+    (read(mvhd, 16), read(tkhd, 20), read(media_header, 16))
+}
+
 fn mdat(file: &[u8]) -> Vec<u8> {
     Boxes::parse(file).child(*b"mdat").to_vec()
 }
@@ -131,6 +168,75 @@ fn merges_segments_into_one_movie() {
         digest,
         crate::store::hash_file(&store.final_path()).expect("digest")
     );
+}
+
+#[test]
+fn normalizes_nonzero_segment_origins() {
+    let directory = TempDir::new().expect("temp dir");
+    let mut store = store(&directory);
+    seal(&mut store, 1, 0, &segment(&[100, 166], 1));
+    seal(&mut store, 2, 30, &segment(&[100, 166], 2));
+
+    store.merge().expect("merge");
+    let file = fs::read(store.final_path()).expect("final video");
+
+    assert_eq!(deltas(&file), [66, 66, 66, 66]);
+    assert_eq!(durations(&file), (264, 264, 264));
+}
+
+#[test]
+fn normalizes_a_second_segment_with_global_timestamps() {
+    let directory = TempDir::new().expect("temp dir");
+    let mut store = store(&directory);
+    seal(&mut store, 1, 0, &segment(&[0, 66], 1));
+    seal(&mut store, 2, 30, &segment(&[1_000, 1_066], 2));
+
+    store.merge().expect("merge");
+    let file = fs::read(store.final_path()).expect("final video");
+
+    assert_eq!(deltas(&file), [66, 66, 66, 66]);
+    assert_eq!(durations(&file), (264, 264, 264));
+}
+
+#[test]
+fn final_single_frame_segment_keeps_the_one_millisecond_tail() {
+    let directory = TempDir::new().expect("temp dir");
+    let mut store = store(&directory);
+    seal(&mut store, 1, 0, &segment(&[0, 66], 1));
+    seal(&mut store, 2, 30, &segment(&[0], 2));
+
+    store.merge().expect("merge");
+    let file = fs::read(store.final_path()).expect("final video");
+
+    assert_eq!(deltas(&file), [66, 66, 1]);
+    assert_eq!(durations(&file), (133, 133, 133));
+}
+
+#[test]
+fn a_single_frame_recording_lasts_one_millisecond() {
+    let directory = TempDir::new().expect("temp dir");
+    let mut store = store(&directory);
+    seal(&mut store, 1, 0, &segment(&[0], 1));
+
+    store.merge().expect("merge");
+    let file = fs::read(store.final_path()).expect("final video");
+
+    assert_eq!(deltas(&file), [1]);
+    assert_eq!(durations(&file), (1, 1, 1));
+}
+
+#[test]
+fn final_segment_tail_uses_its_own_frame_interval() {
+    let directory = TempDir::new().expect("temp dir");
+    let mut store = store(&directory);
+    seal(&mut store, 1, 0, &segment(&[0, 66], 1));
+    seal(&mut store, 2, 30, &segment(&[0, 100], 2));
+
+    store.merge().expect("merge");
+    let file = fs::read(store.final_path()).expect("final video");
+
+    assert_eq!(deltas(&file), [66, 66, 100, 100]);
+    assert_eq!(durations(&file), (332, 332, 332));
 }
 
 #[test]

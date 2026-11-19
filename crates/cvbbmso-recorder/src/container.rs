@@ -17,6 +17,39 @@ pub(crate) use mp4::Mp4Writer;
 
 use thiserror::Error;
 
+/// Colour description shared by the segment and merged containers.
+///
+/// The values are the Matroska/ISO 14496-12 code points for the BT.709
+/// limited-range conversion performed by `Nv12Frame`, with chroma centered in
+/// each 2x2 block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Colour {
+    /// Colour primaries: 1 is BT.709.
+    pub(crate) primaries: u16,
+    /// Transfer characteristics: 1 is BT.709.
+    pub(crate) transfer: u16,
+    /// Matrix coefficients: 1 is BT.709.
+    pub(crate) matrix: u16,
+    /// Nominal range: 1 is limited (16-235).
+    pub(crate) range: u16,
+    /// Horizontal chroma siting: 2 is half (centered).
+    pub(crate) chroma_siting_horz: u16,
+    /// Vertical chroma siting: 2 is half (centered).
+    pub(crate) chroma_siting_vert: u16,
+}
+
+impl Colour {
+    /// The conversion performed by `Nv12Frame`: BT.709 limited, centered chroma.
+    pub(crate) const BT709_LIMITED_CENTERED: Self = Self {
+        primaries: 1,
+        transfer: 1,
+        matrix: 1,
+        range: 1,
+        chroma_siting_horz: 2,
+        chroma_siting_vert: 2,
+    };
+}
+
 /// Failure while writing or reading a recording container.
 #[derive(Debug, Error)]
 pub(crate) enum ContainerError {

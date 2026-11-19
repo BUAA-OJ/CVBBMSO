@@ -16,9 +16,10 @@ impl SegmentStore {
     /// Merges every sealed segment into `final.mp4` and returns its digest.
     ///
     /// Segments are concatenated in media order: the first sample of a segment
-    /// follows the last sample of the previous one, so a capture gap does not
-    /// produce a frozen span in the final video. The wall-clock span remains in
-    /// the segment metadata, which is the manifest's evidence.
+    /// follows the last sample of the previous one, and each segment's own first
+    /// timestamp is treated as zero. The wall-clock span remains in the segment
+    /// metadata, which is the manifest's evidence. The final segment's tail
+    /// duration is passed explicitly to the MP4 writer.
     ///
     /// # Errors
     ///
@@ -35,6 +36,7 @@ impl SegmentStore {
         let mut writer: Option<Mp4Writer> = None;
         let mut layout: Option<(crate::container::AvcConfig, u32, u32)> = None;
         let mut cursor = 0_u64;
+        let mut final_tail = 1_u64;
         for meta in &segments {
             let file = self.parse_segment(meta)?;
             let current = (file.config.clone(), file.width, file.height);
@@ -54,9 +56,15 @@ impl SegmentStore {
             let Some(writer) = writer.as_mut() else {
                 return Err(merge_error("segment writer was not initialized"));
             };
+            let origin = file.samples.first().map_or(0, |sample| sample.timestamp_ms);
             let mut last = None;
             for sample in &file.samples {
-                let timestamp = cursor.checked_add(sample.timestamp_ms).ok_or_else(|| {
+                // Each segment owns its own zero point. Normalising it here keeps
+                // a late first sample from becoming a frozen gap after rotation.
+                let relative = sample.timestamp_ms.checked_sub(origin).ok_or_else(|| {
+                    merge_error(format!("segment {} samples are out of order", meta.index))
+                })?;
+                let timestamp = cursor.checked_add(relative).ok_or_else(|| {
                     merge_error("merged timeline exceeds the representable range")
                 })?;
                 writer
@@ -65,16 +73,19 @@ impl SegmentStore {
                 last = Some(timestamp);
             }
             if let Some(last) = last {
-                cursor = last
-                    .checked_add(tail_duration(&file.samples))
-                    .ok_or_else(|| {
-                        merge_error("merged timeline exceeds the representable range")
-                    })?;
+                final_tail = tail_duration(&file.samples);
+                cursor = last.checked_add(final_tail).ok_or_else(|| {
+                    merge_error("merged timeline exceeds the representable range")
+                })?;
             }
         }
-        let Some(writer) = writer.as_ref() else {
+        let Some(writer) = writer.as_mut() else {
             return Err(merge_error("segment writer was not initialized"));
         };
+        writer.set_tail_duration(
+            u32::try_from(final_tail)
+                .map_err(|_| merge_error("final frame duration does not fit the MP4 table"))?,
+        );
 
         let header = writer.start().map_err(merge_container)?;
         let expected = writer.data_length();

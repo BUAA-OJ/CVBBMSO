@@ -4,8 +4,8 @@
 //! The caller writes the sample payloads after [`Mp4Writer::start`] returns; the
 //! box layout and chunk offset are fixed before the first payload byte.
 
-use super::ContainerError;
 use super::avc::AvcConfig;
+use super::{Colour, ContainerError};
 
 /// Movie timescale: one tick per millisecond.
 const TIMESCALE: u32 = 1_000;
@@ -37,6 +37,7 @@ pub(crate) struct Mp4Writer {
     height: u32,
     entries: Vec<Entry>,
     data_length: u64,
+    tail_duration: Option<u32>,
 }
 
 impl Mp4Writer {
@@ -48,7 +49,16 @@ impl Mp4Writer {
             height,
             entries: Vec::new(),
             data_length: 0,
+            tail_duration: None,
         }
+    }
+
+    /// Overrides the duration of the last sample.
+    ///
+    /// The merge step knows how long the final frame was shown; without an
+    /// explicit value the writer would reuse the previous sample's delta.
+    pub(crate) fn set_tail_duration(&mut self, duration_ms: u32) {
+        self.tail_duration = Some(duration_ms.max(1));
     }
 
     /// Appends one sample's metadata.
@@ -154,13 +164,16 @@ impl Mp4Writer {
     fn deltas(&self) -> Result<Vec<u32>, ContainerError> {
         let mut deltas = Vec::with_capacity(self.entries.len());
         for (index, entry) in self.entries.iter().enumerate() {
+            let last_duration = self
+                .tail_duration
+                .or_else(|| deltas.last().copied())
+                .unwrap_or(1);
             let delta = self
                 .entries
                 .get(index + 1)
-                .map_or_else(
-                    || u64::from(deltas.last().copied().unwrap_or(1)),
-                    |next| next.timestamp_ms.saturating_sub(entry.timestamp_ms),
-                )
+                .map_or(u64::from(last_duration), |next| {
+                    next.timestamp_ms.saturating_sub(entry.timestamp_ms)
+                })
                 .max(1);
             deltas.push(u32::try_from(delta).map_err(|_| ContainerError::Unsupported)?);
         }
@@ -359,6 +372,16 @@ fn sample_description(layout: &Layout<'_>) -> Result<Vec<u8>, ContainerError> {
     push_u16(&mut entry, 0x0018); // depth
     push_u16(&mut entry, 0xFFFF); // pre-defined
     entry.extend_from_slice(&boxed(*b"avcC", &layout.config.record()?));
+    // MP4 has no separate chroma-siting field; nclx carries the matrix, range,
+    // and primaries so players do not infer a different matrix from the stream.
+    let colour = Colour::BT709_LIMITED_CENTERED;
+    let mut colour_box = Vec::with_capacity(11);
+    colour_box.extend_from_slice(b"nclx");
+    push_u16(&mut colour_box, colour.primaries);
+    push_u16(&mut colour_box, colour.transfer);
+    push_u16(&mut colour_box, colour.matrix);
+    colour_box.push(0); // limited range: the flag bit is clear
+    entry.extend_from_slice(&boxed(*b"colr", &colour_box));
 
     let mut description = Vec::new();
     push_u32(&mut description, 1); // entry count

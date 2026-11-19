@@ -2,7 +2,7 @@
 
 use super::avc::AvcConfig;
 use super::ebml::{self, Parser};
-use super::{ContainerError, Sample};
+use super::{Colour, ContainerError, Sample};
 
 const EBML: u32 = 0x1A45_DFA3;
 const EBML_VERSION: u32 = 0x4286;
@@ -30,6 +30,13 @@ const CODEC_PRIVATE: u32 = 0x63A2;
 const VIDEO: u32 = 0xE0;
 const PIXEL_WIDTH: u32 = 0xB0;
 const PIXEL_HEIGHT: u32 = 0xBA;
+const COLOUR: u32 = 0x55B0;
+const MATRIX_COEFFICIENTS: u32 = 0x55B1;
+const CHROMA_SITING_HORZ: u32 = 0x55B7;
+const CHROMA_SITING_VERT: u32 = 0x55B8;
+const RANGE: u32 = 0x55B9;
+const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
+const PRIMARIES: u32 = 0x55BB;
 
 const CLUSTER: u32 = 0x1F43_B675;
 const TIMECODE: u32 = 0xE7;
@@ -115,6 +122,7 @@ pub(crate) struct MkvFile {
     pub(crate) config: AvcConfig,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) colour: Option<Colour>,
     pub(crate) samples: Vec<Sample>,
 }
 
@@ -155,11 +163,12 @@ impl MkvFile {
             }
         }
 
-        let (config, width, height) = track.ok_or(ContainerError::InvalidContainer)?;
+        let (config, width, height, colour) = track.ok_or(ContainerError::InvalidContainer)?;
         Ok(Self {
             config,
             width,
             height,
+            colour,
             samples,
         })
     }
@@ -199,6 +208,38 @@ fn write_tracks(
     let mut video = Vec::new();
     ebml::unsigned(&mut video, PIXEL_WIDTH, u64::from(width));
     ebml::unsigned(&mut video, PIXEL_HEIGHT, u64::from(height));
+    let mut colour = Vec::new();
+    ebml::unsigned(
+        &mut colour,
+        MATRIX_COEFFICIENTS,
+        u64::from(Colour::BT709_LIMITED_CENTERED.matrix),
+    );
+    ebml::unsigned(
+        &mut colour,
+        CHROMA_SITING_HORZ,
+        u64::from(Colour::BT709_LIMITED_CENTERED.chroma_siting_horz),
+    );
+    ebml::unsigned(
+        &mut colour,
+        CHROMA_SITING_VERT,
+        u64::from(Colour::BT709_LIMITED_CENTERED.chroma_siting_vert),
+    );
+    ebml::unsigned(
+        &mut colour,
+        RANGE,
+        u64::from(Colour::BT709_LIMITED_CENTERED.range),
+    );
+    ebml::unsigned(
+        &mut colour,
+        TRANSFER_CHARACTERISTICS,
+        u64::from(Colour::BT709_LIMITED_CENTERED.transfer),
+    );
+    ebml::unsigned(
+        &mut colour,
+        PRIMARIES,
+        u64::from(Colour::BT709_LIMITED_CENTERED.primaries),
+    );
+    ebml::element(&mut video, COLOUR, &colour);
 
     let mut entry = Vec::new();
     ebml::unsigned(&mut entry, TRACK_NUMBER, 1);
@@ -267,7 +308,7 @@ fn parse_info(payload: &[u8]) -> Result<u64, ContainerError> {
     Ok(scale)
 }
 
-fn parse_tracks(payload: &[u8]) -> Result<(AvcConfig, u32, u32), ContainerError> {
+fn parse_tracks(payload: &[u8]) -> Result<(AvcConfig, u32, u32, Option<Colour>), ContainerError> {
     let mut parser = Parser::new(payload);
     while let Some((id, entry)) = parser.next_element()? {
         if id != TRACK_ENTRY {
@@ -276,24 +317,26 @@ fn parse_tracks(payload: &[u8]) -> Result<(AvcConfig, u32, u32), ContainerError>
         let mut config = None;
         let mut width = 0;
         let mut height = 0;
+        let mut colour = None;
         let mut fields = Parser::new(entry);
         while let Some((id, value)) = fields.next_element()? {
             match id {
                 CODEC_PRIVATE => config = Some(AvcConfig::parse(value)?),
-                VIDEO => (width, height) = parse_video(value)?,
+                VIDEO => (width, height, colour) = parse_video(value)?,
                 _ => {}
             }
         }
         let config = config.ok_or(ContainerError::InvalidContainer)?;
-        return Ok((config, width, height));
+        return Ok((config, width, height, colour));
     }
     Err(ContainerError::InvalidContainer)
 }
 
-fn parse_video(payload: &[u8]) -> Result<(u32, u32), ContainerError> {
+fn parse_video(payload: &[u8]) -> Result<(u32, u32, Option<Colour>), ContainerError> {
     let mut parser = Parser::new(payload);
     let mut width = 0;
     let mut height = 0;
+    let mut colour = None;
     while let Some((id, value)) = parser.next_element()? {
         match id {
             PIXEL_WIDTH => {
@@ -304,10 +347,38 @@ fn parse_video(payload: &[u8]) -> Result<(u32, u32), ContainerError> {
                 height = u32::try_from(Parser::unsigned(value)?)
                     .map_err(|_| ContainerError::InvalidContainer)?;
             }
+            COLOUR => colour = Some(parse_colour(value)?),
             _ => {}
         }
     }
-    Ok((width, height))
+    Ok((width, height, colour))
+}
+
+fn parse_colour(payload: &[u8]) -> Result<Colour, ContainerError> {
+    let mut parser = Parser::new(payload);
+    let mut colour = Colour {
+        primaries: 0,
+        transfer: 0,
+        matrix: 0,
+        range: 0,
+        chroma_siting_horz: 0,
+        chroma_siting_vert: 0,
+    };
+    while let Some((id, value)) = parser.next_element()? {
+        let number = || {
+            u16::try_from(Parser::unsigned(value)?).map_err(|_| ContainerError::InvalidContainer)
+        };
+        match id {
+            PRIMARIES => colour.primaries = number()?,
+            TRANSFER_CHARACTERISTICS => colour.transfer = number()?,
+            MATRIX_COEFFICIENTS => colour.matrix = number()?,
+            RANGE => colour.range = number()?,
+            CHROMA_SITING_HORZ => colour.chroma_siting_horz = number()?,
+            CHROMA_SITING_VERT => colour.chroma_siting_vert = number()?,
+            _ => {}
+        }
+    }
+    Ok(colour)
 }
 
 fn parse_cluster(

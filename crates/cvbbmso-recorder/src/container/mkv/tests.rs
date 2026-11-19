@@ -1,6 +1,6 @@
 use super::{MkvFile, MkvWriter};
 use crate::container::avc::AvcConfig;
-use crate::container::{ContainerError, Sample};
+use crate::container::{Colour, ContainerError, Sample};
 
 const SEQUENCE: [u8; 6] = [0x67, 0x42, 0xC0, 0x1E, 0xD9, 0x01];
 const PICTURE: [u8; 4] = [0x68, 0xCE, 0x38, 0x80];
@@ -46,6 +46,7 @@ fn round_trips_a_single_sample() {
     assert_eq!(file.width, 640);
     assert_eq!(file.height, 360);
     assert_eq!(file.config, config());
+    assert_eq!(file.colour, Some(Colour::BT709_LIMITED_CENTERED));
     assert_eq!(file.samples, vec![sample(0, true)]);
 }
 

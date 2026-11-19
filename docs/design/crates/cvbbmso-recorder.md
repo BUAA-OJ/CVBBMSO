@@ -151,13 +151,15 @@ cargo test -p cvbbmso-recorder --locked writes_sampled_frames_from_the_primary_d
 - 色度取 2×2 RGB 总和后统一加权、舍入，避免提前把每通道平均值截断成整数；16-bit 定点近似相对独立浮点参考允许至多一个码值差异。色度样本在 2×2 块中心，U/V 同相，按 progressive 内容解释。
 - 内部布局为 `width * height` 字节 Y 后跟 `width * height / 2` 字节 UV，两平面内部 stride 均为 width。`copy_to` 将每行有效像素拷贝到目标正 stride 缓冲区，UV 从 `stride * height` 开始；它先验证目标大小与溢出，不改动行填充。平台层应传入实际锁定缓冲区的 pitch，不把 compact 布局等同于任意 MF/D3D surface。
 
-Windows 的 `set_color_attributes` 设置 `MF_MT_YUV_MATRIX = BT709`、`MF_MT_VIDEO_NOMINAL_RANGE = 16_235`，以及匹配居中 2×2 采样的 `MF_MT_VIDEO_CHROMA_SITING = MPEG1 | ProgressiveChroma`。`Encoder::open` 会同时把它应用到 NV12 输入和 H.264 输出媒体类型。当前测试验证属性回读，尚不能用属性存储成功替代码流验证；H.264 VUI 是否一致、彩条、灰阶和彩色文字的编码/解码观感仍须在接入采集流水线后人工验收。
+Windows 的 `set_color_attributes` 设置 `MF_MT_YUV_MATRIX = BT709`、`MF_MT_VIDEO_NOMINAL_RANGE = 16_235`，以及匹配居中 2×2 采样的 `MF_MT_VIDEO_CHROMA_SITING = MPEG1 | ProgressiveChroma`。`Encoder::open` 会同时把它应用到 NV12 输入和 H.264 输出媒体类型。Microsoft H.264 MFT 不接受 `ICodecAPI` 的输出颜色属性，也不写入对应 VUI，因此矩阵、范围和原色由容器层补充：MKV 写 `Colour`，MP4 写 `colr`/`nclx`。MP4 没有标准的色度位置字段，居中色度只在 MKV 的 `Colour` 中表达；彩条、灰阶和彩色文字的编码/解码观感仍须在接入采集流水线后人工验收。
 
 ### M4 输出协商与封装边界
 
 `Encoder::open` 在设置输出类型前通过 `ICodecAPI` 将 `CODECAPI_AVEncMPVDefaultBPictureCount` 置零，使输出按显示顺序单调递增、`PTS = DTS`，因此 MKV 与 MP4 都无需 `ctts` 重排。该属性必须在设置输入类型、开始流式处理之前写入；之后 MFT 将拒绝修改。输入样本必须同时携带时间与时长，否则编码器返回 `MF_E_SAMPLE_HAS_NO_DURATION`。
 
-编码输出按 Media Foundation 的 MFT 协议读取：`GetOutputStreamInfo` 声明输出缓冲区大小且不提供样本，因此每次 `ProcessOutput` 由调用方分配样本；`MF_E_NOTACCEPTING` 表示输出尚未排空，先排空再重试同一输入；`MF_E_TRANSFORM_NEED_MORE_INPUT` 是正常结束；`MF_E_TRANSFORM_STREAM_CHANGE` 时重新设置可用输出类型；`MF_E_BUFFERTOOSMALL` 时扩大缓冲区重试。`flush` 发送 `MFT_MESSAGE_COMMAND_DRAIN`，取回编码器延迟的帧。
+`MF_MT_MAX_KEYFRAME_SPACING` 和 `CODECAPI_AVEncMPVGOPSize` 都不能让该 MFT 稳定遵守两秒关键帧间隔。`Encoder::encode` 每累计 `2 * fps` 个输入帧就通过 `CODECAPI_AVEncVideoForceKeyFrame` 请求下一个输入帧为关键帧；硬件测试连续编码 150 帧并断言实际 IDR 间隔不超过 30 帧。`Encoder::force_keyframe` 供 M5 在分片轮转时显式请求新分片首帧为关键帧，固定 GOP 间隔不能替代该边界请求。
+
+编码输出按 Media Foundation 的 MFT 协议读取：`GetOutputStreamInfo` 声明输出缓冲区大小且不提供样本，因此每次 `ProcessOutput` 由调用方分配样本；`MF_E_NOTACCEPTING` 表示输出尚未排空，先排空再重试同一输入；`MF_E_TRANSFORM_NEED_MORE_INPUT` 是正常结束；`MF_E_TRANSFORM_STREAM_CHANGE` 时重新设置可用输出类型；`MF_E_BUFFERTOOSMALL` 时扩大缓冲区重试。`dwStatus` 中的 `NO_SAMPLE` 与 `STREAM_END` 分别处理无样本和结束；`flush` 发送 `MFT_MESSAGE_COMMAND_DRAIN`，取回编码器延迟的帧。
 
 输出样本的时间戳取 MFT 样本自身的 100 ns 时间并换算为毫秒；`MFSampleExtension_CleanPoint` 或 IDR（NAL 类型 5）标识关键帧。序列参数集和图像参数集来自输出类型的 `MF_MT_MPEG_SEQUENCE_HEADER`，按 Annex B 拆分后构造 `AvcConfig`。编码器输出的 Annex B 码流统一转换为四字节长度前缀的 NAL 单元，再交给 `MkvWriter`。空输出样本被丢弃，不生成零长度块。
 
@@ -168,7 +170,8 @@ Windows 的 `set_color_attributes` 设置 `MF_MT_YUV_MATRIX = BT709`、`MF_MT_VI
 `finish` 按 `index` 升序读取已封存分片，合并为单视频轨 MP4：
 
 - 每个分片在读取时和复制样本时都重新计算 SHA-256 并与 `SegmentMeta.sha256` 比对；分片缺失、摘要不符、容器不可读，或各分片的分辨率、AVC 配置不一致时返回 `Merge`，已封存分片保持不变。
-- 样本按媒体顺序拼接：下一分片的首帧紧接上一分片末帧之后，缺口不会在最终视频中形成冻结画面；实际 UTC 起止时间仍由分片元信息承担证据职责。分片尾部时长取该分片最后两个样本的间隔，单帧分片取 1 ms。
-- MP4 由私有写入器直接生成：`ftyp`、`moov`（`mvhd`、单 `trak`、`avc1` + `avcC`、`stts`、`stsc`、`stsz`、`stss`，偏移表按大小选择 `stco` 或 `co64`）与 `mdat`。样本沿用四字节长度前缀，正好匹配 `avcC` 的 `lengthSizeMinusOne = 3`。
+- 样本按媒体顺序拼接：每段先以该段首帧时间戳为零点归一化，下一分片的首帧紧接上一分片末帧之后，缺口不会在最终视频中形成冻结画面，非零起点也不会产生额外停顿。实际 UTC 起止时间仍由分片元信息承担证据职责。
+- 最后一段的尾帧时长显式传给 MP4 写入器：取该段最后两个样本的间隔，单帧分片取 1 ms；`stts`、`mdhd`、`mvhd` 共用同一时长。
+- MP4 由私有写入器直接生成：`ftyp`、`moov`（`mvhd`、单 `trak`、`avc1` + `avcC` + `colr`、`stts`、`stsc`、`stsz`、`stss`，偏移表按大小选择 `stco` 或 `co64`）与 `mdat`。`colr` 使用 BT.709 limited-range 的 `nclx`；样本沿用四字节长度前缀，正好匹配 `avcC` 的 `lengthSizeMinusOne = 3`。MKV 分片的视频轨同样写 `Colour`，其中包含矩阵、范围、原色和居中色度位置。
 - 先写入同目录的 `final.mp4.tmp`，同步后再重命名为 `final.mp4`；失败不会把半成品发布为最终文件。`open` 清理残留的 `final.mp4.tmp`，再次 `finish` 覆盖重建。分片清单为空时仍由 `finish` 返回 `NoSegments`。
 - `finish` 在 `spawn_blocking` 中完成解析、哈希、写盘与最终文件哈希，避免在 Tokio worker 上执行长磁盘操作；成功后将 manifest 缓存，后续调用返回同一摘要。合并产生的临时文件不进入 manifest。

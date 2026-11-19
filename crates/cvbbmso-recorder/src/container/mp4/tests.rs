@@ -62,6 +62,7 @@ struct Parsed {
     width: u16,
     height: u16,
     config: AvcConfig,
+    colour: Option<(u16, u16, u16, u8)>,
     sync: Vec<u32>,
     sizes: Vec<u32>,
     deltas: Vec<u32>,
@@ -90,6 +91,18 @@ fn parse(file: &[u8]) -> Parsed {
     let sample_entry = Boxes::parse(&description_box[8..]).child(*b"avc1");
     let decoder_config = Boxes::parse(&sample_entry[78..]).child(*b"avcC");
     let config = AvcConfig::parse(decoder_config).expect("configuration record");
+    let colour = Boxes::parse(&sample_entry[78..])
+        .entries
+        .iter()
+        .find(|(id, _)| *id == *b"colr")
+        .map(|(_, payload)| {
+            (
+                u16::from_be_bytes(payload[4..6].try_into().expect("primaries")),
+                u16::from_be_bytes(payload[6..8].try_into().expect("transfer")),
+                u16::from_be_bytes(payload[8..10].try_into().expect("matrix")),
+                payload[10],
+            )
+        });
 
     let time_box = stbl.child(*b"stts");
     let runs = u32::from_be_bytes(time_box[4..8].try_into().expect("run count"));
@@ -149,6 +162,7 @@ fn parse(file: &[u8]) -> Parsed {
         width,
         height,
         config,
+        colour,
         sync,
         sizes,
         deltas,
@@ -190,11 +204,33 @@ fn writes_a_playable_movie_header() {
     assert_eq!(parsed.width, 640);
     assert_eq!(parsed.height, 360);
     assert_eq!(parsed.config, config());
+    assert_eq!(parsed.colour, Some((1, 1, 1, 0)));
     assert_eq!(parsed.sizes, [12, 8, 9]);
     assert_eq!(parsed.deltas, [66, 66, 66]);
     assert_eq!(parsed.sync, [1]);
     assert_eq!(parsed.chunk_offset, (file.len() - payload.len()) as u64);
     assert_eq!(parsed.data, payload);
+}
+
+#[test]
+fn explicit_tail_duration_overrides_the_previous_delta() {
+    let samples = [sample(0, true, 12), sample(66, false, 8)];
+    let mut writer = Mp4Writer::new(config(), 640, 360);
+    for sample in &samples {
+        writer
+            .push(sample.timestamp_ms, sample.keyframe, sample.data.len())
+            .expect("push");
+    }
+    writer.set_tail_duration(1);
+    let mut file = writer.start().expect("start");
+    for sample in samples {
+        file.extend_from_slice(&sample.data);
+    }
+
+    let parsed = parse(&file);
+
+    assert_eq!(parsed.deltas, [66, 1]);
+    assert_eq!(parsed.colour, Some((1, 1, 1, 0)));
 }
 
 #[test]
@@ -206,6 +242,7 @@ fn writes_an_empty_movie() {
 
     assert_eq!(parsed.sizes, Vec::<u32>::new());
     assert_eq!(parsed.sync, Vec::<u32>::new());
+    assert_eq!(parsed.colour, Some((1, 1, 1, 0)));
     assert_eq!(parsed.data, Vec::<u8>::new());
 }
 

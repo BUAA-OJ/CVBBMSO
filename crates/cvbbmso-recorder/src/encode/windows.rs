@@ -2,22 +2,21 @@
 
 use std::{marker::PhantomData, mem::ManuallyDrop, ptr};
 
-use windows::Win32::Foundation::E_INVALIDARG;
 use windows::Win32::Media::MediaFoundation::{
-    CMSH264EncoderMFT, CODECAPI_AVEncMPVDefaultBPictureCount, ICodecAPI, IMFActivate, IMFMediaType,
-    IMFTransform, MF_E_ATTRIBUTENOTFOUND, MF_E_BUFFERTOOSMALL, MF_E_NOTACCEPTING,
-    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MAX_KEYFRAME_SPACING, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_SUBTYPE,
-    MF_MT_VIDEO_CHROMA_SITING, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX, MF_VERSION,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
+    CMSH264EncoderMFT, CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
+    CODECAPI_AVEncVideoForceKeyFrame, ICodecAPI, IMFActivate, IMFMediaType, IMFTransform,
+    MF_E_ATTRIBUTENOTFOUND, MF_E_BUFFERTOOSMALL, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT,
+    MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING, MF_MT_MPEG_SEQUENCE_HEADER,
+    MF_MT_SUBTYPE, MF_MT_VIDEO_CHROMA_SITING, MF_MT_VIDEO_NOMINAL_RANGE, MF_MT_YUV_MATRIX,
+    MF_VERSION, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
     MFNominalRange_16_235, MFSTARTUP_LITE, MFSampleExtension_CleanPoint, MFShutdown, MFStartup,
     MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_ALL, MFT_ENUM_FLAG_SORTANDFILTER,
     MFT_FRIENDLY_NAME_Attribute, MFT_MESSAGE_COMMAND_DRAIN, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_DATA_BUFFER_STREAM_END, MFT_OUTPUT_STREAM_INFO, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
-    MFT_REGISTER_TYPE_INFO, MFTEnumEx, MFVideoChromaSubsampling_MPEG1,
-    MFVideoChromaSubsampling_ProgressiveChroma, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, MFVideoTransferMatrix_BT709,
+    MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE, MFT_OUTPUT_DATA_BUFFER_STREAM_END, MFT_OUTPUT_STREAM_INFO,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MFTEnumEx,
+    MFVideoChromaSubsampling_MPEG1, MFVideoChromaSubsampling_ProgressiveChroma, MFVideoFormat_H264,
+    MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFVideoTransferMatrix_BT709,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
@@ -26,11 +25,38 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Variant::{VARIANT, VT_UI4};
 use windows::core::Error as WindowsError;
 use windows::core::Interface;
-use windows::core::Result as WindowsResult;
 
 use super::Nv12Frame;
 use crate::RecordingError;
-use crate::container::{AvcConfig, Sample, annex_b_nals, length_prefixed, nal_type};
+use crate::container::{
+    AvcConfig, ContainerError, Sample, annex_b_nals, length_prefixed, nal_type,
+};
+
+/// Failure inside the Windows encoder adapter.
+///
+/// Platform calls keep their `windows::core::Error`; parameter-set and framing
+/// failures keep the private container error instead of inventing a Win32 code.
+#[derive(Debug, thiserror::Error)]
+enum EncoderError {
+    /// A COM or Media Foundation call failed.
+    #[error(transparent)]
+    Windows(#[from] WindowsError),
+    /// The encoder emitted data that cannot form a valid AVC configuration.
+    #[error("invalid encoder output: {0}")]
+    Container(
+        #[from]
+        #[source]
+        ContainerError,
+    ),
+    /// The encoder output omitted a required parameter set.
+    #[error("encoder output is missing the {0}")]
+    MissingParameterSet(&'static str),
+    /// A frame or timestamp does not fit a Media Foundation field.
+    #[error("frame does not fit the Media Foundation sample")]
+    UnsupportedFrame,
+}
+
+type EncoderResult<T> = Result<T, EncoderError>;
 
 /// Longest friendly name this crate reads back from an encoder activation.
 const NAME_LENGTH: usize = 128;
@@ -44,7 +70,7 @@ const NAME_LENGTH: usize = 128;
 /// # Errors
 ///
 /// Returns the original Windows error if an attribute cannot be stored.
-fn set_color_attributes(media_type: &IMFMediaType) -> WindowsResult<()> {
+fn set_color_attributes(media_type: &IMFMediaType) -> EncoderResult<()> {
     // SAFETY: the media type owns its writable attributes; each GUID and enum
     // value comes from Media Foundation. Chroma is centered by the 2x2 box filter.
     unsafe {
@@ -73,7 +99,7 @@ pub(crate) fn available_encoders() -> Result<Vec<String>, RecordingError> {
     query().map_err(encoder_failure)
 }
 
-fn query() -> WindowsResult<Vec<String>> {
+fn query() -> EncoderResult<Vec<String>> {
     // SAFETY: the guards below pair the COM and Media Foundation initialisation
     // with their shutdown on every exit path, and the activation array returned
     // by `MFTEnumEx` is freed before returning.
@@ -103,22 +129,62 @@ fn query() -> WindowsResult<Vec<String>> {
             &raw mut activations,
             &raw mut count,
         )?;
+        let activations = Activations::new(activations, count);
 
         let mut names = Vec::new();
-        if !activations.is_null() {
-            let entries =
-                std::slice::from_raw_parts(activations, usize::try_from(count).unwrap_or(0));
-            for activation in entries.iter().flatten() {
-                names.push(name_of(activation)?);
-            }
-            CoTaskMemFree(Some(activations.cast()));
+        for activation in activations.as_slice().iter().flatten() {
+            names.push(name_of(activation)?);
         }
         Ok(names)
     }
 }
 
+/// Owns the activation array returned by `MFTEnumEx`.
+///
+/// Both the array allocation and the interface reference in every element
+/// belong to the caller, including when reading one name fails.
+struct Activations {
+    pointer: *mut Option<IMFActivate>,
+    count: usize,
+}
+
+impl Activations {
+    fn new(pointer: *mut Option<IMFActivate>, count: u32) -> Self {
+        Self {
+            pointer,
+            count: usize::try_from(count).unwrap_or(0),
+        }
+    }
+
+    fn as_slice(&self) -> &[Option<IMFActivate>] {
+        if self.pointer.is_null() || self.count == 0 {
+            return &[];
+        }
+        // SAFETY: `MFTEnumEx` returned a non-null array of `count` elements that
+        // remains allocated until this guard drops.
+        unsafe { std::slice::from_raw_parts(self.pointer, self.count) }
+    }
+}
+
+impl Drop for Activations {
+    fn drop(&mut self) {
+        if self.pointer.is_null() {
+            return;
+        }
+        // SAFETY: every element was initialized by `MFTEnumEx`; taking it drops
+        // the interface reference, then the array itself is released once.
+        unsafe {
+            let entries = std::slice::from_raw_parts_mut(self.pointer, self.count);
+            for entry in entries {
+                entry.take();
+            }
+            CoTaskMemFree(Some(self.pointer.cast()));
+        }
+    }
+}
+
 /// Reads the friendly name of one encoder activation.
-fn name_of(activation: &IMFActivate) -> WindowsResult<String> {
+fn name_of(activation: &IMFActivate) -> EncoderResult<String> {
     let key = MFT_FRIENDLY_NAME_Attribute;
     let mut buffer = [0_u16; NAME_LENGTH];
     // SAFETY: the buffer is writable for its whole length and the key is a valid
@@ -165,6 +231,12 @@ struct OutputLayout {
 /// Configured H.264 encoder fed with NV12 frames.
 pub(crate) struct Encoder {
     transform: IMFTransform,
+    /// Codec properties, including the per-frame keyframe request.
+    codec: ICodecAPI,
+    /// Frames between forced keyframes.
+    gop: u32,
+    /// Input frames accepted since the last keyframe request.
+    frames_since_keyframe: u32,
     /// Sample duration in 100-nanosecond units, as Media Foundation requires.
     duration: i64,
     layout: OutputLayout,
@@ -218,6 +290,18 @@ impl Encoder {
         self.flush_inner().map_err(encoder_failure)
     }
 
+    /// Requests that the next encoded frame be a keyframe.
+    ///
+    /// The recorder uses this when rotating to a new segment so the segment can
+    /// be decoded independently of the previous one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordingError::Encoder`] when the codec rejects the request.
+    pub(crate) fn force_keyframe(&mut self) -> Result<(), RecordingError> {
+        self.request_keyframe().map_err(encoder_failure)
+    }
+
     /// Builds the AVC configuration record from the negotiated output type.
     ///
     /// # Errors
@@ -232,8 +316,11 @@ impl Encoder {
         &mut self,
         frame: &Nv12Frame,
         timestamp: std::time::Duration,
-    ) -> WindowsResult<Vec<Sample>> {
+    ) -> EncoderResult<Vec<Sample>> {
         let mut samples = Vec::new();
+        if self.frames_since_keyframe >= self.gop {
+            self.request_keyframe()?;
+        }
         let bytes = frame.as_bytes();
         let sample = input_sample(bytes, timestamp, self.duration)?;
         loop {
@@ -244,23 +331,30 @@ impl Encoder {
                 Err(error) if error.code() == MF_E_NOTACCEPTING => {
                     samples.extend(drain(&self.transform, &mut self.layout)?);
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
+        self.frames_since_keyframe = self.frames_since_keyframe.saturating_add(1);
         samples.extend(drain(&self.transform, &mut self.layout)?);
         Ok(samples)
     }
 
-    fn flush_inner(&mut self) -> WindowsResult<Vec<Sample>> {
+    fn flush_inner(&mut self) -> EncoderResult<Vec<Sample>> {
         unsafe {
             self.transform
                 .ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)?;
         }
         drain(&self.transform, &mut self.layout)
     }
+
+    fn request_keyframe(&mut self) -> EncoderResult<()> {
+        set_codec_u32(&self.codec, &CODECAPI_AVEncVideoForceKeyFrame, 1)?;
+        self.frames_since_keyframe = 0;
+        Ok(())
+    }
 }
 
-fn open_encoder(width: u32, height: u32, fps: u32, bitrate: u32) -> WindowsResult<Encoder> {
+fn open_encoder(width: u32, height: u32, fps: u32, bitrate: u32) -> EncoderResult<Encoder> {
     // SAFETY: the guards live in the returned encoder, so Media Foundation and
     // the apartment outlive the transform they created.
     unsafe {
@@ -271,11 +365,17 @@ fn open_encoder(width: u32, height: u32, fps: u32, bitrate: u32) -> WindowsResul
 
         let transform: IMFTransform =
             CoCreateInstance(&CMSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)?;
-        disable_b_frames(&transform)?;
-        configure(&transform, width, height, fps, bitrate)?;
+        let codec: ICodecAPI = transform.cast()?;
+        configure_b_frames(&codec)?;
+        configure_output(&transform, width, height, fps, bitrate)?;
+        configure_input(&transform, width, height, fps)?;
+        configure_gop(&codec, fps)?;
         let layout = output_layout(&transform)?;
         Ok(Encoder {
             transform,
+            codec,
+            gop: fps.saturating_mul(2).max(1),
+            frames_since_keyframe: 0,
             duration: sample_duration(fps),
             layout,
             _com: com,
@@ -287,33 +387,49 @@ fn open_encoder(width: u32, height: u32, fps: u32, bitrate: u32) -> WindowsResul
 
 /// Turns off B-frames so output timestamps are monotonic and no PTS/DTS
 /// reordering is needed in the containers this crate writes.
-#[allow(clippy::needless_borrow)] // ManuallyDrop union fields need an explicit deref.
-fn disable_b_frames(transform: &IMFTransform) -> WindowsResult<()> {
-    // SAFETY: the codec interface belongs to the transform, which outlives the
-    // call, and the value is a plain VT_UI4 that holds no owned resources.
-    unsafe {
-        let codec: ICodecAPI = transform.cast()?;
-        let key = CODECAPI_AVEncMPVDefaultBPictureCount;
-        if codec.IsSupported(&raw const key).is_err() {
-            return Ok(());
-        }
-        let mut value = VARIANT::default();
-        // The union payload is already zero, which is the B-picture count.
-        // ManuallyDrop union fields need an explicit dereference to assign.
-        (&mut *value.Anonymous.Anonymous).vt = VT_UI4;
-        codec.SetValue(&raw const key, &raw const value)
-    }
+///
+/// This property must be set before the output type; afterwards the encoder
+/// rejects or ignores the change.
+fn configure_b_frames(codec: &ICodecAPI) -> EncoderResult<()> {
+    set_codec_u32(codec, &CODECAPI_AVEncMPVDefaultBPictureCount, 0)
 }
 
-/// Negotiates the H.264 output type and the NV12 input type.
-fn configure(
+/// Requests a keyframe every two seconds through the codec property.
+///
+/// The Microsoft encoder does not reliably honor this hint, so `Encoder::encode`
+/// also forces the keyframe explicitly at the same interval.
+fn configure_gop(codec: &ICodecAPI, fps: u32) -> EncoderResult<()> {
+    set_codec_u32(
+        codec,
+        &CODECAPI_AVEncMPVGOPSize,
+        fps.saturating_mul(2).max(1),
+    )
+}
+
+/// Sets one `ICodecAPI` property to a `VT_UI4` value.
+fn set_codec_u32(codec: &ICodecAPI, key: &windows::core::GUID, value: u32) -> EncoderResult<()> {
+    // SAFETY: the caller holds a live codec interface. The variant owns no
+    // resources and is only read by `SetValue`.
+    unsafe {
+        codec.IsSupported(key)?;
+        let mut variant = VARIANT::default();
+        let inner = &mut *variant.Anonymous.Anonymous;
+        inner.vt = VT_UI4;
+        inner.Anonymous.ulVal = value;
+        codec.SetValue(key, &raw const variant)?;
+    }
+    Ok(())
+}
+
+/// Negotiates the H.264 output type.
+fn configure_output(
     transform: &IMFTransform,
     width: u32,
     height: u32,
     fps: u32,
     bitrate: u32,
-) -> WindowsResult<()> {
-    // SAFETY: both media types are created here, fully described before they are
+) -> EncoderResult<()> {
+    // SAFETY: the media type is created here, fully described before it is
     // handed to the transform, and dropped after negotiation.
     unsafe {
         let output = MFCreateMediaType()?;
@@ -330,7 +446,20 @@ fn configure(
         output.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, fps.saturating_mul(2))?;
         set_color_attributes(&output)?;
         transform.SetOutputType(0, &output, 0)?;
+    }
+    Ok(())
+}
 
+/// Negotiates the NV12 input type after codec properties are fixed.
+fn configure_input(
+    transform: &IMFTransform,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> EncoderResult<()> {
+    // SAFETY: the media type is created here, fully described before it is
+    // handed to the transform, and dropped after negotiation.
+    unsafe {
         let input = MFCreateMediaType()?;
         input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         input.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
@@ -347,7 +476,7 @@ fn configure(
 }
 
 /// Reads the output stream layout once after type negotiation.
-fn output_layout(transform: &IMFTransform) -> WindowsResult<OutputLayout> {
+fn output_layout(transform: &IMFTransform) -> EncoderResult<OutputLayout> {
     // SAFETY: the stream identifier was validated by the successful negotiation.
     let info: MFT_OUTPUT_STREAM_INFO = unsafe { transform.GetOutputStreamInfo(0)? };
     Ok(OutputLayout {
@@ -362,7 +491,7 @@ fn pack(high: u32, low: u32) -> u64 {
 }
 
 /// Reads the H.264 sequence header Media Foundation attaches to the output type.
-fn sequence_header(transform: &IMFTransform) -> WindowsResult<Option<Vec<u8>>> {
+fn sequence_header(transform: &IMFTransform) -> EncoderResult<Option<Vec<u8>>> {
     // SAFETY: the media type and its blob are owned by the transform, and the
     // buffer is sized from the reported attribute length before it is read.
     unsafe {
@@ -371,7 +500,7 @@ fn sequence_header(transform: &IMFTransform) -> WindowsResult<Option<Vec<u8>>> {
     }
 }
 
-fn read_sequence_header(media_type: &IMFMediaType) -> WindowsResult<Option<Vec<u8>>> {
+fn read_sequence_header(media_type: &IMFMediaType) -> EncoderResult<Option<Vec<u8>>> {
     // SAFETY: the caller owns a live media type; the buffer is sized from the
     // attribute length before it is read.
     unsafe {
@@ -379,7 +508,7 @@ fn read_sequence_header(media_type: &IMFMediaType) -> WindowsResult<Option<Vec<u
         let size = match media_type.GetBlobSize(&raw const key) {
             Ok(size) => size,
             Err(error) if error.code() == MF_E_ATTRIBUTENOTFOUND => return Ok(None),
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
         let mut header = vec![0_u8; usize::try_from(size).unwrap_or(0)];
         media_type.GetBlob(&raw const key, &mut header, None)?;
@@ -388,18 +517,23 @@ fn read_sequence_header(media_type: &IMFMediaType) -> WindowsResult<Option<Vec<u
 }
 
 /// Builds the AVC configuration record from the negotiated output type.
-fn config_of(transform: &IMFTransform) -> WindowsResult<AvcConfig> {
-    let header = sequence_header(transform)?.ok_or_else(WindowsError::from_win32)?;
+fn config_of(transform: &IMFTransform) -> EncoderResult<AvcConfig> {
+    build_config(sequence_header(transform)?)
+}
+
+/// Builds a configuration record from the parameter sets in a sequence header.
+fn build_config(header: Option<Vec<u8>>) -> EncoderResult<AvcConfig> {
+    let header = header.ok_or(EncoderError::MissingParameterSet("sequence header"))?;
     let units = annex_b_nals(&header);
     let sequence = units
         .iter()
         .find(|unit| nal_type(unit) == 7)
-        .ok_or_else(WindowsError::from_win32)?;
+        .ok_or(EncoderError::MissingParameterSet("sequence parameter set"))?;
     let picture = units
         .iter()
         .find(|unit| nal_type(unit) == 8)
-        .ok_or_else(WindowsError::from_win32)?;
-    AvcConfig::new(sequence.to_vec(), picture.to_vec()).map_err(|_| WindowsError::from_win32())
+        .ok_or(EncoderError::MissingParameterSet("picture parameter set"))?;
+    Ok(AvcConfig::new(sequence.to_vec(), picture.to_vec())?)
 }
 
 /// Converts a frame rate into the 100-nanosecond sample duration.
@@ -412,8 +546,8 @@ fn input_sample(
     bytes: &[u8],
     timestamp: std::time::Duration,
     duration: i64,
-) -> WindowsResult<windows::Win32::Media::MediaFoundation::IMFSample> {
-    let length = u32::try_from(bytes.len()).map_err(|_| WindowsError::from_win32())?;
+) -> EncoderResult<windows::Win32::Media::MediaFoundation::IMFSample> {
+    let length = u32::try_from(bytes.len()).map_err(|_| EncoderError::UnsupportedFrame)?;
     // SAFETY: the buffer is locked only while it is written and unlocked before
     // it is attached to the sample.
     unsafe {
@@ -426,14 +560,14 @@ fn input_sample(
 
         let sample = MFCreateSample()?;
         sample.AddBuffer(&buffer)?;
-        sample.SetSampleTime(hns(timestamp))?;
+        sample.SetSampleTime(hns(timestamp)?)?;
         sample.SetSampleDuration(duration)?;
         Ok(sample)
     }
 }
 
 /// Pulls every sample the transform can produce without more input.
-fn drain(transform: &IMFTransform, layout: &mut OutputLayout) -> WindowsResult<Vec<Sample>> {
+fn drain(transform: &IMFTransform, layout: &mut OutputLayout) -> EncoderResult<Vec<Sample>> {
     let mut samples = Vec::new();
     loop {
         let mut output = output_buffer(layout)?;
@@ -454,12 +588,17 @@ fn drain(transform: &IMFTransform, layout: &mut OutputLayout) -> WindowsResult<V
         drop(events);
         match result {
             Ok(()) => {
-                if let Some(sample) = sample
+                let no_sample =
+                    output.dwStatus == MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0.cast_unsigned();
+                if !no_sample
+                    && let Some(sample) = sample
                     && let Some(sample) = normalize(&sample)?
                 {
                     samples.push(sample);
                 }
-                if status & MFT_OUTPUT_DATA_BUFFER_STREAM_END.0.cast_unsigned() != 0 {
+                let stream_end =
+                    output.dwStatus & MFT_OUTPUT_DATA_BUFFER_STREAM_END.0.cast_unsigned() != 0;
+                if stream_end {
                     return Ok(samples);
                 }
             }
@@ -467,10 +606,12 @@ fn drain(transform: &IMFTransform, layout: &mut OutputLayout) -> WindowsResult<V
             Err(error) if error.code() == MF_E_BUFFERTOOSMALL => {
                 // The required output buffer grew past the stream info estimate;
                 // retry with a larger sample before failing the recording.
-                let larger = layout.buffer_size.checked_mul(2);
-                match larger {
+                if layout.provides_samples {
+                    return Err(error.into());
+                }
+                match layout.buffer_size.checked_mul(2) {
                     Some(size) => layout.buffer_size = size,
-                    None => return Err(error),
+                    None => return Err(error.into()),
                 }
             }
             Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
@@ -483,14 +624,14 @@ fn drain(transform: &IMFTransform, layout: &mut OutputLayout) -> WindowsResult<V
                 }
                 *layout = output_layout(transform)?;
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         }
     }
 }
 
 /// Allocates the output buffer the transform expects, or none when it provides
 /// its own samples.
-fn output_buffer(layout: &OutputLayout) -> WindowsResult<MFT_OUTPUT_DATA_BUFFER> {
+fn output_buffer(layout: &OutputLayout) -> EncoderResult<MFT_OUTPUT_DATA_BUFFER> {
     let sample = if layout.provides_samples {
         None
     } else {
@@ -513,7 +654,7 @@ fn output_buffer(layout: &OutputLayout) -> WindowsResult<MFT_OUTPUT_DATA_BUFFER>
 /// Normalises one encoder output sample into a container-ready sample.
 fn normalize(
     sample: &windows::Win32::Media::MediaFoundation::IMFSample,
-) -> WindowsResult<Option<Sample>> {
+) -> EncoderResult<Option<Sample>> {
     // SAFETY: the sample is live. A missing timestamp is a broken encoder
     // contract because the input carried both time and duration; refusing it
     // keeps the container timeline ordered.
@@ -536,13 +677,13 @@ fn normalize(
 }
 
 /// Converts one Annex B elementary-stream segment into a framed sample.
-fn frame_sample(stream: &[u8], timestamp: i64, clean_point: bool) -> WindowsResult<Option<Sample>> {
+fn frame_sample(stream: &[u8], timestamp: i64, clean_point: bool) -> EncoderResult<Option<Sample>> {
     let units = annex_b_nals(stream);
     if units.is_empty() {
         return Ok(None);
     }
     let unit_keyframe = units.iter().any(|unit| nal_type(unit) == 5);
-    let data = length_prefixed(&units).map_err(|_| WindowsError::from_hresult(E_INVALIDARG))?;
+    let data = length_prefixed(&units)?;
     Ok(Some(Sample {
         timestamp_ms: u64::try_from(timestamp.max(0) / 10_000).unwrap_or(0),
         keyframe: clean_point || unit_keyframe,
@@ -551,12 +692,12 @@ fn frame_sample(stream: &[u8], timestamp: i64, clean_point: bool) -> WindowsResu
 }
 
 /// Converts a duration into the 100-nanosecond units Media Foundation uses.
-fn hns(duration: std::time::Duration) -> i64 {
-    i64::try_from(duration.as_nanos() / 100).unwrap_or(0)
+fn hns(duration: std::time::Duration) -> EncoderResult<i64> {
+    i64::try_from(duration.as_nanos() / 100).map_err(|_| EncoderError::UnsupportedFrame)
 }
 
-/// Preserves the platform error without exposing its type in public signatures.
-fn encoder_failure(error: WindowsError) -> RecordingError {
+/// Preserves the adapter error without exposing its type in public signatures.
+fn encoder_failure(error: EncoderError) -> RecordingError {
     RecordingError::Encoder(Some(std::io::Error::other(error)))
 }
 
@@ -629,6 +770,80 @@ mod tests {
                 .expect("empty is not an error")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn missing_parameter_sets_name_the_missing_part() {
+        assert!(matches!(
+            build_config(None),
+            Err(EncoderError::MissingParameterSet("sequence header"))
+        ));
+        let sequence_only = vec![0, 0, 0, 1, 0x67, 0x42, 0xC0, 0x1E, 0xD9, 0x01];
+        assert!(matches!(
+            build_config(Some(sequence_only)),
+            Err(EncoderError::MissingParameterSet("picture parameter set"))
+        ));
+    }
+
+    #[test]
+    fn malformed_parameter_sets_keep_the_container_cause() {
+        let truncated = vec![0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xCE];
+        let error = build_config(Some(truncated)).expect_err("truncated parameter sets");
+        assert!(matches!(
+            error,
+            EncoderError::Container(ContainerError::InvalidParameterSet)
+        ));
+
+        let recording = encoder_failure(error);
+        let RecordingError::Encoder(Some(io)) = recording else {
+            panic!("expected an encoder category");
+        };
+        let encoder = io.get_ref().expect("encoder cause");
+        assert!(encoder.downcast_ref::<EncoderError>().is_some());
+        let container = encoder.source().expect("container cause");
+        assert!(container.downcast_ref::<ContainerError>().is_some());
+    }
+
+    #[test]
+    #[ignore = "requires Media Foundation"]
+    fn keyframes_are_at_most_two_seconds_apart() {
+        let mut encoder =
+            super::Encoder::open(160, 120, 15, super::DEFAULT_BITRATE).expect("encoder");
+        let mut frame = crate::encode::Nv12Frame::new(160, 120).expect("frame");
+        frame
+            .convert_bgra(&vec![128_u8; 160 * 120 * 4])
+            .expect("convert");
+        let mut produced = 0_usize;
+        let mut keyframes = Vec::new();
+        for index in 0..150_u32 {
+            for sample in encoder
+                .encode(
+                    &frame,
+                    std::time::Duration::from_millis(u64::from(index) * 66),
+                )
+                .expect("encode")
+            {
+                if sample.keyframe {
+                    keyframes.push(produced);
+                }
+                produced += 1;
+            }
+        }
+        for sample in encoder.flush().expect("flush") {
+            if sample.keyframe {
+                keyframes.push(produced);
+            }
+            produced += 1;
+        }
+
+        assert_eq!(produced, 150);
+        assert_eq!(keyframes.first(), Some(&0));
+        for pair in keyframes.windows(2) {
+            assert!(
+                pair[1] - pair[0] <= 30,
+                "keyframes are more than two seconds apart: {keyframes:?}"
+            );
+        }
     }
 
     #[test]
