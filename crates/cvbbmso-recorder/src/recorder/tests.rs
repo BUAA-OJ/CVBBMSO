@@ -159,12 +159,12 @@ async fn finish_reports_merge_and_stays_retryable() {
 
     assert!(matches!(
         recorder.finish().await,
-        Err(RecordingError::Merge(_))
+        Err(RecordingError::Merge)
     ));
     assert!(matches!(recorder.state, State::Failed));
     assert!(matches!(
         recorder.finish().await,
-        Err(RecordingError::Merge(_))
+        Err(RecordingError::Merge)
     ));
 }
 

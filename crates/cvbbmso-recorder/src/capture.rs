@@ -88,7 +88,7 @@ pub(crate) fn rotate(
 #[cfg(not(windows))]
 mod unsupported {
     use super::Frame;
-    use crate::PlatformError;
+    use crate::RecordingError;
 
     /// Placeholder backend for platforms without a capture implementation.
     pub(crate) struct Desktop;
@@ -96,19 +96,19 @@ mod unsupported {
     impl Desktop {
         /// # Errors
         ///
-        /// Always returns [`PlatformError::Unsupported`].
-        pub(crate) fn open() -> Result<Self, PlatformError> {
-            Err(PlatformError::Unsupported)
+        /// Always returns [`RecordingError::Platform`].
+        pub(crate) fn open() -> Result<Self, RecordingError> {
+            Err(RecordingError::Platform(None))
         }
 
         /// # Errors
         ///
-        /// Always returns [`PlatformError::Unsupported`].
+        /// Always returns [`RecordingError::Platform`].
         pub(crate) fn next_frame(
             &mut self,
             _timeout_ms: u32,
-        ) -> Result<Option<Frame>, PlatformError> {
-            Err(PlatformError::Unsupported)
+        ) -> Result<Option<Frame>, RecordingError> {
+            Err(RecordingError::Platform(None))
         }
     }
 }

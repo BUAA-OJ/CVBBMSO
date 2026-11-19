@@ -20,7 +20,7 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninit
 use windows::core::{Error as WindowsError, Interface, Result as WindowsResult};
 
 use super::{Frame, Rotation, rotate};
-use crate::{CaptureFailure, PlatformError};
+use crate::RecordingError;
 
 /// Bytes per pixel of the desktop duplication surface.
 const BYTES_PER_PIXEL: usize = 4;
@@ -47,7 +47,7 @@ impl Desktop {
     /// # Errors
     ///
     /// Returns [`PlatformError::Failed`] when the display cannot be duplicated.
-    pub(crate) fn open() -> Result<Self, PlatformError> {
+    pub(crate) fn open() -> Result<Self, RecordingError> {
         Self::open_inner().map_err(|error| failure(&error))
     }
 
@@ -59,7 +59,7 @@ impl Desktop {
     /// # Errors
     ///
     /// Returns [`PlatformError::Failed`] when the desktop can no longer be read.
-    pub(crate) fn next_frame(&mut self, timeout_ms: u32) -> Result<Option<Frame>, PlatformError> {
+    pub(crate) fn next_frame(&mut self, timeout_ms: u32) -> Result<Option<Frame>, RecordingError> {
         self.next_frame_inner(timeout_ms)
             .map_err(|error| failure(&error))
     }
@@ -210,9 +210,12 @@ impl Drop for MapGuard<'_> {
     }
 }
 
-/// Wraps a platform error so the caller keeps its code and cause.
-fn failure(error: &WindowsError) -> PlatformError {
-    PlatformError::Failed(CaptureFailure::from_windows(error))
+/// Wraps a platform error so the caller keeps its code and message.
+fn failure(error: &WindowsError) -> RecordingError {
+    RecordingError::Platform(Some(std::io::Error::other(format!(
+        "0x{:08X}: {error}",
+        error.code().0
+    ))))
 }
 
 /// Copies a mapped surface into tightly packed rows.

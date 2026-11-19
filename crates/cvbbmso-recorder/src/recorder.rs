@@ -10,7 +10,7 @@ use cvbbmso_protocol::{RecordingManifest, RecordingPolicy, Sha256Digest};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use uuid::Uuid;
 
-use crate::{MergeError, PlatformError, RecorderEvent, RecordingError, store::SegmentStore};
+use crate::{RecorderEvent, RecordingError, store::SegmentStore};
 
 /// Capacity reserved for live events beyond the restored segments.
 const EVENT_BUFFER: usize = 16;
@@ -89,7 +89,7 @@ impl Recorder {
         if matches!(self.state, State::Capturing) {
             return Ok(());
         }
-        Err(RecordingError::Platform(PlatformError::Unsupported))
+        Err(RecordingError::Platform(None))
     }
 
     /// Stops capture and seals the segment being recorded.
@@ -144,7 +144,7 @@ impl Recorder {
 /// The container work lands with the merge milestone; until then a non-empty
 /// recording cannot be finished.
 fn merge(_store: &SegmentStore) -> Result<Sha256Digest, RecordingError> {
-    Err(RecordingError::Merge(MergeError::Unsupported))
+    Err(RecordingError::Merge)
 }
 
 /// Requires `candidate_dir` to end in `<exam_id>/<oj_user_id>`.

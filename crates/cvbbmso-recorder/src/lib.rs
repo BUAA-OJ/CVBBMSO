@@ -21,6 +21,6 @@ mod event;
 mod recorder;
 mod store;
 
-pub use error::{CaptureFailure, EncoderError, MergeError, PlatformError, RecordingError};
+pub use error::RecordingError;
 pub use event::RecorderEvent;
 pub use recorder::Recorder;
