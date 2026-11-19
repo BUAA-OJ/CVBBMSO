@@ -8,7 +8,9 @@ Guidance for coding agents working on `cvbbmso`.
 client for students and an Axum server operated by staff. Students use a
 controlled WebView to log in to Accoding; the server re-verifies the
 `connect.sid` cookie against Accoding. Exam timing is server-authoritative and
-commands are delivered over one WebSocket per student.
+commands are delivered over one WebSocket per student. During the app lifetime,
+a system-level egress guard restricts outbound network traffic to Accoding, the
+monitoring server, and essential local services.
 
 The repository is being scaffolded crate by crate. The design contracts live
 under `docs/design/`; follow their layout and contracts exactly.
@@ -31,7 +33,7 @@ English.
 crates/
 ├── cvbbmso-protocol/   # HTTP / WebSocket DTOs, enums, error codes
 ├── cvbbmso-accoding/   # Cookie normalization, Accoding identity verification
-├── cvbbmso-network/    # Client startup proxy and reachability preflight
+├── cvbbmso-network/    # Client startup preflight and system egress guard
 ├── cvbbmso-recorder/   # Screen capture, segmentation, recovery, merge, hashing
 ├── cvbbmso-exam/       # Client exam runtime, WebSocket, local event queue
 ├── cvbbmso-client/     # Tauri desktop app, startup preflight, controlled browser
@@ -157,8 +159,8 @@ Write idiomatic Rust and keep the design boring.
 - `cvbbmso-protocol`: DTOs, enums, validation newtypes, error-code constants.
   No I/O, no async, no database types.
 - `cvbbmso-accoding`: cookie handling and identity verification only.
-- `cvbbmso-network`: client startup preflight only; read-only inspection, never
-  modify system proxy settings.
+- `cvbbmso-network`: client startup preflight and system egress guard.
+  Proxy inspection stays read-only; never modify system proxy settings.
 - `cvbbmso-recorder`: recording lifecycle, local files, manifests. Platform
   capture and encoding stay private.
 - `cvbbmso-exam`: runtime orchestration, WebSocket, retry/reconnect, event

@@ -22,6 +22,7 @@
 | recording | 客户端本地录屏产物；服务端保存摘要 |
 | `ack_event_through` | `sync` 中返回的服务端已持久化最大连续事件序号 |
 | `CommandAck` | 服务端对 `command_result` 的确认 |
+| egress guard | 客户端启动时安装、持续到应用退出的系统级出站网络过滤 |
 
 ## 范围边界
 
@@ -32,7 +33,7 @@
 - 业务标识为 `(exam_id, oj_user_id)`。
 - 文档契约覆盖公开接口、职责和跨模块行为；表结构、索引和迁移由实现决定。
 - 一个客户端进程同时承载一场活动考试。
-- 客户端启动时完成网络与屏幕权限预检，通过后才能进入考试。
+- 客户端启动时完成网络预检、系统出站守卫安装和屏幕权限预检，通过后才能进入考试；出站守卫保持到应用退出，需要管理员/root 权限。
 
 ## Workspace 与文档
 
@@ -42,7 +43,7 @@ cvbbmso/
 ├── crates/
 │   ├── cvbbmso-protocol/   # 共用 HTTP / WebSocket DTO、枚举、错误码
 │   ├── cvbbmso-accoding/   # Cookie 处理、Accoding 身份验证
-│   ├── cvbbmso-network/    # 客户端启动预检：系统代理和服务端可达性
+│   ├── cvbbmso-network/    # 客户端启动预检与系统出站守卫
 │   ├── cvbbmso-recorder/   # 分段录屏、恢复、合并、哈希
 │   ├── cvbbmso-exam/       # 客户端考试运行时、WS、本地事件队列
 │   ├── cvbbmso-client/     # Tauri 桌面程序、启动预检和受控浏览器
@@ -62,7 +63,7 @@ cvbbmso/
 | --- | --- | --- | --- |
 | `cvbbmso-protocol` | 共用 DTO、封闭枚举、线上错误码 | 数据结构、枚举、错误码 | [协议](crates/cvbbmso-protocol.md) |
 | `cvbbmso-accoding` | Cookie 归一化及学生站 `/api/users/me` 复验 | `AccodingCookies`、`Verifier` | [认证](crates/cvbbmso-accoding.md) |
-| `cvbbmso-network` | 客户端启动时的系统代理与监考服务端连通性预检 | `Inspector::check`、`NetworkReport` | [网络](crates/cvbbmso-network.md) |
+| `cvbbmso-network` | 客户端启动预检；系统级出站网络守卫 | `Inspector::check`、`EgressGuard::install/verify/shutdown` | [网络](crates/cvbbmso-network.md) |
 | `cvbbmso-recorder` | 主显示器录屏、分片、恢复、合并、SHA-256 | `Recorder::open/start/stop/finish`、`RecorderEvent` | [录像](crates/cvbbmso-recorder.md) |
 | `cvbbmso-exam` | 客户端考试运行时、WS 重连、可靠上报、本地状态 | `Exam::connect`、`ExamHandle` | [运行时](crates/cvbbmso-exam.md) |
 | `cvbbmso-client` | 启动预检、WebView、Cookie Store、状态 UI | 可执行程序、Tauri commands | [客户端](crates/cvbbmso-client.md) |
@@ -80,7 +81,7 @@ cvbbmso/
 - `recorder → protocol`
 - `accoding → protocol`
 
-`protocol` 是纯数据层，依赖方向为业务 crate → protocol。录屏系统接口封装在 `recorder` 内部，代理平台代码封装在 `network` 内部，数据库与任务调度封装在 `domain` 内部；跨 crate 共享必要的数据类型和操作入口。网络预检属于客户端启动流程。
+`protocol` 是纯数据层，依赖方向为业务 crate → protocol。录屏系统接口封装在 `recorder` 内部，代理平台代码和系统出站策略封装在 `network` 内部，数据库与任务调度封装在 `domain` 内部；跨 crate 共享必要的数据类型和操作入口。网络预检与出站守卫属于客户端启动流程。
 
 ## 核心业务规则
 
@@ -91,6 +92,7 @@ cvbbmso/
 - **录像**：客户端接到开始命令后录制主显示器，音频关闭；每段元信息包含 `index`、`start_at`、`end_at`、`sha256`；合并结束后上报 `merged_sha256`。录像保留在客户端，服务端保存摘要。录屏故障由客户端上报 incident 并自行重试。
 - **异常**：每条异常以 `occurred_at` 记录发生时间。服务端记录 `connection_lost`、`connection_restored`、`process_restarted`；客户端上报录屏和导航异常作为独立证据记录。CLI 按时间排序关联。
 - **认证**：原生客户端使用 WebView Cookie Store 中的 Accoding Cookie 连接服务端；服务端向学生站 `/api/users/me` 复验，并以返回身份作为唯一登录凭据。
+- **网络隔离**：客户端启动并取得管理员/root 权限后安装系统级出站守卫，只放行 Accoding、监考服务器、回环、DNS、DHCP/NTP 和系统证书验证所需的流量；其他进程的出站连接被拒绝。守卫随应用退出或崩溃清理，安装或运行期校验失败时停止考试。
 
 ## 部署边界
 
@@ -98,6 +100,7 @@ cvbbmso/
 - TLS 由反向代理终止；Rust 进程监听内网 HTTP/WS。对外地址为 `wss://<监考服务端>/api/exams/{exam_id}/ws`。
 - 客户端与服务端同版本部署；协议按同版本契约设计。
 - 管理入口是服务端本机 CLI，直接调用领域层。
+- 系统出站守卫要求客户端以管理员/root 运行；通过临时看门狗和一次性 OS 清理任务处理异常退出，TTL 默认 15 分钟。
 
 ## 协作时序
 
@@ -105,10 +108,15 @@ cvbbmso/
 sequenceDiagram
     actor Student as 学生
     participant UI as cvbbmso-client
+    participant Net as cvbbmso-network
     participant Exam as cvbbmso-exam
     participant Srv as cvbbmso-server
     participant Domain as cvbbmso-domain
     participant OJ as Accoding
+    UI->>Net: Inspector::check
+    Net-->>UI: proxy clear / server reachable
+    UI->>Net: EgressGuard::install(accoding, server)
+    Net-->>UI: guard active
     Student->>UI: 在 WebView 登录 Accoding
     UI->>Exam: Exam::connect(exam_id, cookies)
     Exam->>Srv: WSS GET /api/exams/{exam_id}/ws + Cookie
