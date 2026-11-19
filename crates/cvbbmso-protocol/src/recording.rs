@@ -117,27 +117,29 @@ struct RawSegmentMeta {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawRecordingManifest")]
 pub struct RecordingManifest {
-    /// Sealed segments, ordered by ascending index.
+    /// Sealed segments, non-empty and contiguous from index one.
     pub segments: Vec<SegmentMeta>,
     /// SHA-256 of the merged video file.
     pub merged_sha256: Sha256Digest,
 }
 
 impl RecordingManifest {
-    /// Creates a manifest, requiring strictly increasing segment indices.
+    /// Creates a manifest, requiring a non-empty list whose indices start at
+    /// one and increase by exactly one.
     ///
     /// # Errors
     ///
-    /// Returns [`ProtocolError::InvalidSegmentOrder`] when indices are equal or
-    /// decreasing.
+    /// Returns [`ProtocolError::InvalidSegmentOrder`] when the list is empty,
+    /// does not start at index one, or is not contiguous.
     pub fn new(
         segments: Vec<SegmentMeta>,
         merged_sha256: Sha256Digest,
     ) -> Result<Self, ProtocolError> {
-        if !segments
+        let starts_at_one = segments.first().is_some_and(|segment| segment.index == 1);
+        let is_contiguous = segments
             .windows(2)
-            .all(|pair| pair[0].index < pair[1].index)
-        {
+            .all(|pair| pair[0].index.checked_add(1) == Some(pair[1].index));
+        if !starts_at_one || !is_contiguous {
             return Err(ProtocolError::InvalidSegmentOrder);
         }
         Ok(Self {
@@ -217,31 +219,34 @@ mod tests {
     }
 
     #[test]
-    fn manifest_requires_ascending_indices() {
+    fn manifest_requires_contiguous_indices_from_one() {
         let first = SegmentMeta::new(1, timestamp(0), timestamp(30), digest('a')).expect("segment");
         let duplicate =
             SegmentMeta::new(1, timestamp(30), timestamp(60), digest('b')).expect("segment");
         let second =
             SegmentMeta::new(2, timestamp(30), timestamp(60), digest('b')).expect("segment");
+        let third =
+            SegmentMeta::new(3, timestamp(60), timestamp(90), digest('c')).expect("segment");
 
+        assert_eq!(
+            RecordingManifest::new(Vec::new(), digest('c')),
+            Err(ProtocolError::InvalidSegmentOrder)
+        );
         assert_eq!(
             RecordingManifest::new(vec![first.clone(), duplicate], digest('c')),
             Err(ProtocolError::InvalidSegmentOrder)
         );
         assert_eq!(
-            RecordingManifest::new(vec![second, first], digest('c')),
+            RecordingManifest::new(vec![second.clone(), first.clone()], digest('c')),
+            Err(ProtocolError::InvalidSegmentOrder)
+        );
+        assert_eq!(
+            RecordingManifest::new(vec![second, third], digest('c')),
             Err(ProtocolError::InvalidSegmentOrder)
         );
         assert!(
-            RecordingManifest::new(
-                vec![
-                    SegmentMeta::new(1, timestamp(0), timestamp(30), digest('a')).expect("segment"),
-                    SegmentMeta::new(2, timestamp(30), timestamp(60), digest('b'))
-                        .expect("segment"),
-                ],
-                digest('c')
-            )
-            .is_ok()
+            RecordingManifest::new(vec![first], digest('c')).is_ok(),
+            "manifest may contain a single segment"
         );
     }
 }

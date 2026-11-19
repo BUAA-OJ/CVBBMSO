@@ -4,8 +4,8 @@
 use cvbbmso_protocol::{
     AccodingUser, ClientHello, ClientIncident, ClientMessage, ClientState, CommandName,
     CommandStatus, ExamEvent, ExamListResponse, ExamPhase, ExamSummary, ExecutionState,
-    IncidentCode, NetworkState, Platform, RecordingManifest, RecordingPolicy, RecordingState,
-    SegmentMeta, ServerMessage, Sha256Digest,
+    IncidentCode, Platform, RecordingManifest, RecordingPolicy, RecordingState, SegmentMeta,
+    ServerMessage, Sha256Digest,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -27,7 +27,6 @@ fn state() -> ClientState {
     ClientState {
         execution: ExecutionState::Recording,
         recording: RecordingState::Capturing,
-        network: NetworkState::Clear,
     }
 }
 
@@ -59,7 +58,6 @@ fn hello_message_matches_the_wire_format() {
         state: ClientState {
             execution: ExecutionState::Ready,
             recording: RecordingState::Idle,
-            network: NetworkState::Clear,
         },
     });
 
@@ -84,8 +82,8 @@ fn server_messages_match_the_wire_format() {
                 name: CommandName::StartExam,
                 effective_at: at("2026-12-20T01:00:00Z"),
             },
-            ServerMessage::Ack {
-                ack_event_through: 6,
+            ServerMessage::CommandAck {
+                command_id: Uuid::from_u128(0x40),
             },
             ServerMessage::Error {
                 code: "PROTOCOL_ERROR".to_owned(),
@@ -114,9 +112,9 @@ fn client_messages_match_the_wire_format() {
             ClientMessage::Event {
                 seq: 5,
                 event: ExamEvent::Incident(ClientIncident {
-                    code: IncidentCode::ProxyDetected,
+                    code: IncidentCode::RecordingFailed,
                     occurred_at: at("2026-12-20T01:00:31Z"),
-                    detail: Some("system proxy enabled".to_owned()),
+                    detail: Some("capture stream stopped".to_owned()),
                 }),
             },
             ClientMessage::Event {
@@ -152,7 +150,7 @@ fn exam_list_matches_the_wire_format() {
 #[test]
 fn documented_client_messages_deserialize() {
     let hello: ClientMessage = serde_json::from_str(
-        r#"{"type":"hello","device_id":"00000000-0000-0000-0000-000000000020","instance_id":"00000000-0000-0000-0000-000000000030","platform":"windows","state":{"execution":"ready","recording":"idle","network":"clear"}}"#,
+        r#"{"type":"hello","device_id":"00000000-0000-0000-0000-000000000020","instance_id":"00000000-0000-0000-0000-000000000030","platform":"windows","state":{"execution":"ready","recording":"idle"}}"#,
     )
     .expect("hello parses");
     assert!(matches!(hello, ClientMessage::Hello(_)));
@@ -207,6 +205,15 @@ fn documented_server_messages_deserialize() {
             name: CommandName::StartExam,
             ..
         }
+    ));
+
+    let ack: ServerMessage = serde_json::from_str(
+        r#"{"type":"command_ack","command_id":"00000000-0000-0000-0000-000000000040"}"#,
+    )
+    .expect("command ack parses");
+    assert!(matches!(
+        ack,
+        ServerMessage::CommandAck { command_id } if command_id == Uuid::from_u128(0x40)
     ));
 
     let error: ServerMessage = serde_json::from_str(

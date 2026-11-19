@@ -87,9 +87,9 @@ cvbbmso-cli recordings show --exam <exam-id> --oj-user-id 12345
 | `events list` | `EventRecord[]` | 客户端上报的 `seq`、`event`、`received_at` |
 | `incidents list` | `IncidentRecord[]` | 服务端及客户端异常的发生时间与上下文 |
 | `incidents show` | `IncidentRecord` | 单个异常的完整信息 |
-| `recordings show` | `RecordingManifest` | 分片元信息及合并录像 SHA-256 |
+| `recordings show` | `RecordingManifest` | 分片元信息及合并录像 SHA-256；没有 manifest 时返回 `NotFound` |
 
-`StudentRuntime` 的核心字段为 `exam_id: uuid`、`oj_user_id: i64`、`connected: bool`、`execution: ExecutionState`、`last_seen_at: datetime?`。`EventRecord` 为 `exam_id`、`oj_user_id`、`seq`、`event`、`received_at`，其中 `event` 遵循 [cvbbmso-protocol](cvbbmso-protocol.md)。`IncidentRecord` 为 `id`、`exam_id`、`oj_user_id`、`source`、`kind`、`occurred_at`、`detail`，字段定义见 [cvbbmso-domain](cvbbmso-domain.md)。`detail` 是可选字符串，用于记录 `heartbeat_timeout`、`replaced`、`server_restart`、`system proxy enabled` 等上下文。
+`StudentRuntime` 的核心字段为 `exam_id: uuid`、`oj_user_id: i64`、`connected: bool`、`execution: ExecutionState`、`last_seen_at: datetime?`；`ExecutionState` 为 `ready` / `recording` / `finalizing` / `finished`。`EventRecord` 为 `exam_id`、`oj_user_id`、`seq`、`event`、`received_at`，其中 `event` 遵循 [cvbbmso-protocol](cvbbmso-protocol.md)。`IncidentRecord` 为 `id`、`exam_id`、`oj_user_id`、`source`、`kind`、`occurred_at`、`detail`，字段定义见 [cvbbmso-domain](cvbbmso-domain.md)。`detail` 是可选字符串，用于记录 `heartbeat_timeout`、`replaced`、`capture stream stopped` 等上下文。
 
 ## 示例
 
@@ -111,4 +111,4 @@ cvbbmso-cli incidents list --exam <exam-id> --kind connection_lost --format json
 ]
 ```
 
-`incidents list` 的 `--kind` 支持 `connection_lost`、`connection_restored`、`process_restarted`、`proxy_detected`、`proxy_check_failed`、`recording_failed`、`recording_recovered`、`navigation_denied`。`connection_lost` 与 `connection_restored` 是两条独立记录，CLI 按 `occurred_at` 排序展示；客户端保持离线时，CLI 仍能查询到服务端记录的 `connection_lost`。
+`incidents list` 的 `--kind` 支持 `connection_lost`、`connection_restored`、`process_restarted`、`recording_failed`、`recording_recovered`、`navigation_denied`。`connection_lost` 与 `connection_restored` 是两条独立记录，CLI 按 `occurred_at` 排序展示；客户端保持离线时，CLI 仍能查询到服务端记录的 `connection_lost`。

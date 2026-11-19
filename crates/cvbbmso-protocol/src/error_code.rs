@@ -22,5 +22,5 @@ pub const PROTOCOL_ERROR: &str = "PROTOCOL_ERROR";
 pub const COMMAND_STATE_CONFLICT: &str = "COMMAND_STATE_CONFLICT";
 /// Starting or resuming recording failed.
 pub const RECORDING_START_FAILED: &str = "RECORDING_START_FAILED";
-/// Stopping, merging, or hashing the recording failed.
+/// Stopping, merging, or hashing the recording failed, or no segments exist.
 pub const RECORDING_FINISH_FAILED: &str = "RECORDING_FINISH_FAILED";

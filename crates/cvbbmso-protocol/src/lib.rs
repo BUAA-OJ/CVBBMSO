@@ -33,4 +33,4 @@ pub use exam::{AccodingUser, ExamListResponse, ExamPhase, ExamSummary};
 pub use incident::{ClientIncident, IncidentCode};
 pub use message::{ClientHello, ClientMessage, CommandName, CommandStatus, ServerMessage};
 pub use recording::{RecordingManifest, RecordingPolicy, SegmentMeta};
-pub use state::{ClientState, ExecutionState, NetworkState, Platform, RecordingState};
+pub use state::{ClientState, ExecutionState, Platform, RecordingState};

@@ -9,7 +9,6 @@ expression: message
   "platform": "windows",
   "state": {
     "execution": "ready",
-    "recording": "idle",
-    "network": "clear"
+    "recording": "idle"
   }
 }

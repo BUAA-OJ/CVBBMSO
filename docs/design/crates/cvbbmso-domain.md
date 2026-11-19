@@ -75,9 +75,16 @@ impl AdminService {
 }
 ```
 
-`ExamService::connect` 验证报名资格，并在相同 `(exam_id, oj_user_id)` 上恢复既有状态。`hello.instance_id` 与上次不同且考生已开始考试（`execution` 为 recording / finalizing / finished）时，写入 `process_restarted` 异常；重连成功时写入 `connection_restored`。`receive` 持久化可靠事件并返回累计 ACK；`disconnect` 由 server 对当前有效连接调用，`Closed`/`HeartbeatTimeout` 写入 `connection_lost`，`Replaced` 以 `detail = "replaced"` 写入 `connection_lost`。正常完成考试时连接静默关闭，连接丢失记录由 `disconnect` 产生。
+`ExamService::connect` 验证报名资格，并在相同 `(exam_id, oj_user_id)` 上恢复既有状态。`hello.state` 是客户端连接时刻的真实状态；服务端据此校正持久状态并决定是否生成命令。
 
-`due_commands` 根据服务端时钟生成开始/结束命令；实际网络推送由服务端执行。`connect` 可在迟到、重连或进程重启时补发命令。公共结果是 `completed` / `failed`；投递与重发细节由服务端内部处理。
+`connect` 记录异常的条件：
+
+- `hello.instance_id` 与上次不同，且上次状态为 `recording` 或 `finalizing` 时，写入 `process_restarted`。
+- 此前存在尚未恢复的 `connection_lost` 时，写入 `connection_restored`；首次连接直接建立记录。
+
+`receive` 持久化可靠事件并推进确认位置，处理命令结果并返回 `CommandAck`。`disconnect` 由 server 对当前有效连接调用：执行状态为 `finished` 的连接关闭按正常完成处理；其他关闭按 `Closed` / `HeartbeatTimeout` / `Replaced` 分别写入 `connection_lost`，其中 `Replaced` 的 `detail` 为 `"replaced"`。正常完成考试时连接静默关闭。
+
+`due_commands` 根据服务端时钟生成开始/结束命令；实际网络推送由服务端执行。命令由当前在线考生触发；离线考生的命令在 `connect` 时按状态生成。每个命令使用新的唯一 `command_id`。
 
 `ConnectOutcome.sync` 是 `ServerMessage::Sync`，`commands` 中每个元素都是 `ServerMessage::Command`；`DirectedCommand.command` 同样承载 `Command` 变体。
 
@@ -169,6 +176,8 @@ pub struct IncidentRecord {
 
 `actor` 由 CLI 提供，缺省为当前操作系统用户名；域层写入审计记录。`AdminOperation` 的输入先经过域层校验：`start_at < end_at`，`RecordingPolicy` 参数大于零，`oj_user_id` 为正整数，CSV 导入去重。错误以 `DomainError` 返回，由 server 或 CLI 映射为对外错误。
 
+`RecordingsShow` 返回已完成的 `RecordingManifest`；未 finalize 或 finalize 失败时返回 `NotFound`。
+
 ## 数据所有权
 
 本 crate 拥有以下业务数据；具体表结构和索引由实现决定：
@@ -178,7 +187,7 @@ pub struct IncidentRecord {
 | 考试记录 | `exam_id`、标题、固定起止时间、录像策略 |
 | 报名关系 | `(exam_id, oj_user_id)` 是否允许参加 |
 | 考生运行状态 | 当前设备/进程、连接状态、执行状态、最后心跳、事件确认位置 |
-| 指令记录 | 已下发或待下发的开始/结束命令及其终态结果 |
+| 指令记录 | 已下发或待下发的开始/结束命令、唯一 `command_id`、终态结果与 ACK 状态 |
 | 可靠事件 | 客户端上报的 `seq`、事件内容和接收时间 |
 | 异常记录 | 服务端与客户端按发生时间保存的证据 |
 | 录像摘要 | 分片元信息和合并文件摘要 |
@@ -192,31 +201,44 @@ pub struct IncidentRecord {
 - `start_at <= now < end_at`：`running`
 - `now >= end_at`：`ended`
 
-调度器定期调用 `due_commands`：
+调度器定期调用 `due_commands`；命令生成规则如下：
 
-- 到达 `start_at` 时，为已报名且需要开始录制的考生生成 `start_exam`；离线考生保留命令，重连后补发。
-- 到达 `end_at` 时，为已开始录制且需要收尾的考生生成 `end_exam`；离线考生在重连后补发。
-- 迟到、重连或进程重启时，`connect` 可以补发 `start_exam` / `end_exam`；需要重新开始录屏时生成新的 `start_exam` 和新的 `command_id`。
-- 同一考生同一命令类型的待完成命令复用既有 `command_id`；上一命令进入终态后，需要重新开始录屏时生成新的 `start_exam` 和新的 `command_id`。客户端对重复命令幂等处理。
+| 阶段 | 客户端 `hello.state` / 当前状态 | 生成命令 |
+| --- | --- | --- |
+| `scheduled` | 任意 | 无 |
+| `running` | `ready/idle` | 新 `start_exam` |
+| `running` | `recording/capturing` 或 `recording/failed` | 无（录屏故障由客户端自行重试） |
+| `running` | `finalizing/*` | 无 |
+| `running` | `finished/*` | 无 |
+| `ended` | `recording/*` 或 `finalizing/*` | 新 `end_exam` |
+| `ended` | `ready/idle` | 无 |
+| `ended` | `finished/*` | 无 |
+
+- 到达 `start_at` 时，对在线且处于 `ready/idle` 的考生生成 `start_exam`；离线考生在重连后由 `connect` 生成。
+- 到达 `end_at` 时，对在线且已开始录制的考生生成 `end_exam`；离线考生在重连后由 `connect` 生成。
+- 迟到、重连或进程重启时，`connect` 按上表补生成命令。每个命令使用新的 `command_id`。
+- 在线调度生成前检查当前连接是否已有同类型未终态命令；已有则等待结果。
+- `connect` 遇到上一连接遗留的未终态命令时，将其标记为 superseded；若 `hello.state` 表明命令效果未生效，则生成新 ID 的新命令。
+- 服务端收到 `command_result` 后持久化终态并回复 `CommandAck`。若结果丢失，重连时以 `hello.state` 校正：已体现命令效果的状态按完成处理；需要继续执行时生成新命令。
 
 ## 事件、异常与录像摘要
 
-客户端 `event.seq` 按 `(exam_id, oj_user_id)` 连续递增。`receive` 以联合标识和 `seq` 去重，持久化后推进最大连续确认序号 `ack_event_through`。`recording_finalized` 保存分片清单和合并摘要；`incident` 保存为异常记录。分片按 `index` 去重，重启后的重复上报按 `index` 幂等处理。
+客户端 `event.seq` 按 `(exam_id, oj_user_id)` 连续递增。`receive` 以联合标识和 `seq` 去重，持久化后推进最大连续确认序号 `ack_event_through`；确认位置在下一次 `sync` 中返回。重复 `seq` 内容相同则忽略，内容不同按协议错误处理。
+
+`Recorder::open` 恢复的分片可能以原 `seq` 重报；服务端按 `seq` 幂等，并可按 `(exam_id, oj_user_id, index)` 做辅助去重。`recording_finalized` 保存非空分片清单和合并摘要；`incident` 保存为异常记录。
 
 异常记录按发生时间保存，每条记录包含 `occurred_at`：
 
 | 来源 | `kind` | 含义 |
 | --- | --- | --- |
-| server | `connection_lost` | 当前连接关闭、心跳超时、被新连接替换或服务端重启；`detail` 说明原因 |
-| server | `connection_restored` | 考生重新连接成功 |
+| server | `connection_lost` | 当前连接关闭、心跳超时或被新连接替换；`detail` 说明原因 |
+| server | `connection_restored` | 此前丢失的考生连接重新建立成功 |
 | server | `process_restarted` | `instance_id` 变化，表明客户端进程重启 |
-| client | `proxy_detected` | 检测到系统代理/PAC/代理环境变量 |
-| client | `proxy_check_failed` | 代理检查无法完成 |
-| client | `recording_failed` | 录屏启动、采集、编码或写盘失败 |
+| client | `recording_failed` | 录屏启动、采集、编码、写盘、合并或哈希失败 |
 | client | `recording_recovered` | 录屏恢复；作为独立证据保存 |
 | client | `navigation_denied` | 受控浏览器拒绝了导航请求 |
 
-`connection_lost` 与 `connection_restored` 是两条独立记录，CLI 按 `occurred_at` 排序展示和关联。`detail` 为可选字符串，例如 `heartbeat_timeout`、`replaced`、`system proxy enabled`。异常按发生记录保存，消费方按时间判断关联。
+`connection_lost` 与 `connection_restored` 是两条独立记录，CLI 按 `occurred_at` 排序展示和关联。`detail` 为可选字符串，例如 `heartbeat_timeout`、`replaced`、`capture stream stopped`。异常按发生记录保存，消费方按时间判断关联。
 
 ## 错误映射
 
@@ -227,5 +249,7 @@ pub struct IncidentRecord {
 | `NotFound` | 考试、考生、异常或录像不存在 | `EXAM_NOT_FOUND` / CLI 错误 |
 | `NotEnrolled` | 访问者不在该考试的报名名单中 | `NOT_ENROLLED` |
 | `InvalidInput` | 时间、策略、CSV 或参数非法 | `INVALID_REQUEST` |
-| `Conflict` | 重复报名、状态冲突 | `INVALID_REQUEST` / CLI 错误 |
+| `Conflict` | 重复报名、命令结果与当前命令状态不匹配 | 命令结果用 `COMMAND_STATE_CONFLICT`，其他用 `INVALID_REQUEST` |
 | `Storage` | 数据库或持久化失败 | `INTERNAL_ERROR` |
+
+客户端 `command_result` 到达时，`receive` 校验 `command_id` 属于当前考生且命令仍可确认；重复的相同结果幂等忽略，未知或状态不匹配返回 `Conflict`，由 server 映射为 `COMMAND_STATE_CONFLICT`。
