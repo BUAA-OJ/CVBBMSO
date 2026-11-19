@@ -18,12 +18,12 @@ pub struct Exam;
 pub struct ExamHandle { /* 私有运行时句柄 */ }
 
 pub enum ExamError {
-    Http,
-    WebSocket,
+    Http(Option<reqwest::Error>),
+    WebSocket(Option<tokio_tungstenite::tungstenite::Error>),
     Auth,
     NotEnrolled,
-    Recording,
-    Storage,
+    Recording(cvbbmso_recorder::RecordingError),
+    Storage(std::io::Error),
     Closed,
 }
 
@@ -64,7 +64,7 @@ impl ExamHandle {
 
 `Exam::connect` 首先调用 `GET /api/exams` 确认用户身份和考试报名，以返回的 `user.id` 定位本地 `(exam_id, oj_user_id)` 数据，然后打开/恢复 recorder、建立 WSS 并等待初始 `sync`。`ExamConfig.instance_id` 由客户端进程启动时生成，在该进程的所有重连中保持一致；`device_id` 是持久设备标识。`Exam::connect` 是该 crate 的唯一启动入口。
 
-`ExamError` 是运行时错误类别：`Auth` / `NotEnrolled` 对应认证与报名错误，`Http` / `WebSocket` / `Recording` / `Storage` 对应连接、录像或存储失败，`Closed` 表示句柄已关闭。无法恢复的本地故障通过 `ClientView.last_error_code` 暴露，并停止运行时。
+`ExamError` 是运行时错误类别：`Auth` / `NotEnrolled` 对应认证与报名错误，`Http` / `WebSocket` / `Recording` / `Storage` 对应连接、录像或存储失败，并在有底层原因时携带它，供应用层通过 `anyhow` 输出完整 source 链；`Closed` 表示句柄已关闭。无法恢复的本地故障通过 `ClientView.last_error_code` 暴露，并停止运行时。
 
 一个客户端进程内每个 `exam_id` 最多有一个活跃 `ExamHandle`，客户端整体同时承载一场活动考试。`ExamHandle` 提供状态订阅、UI 通知和关闭。
 
@@ -130,8 +130,10 @@ stateDiagram-v2
 
 ## 本地数据所有权
 
-本 crate 管理 `<app-data>/exams/<exam-id>/<oj-user-id>/` 下的运行时数据：考试运行状态、已执行命令结果、待确认的可靠事件队列，以及分片 `index` 到原 `event.seq` 的映射。录像文件和分片元信息属于 [cvbbmso-recorder](cvbbmso-recorder.md)，位于同一考生目录下的 `recording/`。
+本 crate 管理 `<app-data>/exams/<exam-id>/<oj-user-id>/runtime/` 下的运行时数据：考试执行阶段、待确认的可靠事件队列，以及已入队的分片 `index`。录像文件和分片元信息属于 [cvbbmso-recorder](cvbbmso-recorder.md)，位于同一考生目录下的 `recording/`。命令结果只在当前连接内保留：重连后旧命令由服务端标记为 superseded，并按 `hello.state` 生成新命令，因此不跨连接重发命令结果。
 
-`Recorder::open` 会重新发出全部已恢复分片；运行时用持久化的 `index → seq` 映射为分片复用原序号，没有原序号的分片分配下一个事件序号。服务端按 `seq` 去重，因此重复上报安全。分片事件仍以 `SegmentMeta.index` 作为稳定身份，服务端可按 `(exam_id, oj_user_id, index)` 做辅助去重。
+`Recorder::open` 会重新发出全部已恢复分片；已入队的分片保留其原 `seq` 继续等待确认，已确认的分片不再上报，未入队的分片分配下一个事件序号。服务端按 `seq` 去重，因此重复上报安全。分片事件仍以 `SegmentMeta.index` 作为稳定身份，服务端可按 `(exam_id, oj_user_id, index)` 做辅助去重。
+
+事件序号由本地数据首次收到的 `sync.ack_event_through` 锚定：首次 `sync` 之前产生的事件先入队不编号，之后从 `ack_event_through + 1` 起编号；此后每次 `sync` 都不让序号回退。本地数据丢失或损坏（损坏文件改名保留后重建）时，新序号因此始终位于服务端已持久化的序号之后，不会与服务端已有的 `seq` 冲突。每次变更先原子写入磁盘，再发送对应消息。
 
 本地运行时数据由本 crate 管理，存储细节封装在 crate 内部；对客户端和其他 crate 提供运行时接口。

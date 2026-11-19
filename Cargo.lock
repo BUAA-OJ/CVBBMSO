@@ -691,6 +691,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cvbbmso-exam"
+version = "0.1.0"
+dependencies = [
+ "cvbbmso-protocol",
+ "cvbbmso-recorder",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
 name = "cvbbmso-protocol"
 version = "0.1.0"
 dependencies = [
