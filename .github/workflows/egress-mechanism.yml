@@ -1,0 +1,39 @@
+name: Egress guard mechanism
+
+# The egress guard touches operating-system firewall state, so its privileged
+# verification is kept out of the pull request gate: it runs on demand only.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  pf-rules:
+    name: PF rules (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 10
+    # A broken firewall rule must never block the repository, so this job
+    # reports a failure without failing the workflow during its probation.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Rendered rules must parse with pfctl
+        run: cargo test -p cvbbmso-network --lib egress::backend::macos
+
+  wfp-filters:
+    name: WFP filters (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Filter plan must be well formed
+        run: cargo test -p cvbbmso-network --lib egress::backend::windows
