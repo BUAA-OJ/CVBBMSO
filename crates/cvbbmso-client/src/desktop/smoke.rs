@@ -187,8 +187,8 @@ async fn exercise(
 ) -> Result<(), Error> {
     wait_for(
         ui,
-        "Boolean(document.querySelector('#open') && window.__TAURI__)",
-        "local UI",
+        "document.querySelector('#inspect')?.disabled === false",
+        "local UI event subscription",
     )
     .await?;
     ui.eval("document.querySelector('#open').click()")?;
@@ -200,7 +200,8 @@ async fn exercise(
             sleep(Duration::from_millis(50)).await;
         }
     })
-    .await?;
+    .await
+    .map_err(|_| io::Error::other("Local command did not open the Accoding window"))?;
     wait_for(&oj, "document.title === 'Fixture login'", "remote fixture").await?;
     println!(
         "Native WebView user agent: {}",

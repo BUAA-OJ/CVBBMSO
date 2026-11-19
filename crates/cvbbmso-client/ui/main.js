@@ -23,7 +23,7 @@ try {
       : "未读取到会话。请在 Accoding 窗口登录后重试。";
   });
   inspect.addEventListener("click", () => submit(inspect, "inspect_session"));
+  inspect.disabled = false;
 } catch {
-  inspect.disabled = true;
   session.textContent = "会话检查暂不可用。";
 }

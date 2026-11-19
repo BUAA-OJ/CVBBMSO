@@ -20,6 +20,7 @@ pub(super) fn lock_down(browser: &WebviewWindow) -> tauri::Result<()> {
                 settings
                     .cast::<ICoreWebView2Settings3>()?
                     .SetAreBrowserAcceleratorKeysEnabled(false)?;
+                let mut handler_token = 0;
                 webview
                     .cast::<ICoreWebView2_18>()?
                     .add_LaunchingExternalUriScheme(
@@ -29,7 +30,7 @@ pub(super) fn lock_down(browser: &WebviewWindow) -> tauri::Result<()> {
                             }
                             Ok(())
                         })),
-                        &mut 0,
+                        &raw mut handler_token,
                     )?;
             }
             Ok(())
@@ -62,12 +63,12 @@ pub(super) fn assert_locked(browser: &WebviewWindow) -> tauri::Result<()> {
             unsafe {
                 let webview = native.controller().CoreWebView2()?;
                 let settings = webview.Settings()?;
-                let mut devtools = Default::default();
-                let mut accelerators = Default::default();
-                settings.AreDevToolsEnabled(&mut devtools)?;
+                let mut devtools = windows_core::BOOL::default();
+                let mut accelerators = windows_core::BOOL::default();
+                settings.AreDevToolsEnabled(&raw mut devtools)?;
                 settings
                     .cast::<ICoreWebView2Settings3>()?
-                    .AreBrowserAcceleratorKeysEnabled(&mut accelerators)?;
+                    .AreBrowserAcceleratorKeysEnabled(&raw mut accelerators)?;
                 Ok((devtools.as_bool(), accelerators.as_bool()))
             }
         };

@@ -6,7 +6,10 @@ use objc2_web_kit::WKWebView;
 use tauri::WebviewWindow;
 use url::Url;
 
-use crate::policy::matches_cookie;
+#[path = "macos/cookie_scope.rs"]
+mod cookie_scope;
+
+use cookie_scope::matches_cookie;
 
 pub(super) fn cookie_pairs(
     browser: &WebviewWindow,

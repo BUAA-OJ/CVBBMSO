@@ -249,7 +249,7 @@ async fn http_distinguishes_expired_unavailable_and_empty_enrollment() {
     assert_eq!(response.status(), StatusCode::OK);
     let list = response.json::<ExamListResponse>().await.unwrap();
     assert_eq!(list.user.id, 42);
-    assert!(list.items.is_empty());
+    assert_eq!(list.items, Vec::<ExamSummary>::new());
     server.abort();
 }
 

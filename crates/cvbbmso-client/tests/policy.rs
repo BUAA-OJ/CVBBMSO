@@ -1,9 +1,12 @@
 //! Regressions for parsed origins and identity cookie scope.
 
+#[path = "../src/desktop/macos/cookie_scope.rs"]
+mod cookie_scope;
 #[path = "../src/policy.rs"]
 mod policy;
 
-use policy::{IDENTITY_URL, LOGIN_URL, matches_cookie, permits, server_origin};
+use cookie_scope::matches_cookie;
+use policy::{IDENTITY_URL, LOGIN_URL, permits, server_origin};
 use url::Url;
 
 #[test]
