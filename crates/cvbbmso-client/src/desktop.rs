@@ -85,7 +85,7 @@ fn builder() -> tauri::Builder<Wry> {
 }
 
 fn build_ui(app: &AppHandle) -> tauri::Result<WebviewWindow> {
-    WebviewWindowBuilder::new(app, UI, WebviewUrl::App("index.html".into()))
+    let ui = WebviewWindowBuilder::new(app, UI, WebviewUrl::App("index.html".into()))
         .title("CVBBMSO")
         .inner_size(560.0, 420.0)
         .min_inner_size(340.0, 320.0)
@@ -102,7 +102,15 @@ fn build_ui(app: &AppHandle) -> tauri::Result<WebviewWindow> {
                 && matches!(url.path(), "" | "/" | "/index.html")
         })
         .on_new_window(|_, _| NewWindowResponse::Deny)
-        .build()
+        .build()?;
+    let app = app.clone();
+    ui.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            app.exit(0);
+        }
+    });
+    Ok(ui)
 }
 
 #[tauri::command]

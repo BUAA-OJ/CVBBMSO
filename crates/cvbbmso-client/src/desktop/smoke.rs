@@ -30,40 +30,47 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 const DEADLINE: Duration = Duration::from_secs(20);
 
 pub(super) fn run() -> tauri::Result<()> {
+    let data = tempfile::tempdir()?;
+    let data_dir = data.path().to_owned();
     let (completed, result) = std::sync::mpsc::channel();
     let app = builder()
         .setup(move |app| {
-            let data = tempfile::tempdir()?;
-            let deployed = Desktop::deployed(data.path().to_owned())?;
+            let deployed = Desktop::deployed(data_dir.clone())?;
             let (fixture, foreign, hits) = async_runtime::block_on(start_fixture())?;
             let base = Url::parse(&format!("http://{fixture}/"))?;
             let (blocked, mut decisions) = mpsc::unbounded_channel();
             app.manage(Desktop {
                 login: base.join("user/login")?,
                 identity: base.join("api/users/me")?,
-                data_dir: data.path().to_owned(),
+                data_dir,
                 blocked: Some(blocked),
             });
             let ui = build_ui(app.handle())?;
             let app = app.handle().clone();
             async_runtime::spawn(async move {
-                let result =
+                let exercised =
                     exercise(&app, &ui, &deployed, &base, foreign, &hits, &mut decisions).await;
-                if let Err(error) = result {
+                if let Err(error) = exercised.and_then(|()| ui.close().map_err(Into::into)) {
                     eprintln!("Desktop smoke failed: {error}");
-                    let _ = completed.send(false);
                 } else {
-                    println!("Desktop smoke passed.");
-                    let _ = completed.send(true);
+                    sleep(DEADLINE).await;
+                    eprintln!("Desktop smoke failed: closing the control window did not exit");
                 }
-                app.exit(0);
-                drop(data);
+                app.exit(1);
             });
             Ok(())
         })
         .build(tauri::generate_context!())?;
-    app.run_return(|_, _| {});
-    if result.try_recv() == Ok(true) {
+    app.run_return(move |app, event| {
+        if matches!(event, tauri::RunEvent::ExitRequested { code: Some(0), .. })
+            && app.get_webview_window(OJ).is_some()
+        {
+            let _ = completed.send(());
+        }
+    });
+    if result.try_recv().is_ok() {
+        println!("Closing the control window exited with Accoding open.");
+        println!("Desktop smoke passed.");
         Ok(())
     } else {
         Err(io::Error::other("Native desktop smoke did not complete successfully").into())
