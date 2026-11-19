@@ -16,6 +16,7 @@
 
 mod capture;
 mod container;
+mod encode;
 mod error;
 mod event;
 mod recorder;
