@@ -603,7 +603,11 @@ impl<C: Capture> Runtime<C> {
                     if self.state.recording == RecordingState::Capturing {
                         self.resolve(CommandStatus::Completed, None).await;
                     } else {
-                        self.start_failures = 0;
+                        // A capture already failing keeps its count, so the
+                        // fault is not reported a second time.
+                        if self.state.recording != RecordingState::Failed {
+                            self.start_failures = 0;
+                        }
                         self.retry_at = None;
                         self.try_start().await;
                     }
