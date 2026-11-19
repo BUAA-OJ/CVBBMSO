@@ -1,0 +1,15 @@
+{
+  "productName": "CVBBMSO",
+  "identifier": "edu.buaa.accoding.cvbbmso",
+  "build": {
+    "frontendDist": "ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "capabilities": ["student-ui"],
+      "csp": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src ipc: http://ipc.localhost; base-uri 'none'; form-action 'none'; frame-src 'none'"
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "identifier": "student-ui",
+  "description": "Local student controls and addressed session observations",
+  "webviews": ["student"],
+  "permissions": ["allow-open-accoding", "allow-inspect-session", "core:event:allow-listen", "core:event:allow-unlisten"]
+}
