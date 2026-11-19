@@ -137,11 +137,16 @@ impl Drop for MediaFoundationGuard {
 }
 
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
+
+use super::Nv12Frame;
+use windows::core::Error as WindowsError;
 
 use windows::Win32::Media::MediaFoundation::{
-    CMSH264EncoderMFT, IMFTransform, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING, MF_MT_SUBTYPE,
-    MFCreateMediaType, MFVideoInterlace_Progressive,
+    CMSH264EncoderMFT, IMFTransform, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+    MF_MT_MAX_KEYFRAME_SPACING, MF_MT_SUBTYPE, MFCreateMediaType, MFCreateMemoryBuffer,
+    MFCreateSample, MFT_OUTPUT_DATA_BUFFER, MFVideoInterlace_Progressive,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 
@@ -242,6 +247,80 @@ fn pack(high: u32, low: u32) -> u64 {
     (u64::from(high) << 32) | u64::from(low)
 }
 
+impl Encoder {
+    /// Encodes one NV12 frame and returns the elementary stream bytes produced.
+    ///
+    /// Returns an empty vector when the encoder needs more input before it can
+    /// emit a frame, which is normal for the first frames of a stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordingError::Encoder`] when the transform rejects the frame
+    /// or cannot deliver output.
+    pub(crate) fn encode(
+        &mut self,
+        frame: &Nv12Frame,
+        timestamp: std::time::Duration,
+    ) -> Result<Vec<u8>, RecordingError> {
+        encode_frame(&self.transform, frame, timestamp).map_err(|_| RecordingError::Encoder)
+    }
+}
+
+fn encode_frame(
+    transform: &IMFTransform,
+    frame: &Nv12Frame,
+    timestamp: std::time::Duration,
+) -> WindowsResult<Vec<u8>> {
+    // SAFETY: the input buffer is locked only while it is written, and the output
+    // sample is copied out before the contiguous buffer is unlocked.
+    unsafe {
+        let bytes = frame.as_bytes();
+        let length = u32::try_from(bytes.len()).map_err(|_| WindowsError::from_win32())?;
+        let buffer = MFCreateMemoryBuffer(length)?;
+        let mut source_pixels: *mut u8 = ptr::null_mut();
+        buffer.Lock(&raw mut source_pixels, None, None)?;
+        std::slice::from_raw_parts_mut(source_pixels, bytes.len()).copy_from_slice(bytes);
+        buffer.Unlock()?;
+        buffer.SetCurrentLength(length)?;
+
+        let sample = MFCreateSample()?;
+        sample.AddBuffer(&buffer)?;
+        sample.SetSampleTime(hns(timestamp))?;
+        transform.ProcessInput(0, &sample, 0)?;
+
+        let mut output = MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: 0,
+            pSample: ManuallyDrop::new(None),
+            dwStatus: 0,
+            pEvents: ManuallyDrop::new(None),
+        };
+        let mut status = 0_u32;
+        match transform.ProcessOutput(0, std::slice::from_mut(&mut output), &raw mut status) {
+            Ok(()) => {}
+            Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        }
+        let Some(output_sample) = ManuallyDrop::take(&mut output.pSample) else {
+            return Ok(Vec::new());
+        };
+
+        let contiguous = output_sample.ConvertToContiguousBuffer()?;
+        let mut encoded_bytes: *mut u8 = ptr::null_mut();
+        let mut current = 0_u32;
+        contiguous.Lock(&raw mut encoded_bytes, None, Some(&raw mut current))?;
+        let bytes =
+            std::slice::from_raw_parts(encoded_bytes, usize::try_from(current).unwrap_or(0))
+                .to_vec();
+        contiguous.Unlock()?;
+        Ok(bytes)
+    }
+}
+
+/// Converts a duration into the 100-nanosecond units Media Foundation uses.
+fn hns(duration: std::time::Duration) -> i64 {
+    i64::try_from(duration.as_nanos() / 100).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +374,27 @@ mod tests {
         let encoder =
             super::Encoder::open(1920, 1080, 15, super::DEFAULT_BITRATE).expect("encoder");
         drop(encoder);
+    }
+
+    #[test]
+    #[ignore = "requires Media Foundation"]
+    fn encodes_frames_into_an_elementary_stream() {
+        let mut encoder =
+            super::Encoder::open(320, 240, 15, super::DEFAULT_BITRATE).expect("encoder");
+        let mut frame = crate::encode::Nv12Frame::new(320, 240).expect("frame");
+        frame
+            .convert_bgra(&vec![128_u8; 320 * 240 * 4])
+            .expect("convert");
+        let mut total = 0_usize;
+        for index in 0..10_u32 {
+            let bytes = encoder
+                .encode(
+                    &frame,
+                    std::time::Duration::from_millis(u64::from(index) * 66),
+                )
+                .expect("encode");
+            total += bytes.len();
+        }
+        println!("elementary stream bytes: {total}");
     }
 }
