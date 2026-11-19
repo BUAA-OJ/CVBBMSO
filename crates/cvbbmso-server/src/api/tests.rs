@@ -263,7 +263,7 @@ async fn protected_http_routes_use_verified_identity_and_json_errors() {
         .await;
     let exams: ExamListResponse = serde_json::from_value(body(exams).await).unwrap();
     assert_eq!(exams.user.id, OTHER_STUDENT);
-    assert!(exams.items.is_empty());
+    assert_eq!(exams.items, []);
 
     for (cookie, status, code) in [
         (

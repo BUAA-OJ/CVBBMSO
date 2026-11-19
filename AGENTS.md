@@ -213,7 +213,9 @@ Write idiomatic Rust and keep the design boring.
 
 ## 7. Toolchain, Formatting, and Lints
 
-- Edition 2024, MSRV 1.88, stable toolchain pinned in `rust-toolchain.toml`.
+- Edition 2024, MSRV 1.99.1. Local builds and CI use the same pinned Rust
+  release. Update `Cargo.toml`, `rust-toolchain.toml`, and `.github/workflows/ci.yml`
+  together when raising it.
 - Format with default `rustfmt` settings: `cargo fmt --all`.
 - Enable `clippy::all` and `clippy::pedantic` at workspace level. Treat
   warnings as errors in CI, not during local iteration.

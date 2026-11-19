@@ -22,7 +22,7 @@ pub(crate) async fn receive(
     let event = validated(event)?;
     let encoded_seq = db::encode_seq(seq);
     if let Some(existing) = tx
-        .query_one(sql!(
+        .query_one_raw(sql!(
             "SELECT event FROM events WHERE exam_id = ? AND oj_user_id = ? AND seq = ?",
             key.exam.as_str(),
             key.user,
@@ -38,7 +38,7 @@ pub(crate) async fn receive(
         };
     }
 
-    tx.execute(sql!(
+    tx.execute_raw(sql!(
         "INSERT INTO events (exam_id, oj_user_id, seq, event, received_at) VALUES (?, ?, ?, ?, ?)",
         key.exam.as_str(),
         key.user,
@@ -63,7 +63,7 @@ pub(crate) async fn receive(
             .await?;
         }
         ExamEvent::RecordingFinalized(manifest) => {
-            tx.execute(sql!(
+            tx.execute_raw(sql!(
                 "INSERT INTO recording_manifests (exam_id, oj_user_id, source_seq, manifest)
                  VALUES (?, ?, ?, ?) ON CONFLICT (exam_id, oj_user_id) DO UPDATE SET
                  source_seq = excluded.source_seq, manifest = excluded.manifest
@@ -156,7 +156,7 @@ async fn advance_ack(
             break;
         }
     }
-    tx.execute(sql!(
+    tx.execute_raw(sql!(
         "UPDATE student_runtimes SET ack_event_through = ? WHERE exam_id = ? AND oj_user_id = ?",
         db::encode_seq(count),
         key.exam.as_str(),
@@ -201,7 +201,7 @@ async fn save_incident(
     evidence: Evidence<'_>,
 ) -> Result<String, DomainError> {
     let id = Uuid::new_v4().to_string();
-    tx.execute(sql!(
+    tx.execute_raw(sql!(
         "INSERT INTO incidents (incident_id, exam_id, oj_user_id, source, kind, occurred_at, detail, event_seq)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         id.as_str(), key.exam.as_str(), key.user, evidence.source, evidence.kind,

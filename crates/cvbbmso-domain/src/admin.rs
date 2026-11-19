@@ -239,7 +239,7 @@ async fn mutate(
             }
             let exam_id = Uuid::new_v4();
             let id = exam_id.to_string();
-            tx.execute(sql!(
+            tx.execute_raw(sql!(
                 "INSERT INTO exams (exam_id, title, start_at, end_at, segment_duration_secs, fps)
                  VALUES (?, ?, ?, ?, ?, ?)",
                 id.as_str(),
@@ -281,7 +281,7 @@ async fn mutate(
             let key = StudentKey::new(exam_id, oj_user_id)?;
             db::exam(tx, &key.exam).await?;
             let deleted = tx
-                .execute(sql!(
+                .execute_raw(sql!(
                     "DELETE FROM enrollments WHERE exam_id = ? AND oj_user_id = ?",
                     key.exam.as_str(),
                     key.user,
@@ -347,7 +347,7 @@ async fn add_participant(
     user: i64,
 ) -> Result<usize, DomainError> {
     let execution = tx
-        .execute(sql!(
+        .execute_raw(sql!(
             "INSERT INTO enrollments (exam_id, oj_user_id) VALUES (?, ?)
          ON CONFLICT (exam_id, oj_user_id) DO NOTHING",
             exam,
@@ -367,7 +367,7 @@ async fn audit(
     now: OffsetDateTime,
 ) -> Result<(), DomainError> {
     let target_users = target_users.map(|users| db::encode(&users)).transpose()?;
-    tx.execute(sql!(
+    tx.execute_raw(sql!(
         "INSERT INTO admin_audit (audit_id, actor, operation, exam_id, target_users, change_count, occurred_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)",
         Uuid::new_v4().to_string(), actor, operation, exam, target_users,
@@ -618,7 +618,7 @@ async fn recording(tx: &DatabaseTransaction, key: &StudentKey) -> Result<AdminOu
         return Err(DomainError::NotFound);
     }
     let manifest = tx
-        .query_one(sql!(
+        .query_one_raw(sql!(
             "SELECT manifest FROM recording_manifests WHERE exam_id = ? AND oj_user_id = ?",
             key.exam.as_str(),
             key.user,

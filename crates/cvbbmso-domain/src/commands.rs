@@ -30,7 +30,7 @@ pub(crate) async fn issue(
     };
     let command_id = Uuid::new_v4();
     let inserted = tx
-        .execute(sql!(
+        .execute_raw(sql!(
             "INSERT INTO commands (
                  command_id, exam_id, oj_user_id, connection_id, name, effective_at, created_at, lifecycle
              ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
@@ -60,7 +60,7 @@ pub(crate) async fn retire_pending(
         ExecutionState::Recording | ExecutionState::Finalizing
     ) || state.execution == ExecutionState::Finished;
     let ended = state.execution == ExecutionState::Finished;
-    tx.execute(sql!(
+    tx.execute_raw(sql!(
         "UPDATE commands SET lifecycle = CASE
              WHEN (name = 'start_exam' AND ?) OR (name = 'end_exam' AND ?) THEN 'inferred'
              ELSE 'superseded'
@@ -122,7 +122,7 @@ pub(crate) async fn result(
         return Err(DomainError::Conflict);
     }
 
-    tx.execute(sql!(
+    tx.execute_raw(sql!(
         "UPDATE commands SET lifecycle = 'reported', result_status = ?, result_error_code = ?
          WHERE command_id = ?",
         status_name,

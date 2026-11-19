@@ -243,7 +243,7 @@ async fn enrollment_is_rechecked_and_removal_preserves_prior_evidence() {
         f.service.check_enrollment(f.exam, USER + 1).await,
         Err(DomainError::NotEnrolled)
     ));
-    assert!(f.service.list_for(USER + 1).await.unwrap().is_empty());
+    assert_eq!(f.service.list_for(USER + 1).await.unwrap(), []);
     f.service.check_enrollment(f.exam, USER).await.unwrap();
     let hello = ready();
     f.connect(hello.clone()).await;
@@ -274,7 +274,7 @@ async fn time_boundaries_schedule_each_pending_command_once() {
     let hello = ready();
     let outcome = f.connect(hello).await;
     sync(&outcome, ExamPhase::Scheduled, 0);
-    assert!(outcome.commands.is_empty());
+    assert_eq!(outcome.commands, []);
 
     let cases = [
         (START - 1, ExamPhase::Scheduled),
@@ -539,7 +539,7 @@ async fn failed_audit_rolls_back_enrollment() {
     f.sql("DROP TRIGGER fail_audit").await;
     f.admin(op).await;
     f.service.check_enrollment(f.exam, USER + 1).await.unwrap();
-    let row = f.service.admin().0.database.query_one(db::sql!(
+    let row = f.service.admin().0.database.query_one_raw(db::sql!(
         "SELECT COUNT(*) AS count FROM admin_audit WHERE operation = 'participants_add' AND target_users = ?",
         format!("[{}]", USER + 1),
     )).await.unwrap().unwrap();
@@ -645,7 +645,7 @@ async fn failed_runtime_update_rolls_back_command_result_and_ack() {
         .admin()
         .0
         .database
-        .query_one(db::sql!(
+        .query_one_raw(db::sql!(
             "SELECT result_error_code FROM commands WHERE command_id = ?",
             command_id.to_string(),
         ))
@@ -715,7 +715,7 @@ async fn stale_write_snapshot_rechecks_enrollment_after_concurrent_cli_commit() 
                     .await
                     .unwrap();
             }
-            tx.execute(db::sql!(
+            tx.execute_raw(db::sql!(
                 "UPDATE exams SET title = 'stale write' WHERE exam_id = ?",
                 key.exam,
             ))

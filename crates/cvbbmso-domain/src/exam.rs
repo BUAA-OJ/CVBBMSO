@@ -230,7 +230,7 @@ async fn connect(
 
     let connection_id = Uuid::new_v4().to_string();
     let instance_id = hello.instance_id.to_string();
-    tx.execute(sql!(
+    tx.execute_raw(sql!(
         "INSERT INTO student_runtimes (
              exam_id, oj_user_id, device_id, instance_id, platform, connection_id,
              connected, execution, recording, last_seen_at, ack_event_through
@@ -329,7 +329,7 @@ async fn receive(
     }
     match message {
         ClientMessage::Heartbeat => {
-            tx.execute(sql!(
+            tx.execute_raw(sql!(
                 "UPDATE student_runtimes SET last_seen_at = ? WHERE exam_id = ? AND oj_user_id = ?",
                 db::stored_time(now)?,
                 key.exam.as_str(),
@@ -358,7 +358,7 @@ pub(crate) async fn update_state(
     key: &StudentKey,
     state: ClientState,
 ) -> Result<(), DomainError> {
-    tx.execute(sql!(
+    tx.execute_raw(sql!(
         "UPDATE student_runtimes SET execution = ?, recording = ? WHERE exam_id = ? AND oj_user_id = ?",
         db::enum_name(state.execution)?, db::enum_name(state.recording)?, key.exam.as_str(), key.user,
     ))
@@ -384,7 +384,7 @@ async fn disconnect(
                 .await?,
         )
     };
-    tx.execute(sql!(
+    tx.execute_raw(sql!(
         "UPDATE student_runtimes SET connected = 0, lost_incident_id = ?
          WHERE exam_id = ? AND oj_user_id = ?",
         lost_id,

@@ -94,11 +94,14 @@ fn busy(error: &DomainError) -> bool {
         return false;
     };
     let Some(
-        DbErr::Exec(RuntimeErr::SqlxError(sqlx::Error::Database(source)))
-        | DbErr::Query(RuntimeErr::SqlxError(sqlx::Error::Database(source)))
-        | DbErr::Conn(RuntimeErr::SqlxError(sqlx::Error::Database(source))),
+        DbErr::Exec(RuntimeErr::SqlxError(error))
+        | DbErr::Query(RuntimeErr::SqlxError(error))
+        | DbErr::Conn(RuntimeErr::SqlxError(error)),
     ) = source.downcast_ref::<DbErr>()
     else {
+        return false;
+    };
+    let sqlx::Error::Database(source) = error.as_ref() else {
         return false;
     };
     source
@@ -254,7 +257,7 @@ pub(crate) async fn enrollment(
 ) -> Result<StoredExam, DomainError> {
     let exam = exam(db, &key.exam).await?;
     if db
-        .query_one(sql!(
+        .query_one_raw(sql!(
             "SELECT 1 FROM enrollments WHERE exam_id = ? AND oj_user_id = ?",
             key.exam.as_str(),
             key.user,
