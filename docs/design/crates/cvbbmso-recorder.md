@@ -17,11 +17,11 @@ pub enum RecorderEvent {
 }
 
 pub enum RecordingError {
-    Io,
-    Platform,
-    Encoder,
+    Io(std::io::Error),
+    Platform(PlatformError),
+    Encoder(EncoderError),
     NoSegments,
-    Merge,
+    Merge(MergeError),
 }
 
 impl Recorder {
@@ -48,6 +48,8 @@ impl Recorder {
     ) -> Result<cvbbmso_protocol::RecordingManifest, RecordingError>;
 }
 ```
+
+`RecordingError` 的 `Io` / `Platform` / `Encoder` / `Merge` 变体携带底层原因（`std::io::Error`、`PlatformError`、`EncoderError`、`MergeError`），使应用层通过 `anyhow` 输出完整 source 链。`PlatformError`、`EncoderError`、`MergeError` 是本 crate 的错误类型，均为 `#[non_exhaustive]`，随采集、编码和合并的实现扩充变体；`NoSegments` 是状态判定，不携带原因。
 
 `candidate_dir` 是考生目录 `<app-data>/exams/<exam-id>/<oj-user-id>/`，由运行时传入；`Recorder` 在其中创建 `recording/`。`open` 读取并恢复已封存分片，恢复分片按 `index` 升序通过接收端发送 `SegmentFinalized`。运行时为这些分片复用本地持久化的原 `event.seq`，因此 `open` 可以安全地重复发出全部分片。
 
