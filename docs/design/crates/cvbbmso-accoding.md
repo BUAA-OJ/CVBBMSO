@@ -6,10 +6,15 @@
 
 ```rust
 pub struct AccodingCookies { /* 私有 Cookie 集合 */ }
+pub struct Verifier { /* 私有 HTTP 客户端 */ }
 
-pub enum CookieError {
+#[non_exhaustive]
+pub enum AccodingError {
     MissingSession,
-    InvalidHeader,
+    InvalidHeader(Option<http::header::InvalidHeaderValue>),
+    Unauthenticated,
+    Upstream(reqwest::Error),
+    InvalidResponse(Option<serde_json::Error>),
 }
 
 impl AccodingCookies {
@@ -17,35 +22,31 @@ impl AccodingCookies {
     /// 要求 connect.sid 存在且非空；其余 Cookie 原样保留。
     pub fn from_pairs(
         pairs: impl IntoIterator<Item = (String, String)>,
-    ) -> Result<Self, CookieError>;
+    ) -> Result<Self, AccodingError>;
 
-    /// 编码为标准 HTTP Cookie 头，供原生 HTTPS/WSS 请求使用。
-    pub fn header_value(&self) -> Result<http::HeaderValue, CookieError>;
-}
-
-pub struct Verifier { /* 私有 HTTP 客户端 */ }
-
-pub enum VerifyError {
-    Unauthenticated,
-    Upstream,
-    InvalidResponse,
+    /// 返回构造时已校验并标为敏感的 HTTP Cookie 头，供 HTTPS/WSS 请求使用。
+    pub fn header_value(&self) -> http::HeaderValue;
 }
 
 impl Verifier {
-    /// 创建学生站身份验证器；学生站 Origin 是内部固定常量。
-    pub fn new(http: reqwest::Client) -> Self;
+    /// 创建可复用的学生站身份验证器。
+    pub fn new() -> Result<Self, AccodingError>;
 
     /// 查询当前 Accoding 账号；匿名或失效 Cookie 返回 Unauthenticated。
     pub async fn verify(
         &self,
         cookies: &AccodingCookies,
-    ) -> Result<cvbbmso_protocol::AccodingUser, VerifyError>;
+    ) -> Result<cvbbmso_protocol::AccodingUser, AccodingError>;
 }
 ```
 
-`AccodingCookies` 要求至少包含非空 `connect.sid`；WebView 提供的其他 Cookie 原样保留，服务端用整组 Cookie 复验。`Verifier` 的 Origin 固定为学生站，Cookie 发送到该固定地址。
+`AccodingCookies` 构造时要求恰好有一个非空 `connect.sid`。缺失或空值返回 `MissingSession`，重复的会话 Cookie 或不符合 Cookie 头语法的名值返回 `InvalidHeader`。Cookie 值和顺序原样保留，服务端用整组 Cookie 复验。
 
-`VerifyError::Unauthenticated` 表示 Cookie 缺失、失效或 Accoding 返回匿名状态；`Upstream` 表示网络错误或学生站 5xx；`InvalidResponse` 表示返回体格式异常。服务端将 `Unauthenticated` 映射为 `ACCODING_AUTH_EXPIRED`，将 `Upstream` / `InvalidResponse` 映射为 `ACCODING_UNAVAILABLE` 或 `INTERNAL_ERROR`。
+`Verifier` 只向固定的学生站身份接口发送 Cookie。HTTP 客户端的请求超时为 10 秒，并禁用重定向。`401`、指向同 Origin `/user/login` 的 `301`、`302`、`303`、`307` 或 `308`，以及 `200` 的空正文或纯 ASCII 空白正文，均返回 `Unauthenticated`。
+
+身份响应正文最多接收 16 KiB（16,384 字节）。`Verifier` 按实际读取的字节累计，超出上限时立即停止读取并返回 `InvalidResponse`。异常响应状态、无效 JSON 和不满足 `AccodingUser` 约束的身份数据也返回 `InvalidResponse`。HTTP 客户端初始化失败、传输错误和其他上游 HTTP 错误状态返回 `Upstream`。
+
+服务端对 HTTP `/api/exams` 和 WebSocket 升级前的握手使用同一错误映射。非法 Cookie 或重复的 `connect.sid` 产生 `InvalidHeader`，返回 `400 INVALID_REQUEST`。`MissingSession` 和 `Unauthenticated` 返回 `401 ACCODING_AUTH_EXPIRED`。`Upstream` 和 `InvalidResponse` 映射为 `ACCODING_UNAVAILABLE` 或 `INTERNAL_ERROR`。
 
 ## Accoding 登录与认证协议
 
@@ -73,7 +74,7 @@ username=user%40example.com&password=<url-encoded-password>&_csrf=<url-encoded-c
 {"id":12345,"username":"user@example.com","nickname":"示例用户"}
 ```
 
-匿名响应同样为 HTTP `200`，Content-Type 为 `application/json`，正文为空。`Verifier::verify` 在得到有效用户对象时返回 `AccodingUser`；空正文映射为 `Unauthenticated`，监考服务端在握手认证失败时映射为 `401 ACCODING_AUTH_EXPIRED`。
+匿名响应同样为 HTTP `200`，Content-Type 为 `application/json`，正文为空。
 
 ## 与其他 crate 的边界
 
