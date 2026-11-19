@@ -43,6 +43,14 @@ pub(super) fn recover(segments_dir: &Path) -> Result<BTreeMap<u32, SegmentMeta>,
         }
     }
 
+    // Metadata proves the segment was sealed; its video disappearing is missing
+    // evidence, not an unsealed leftover, so it must not be reported as free.
+    if let Some(index) = metas.difference(&videos).next() {
+        return Err(invalid_input(format!(
+            "segment {index} metadata has no video"
+        )));
+    }
+
     let mut segments = BTreeMap::new();
     let mut expected = 1_u32;
     for index in videos.intersection(&metas) {

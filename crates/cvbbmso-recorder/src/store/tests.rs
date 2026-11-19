@@ -156,6 +156,22 @@ fn fails_when_a_video_no_longer_matches_its_digest() {
 }
 
 #[test]
+fn fails_when_a_sealed_video_is_missing() {
+    let directory = TempDir::new().expect("temp dir");
+    let mut store = store(&directory);
+    for index in 1..=2_u32 {
+        write_video(&store, index, b"abc");
+        store
+            .seal(index, timestamp(0), timestamp(30))
+            .expect("seal");
+    }
+    fs::remove_file(store.video_path(2)).expect("remove video");
+    drop(store);
+
+    assert!(SegmentStore::open(directory.path()).is_err());
+}
+
+#[test]
 fn refuses_to_seal_over_existing_metadata() {
     let directory = TempDir::new().expect("temp dir");
     let mut store = store(&directory);
