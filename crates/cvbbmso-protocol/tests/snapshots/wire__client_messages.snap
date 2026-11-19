@@ -1,6 +1,6 @@
 ---
 source: crates/cvbbmso-protocol/tests/wire.rs
-expression: "vec![ClientMessage::Heartbeat, ClientMessage::Status { state: state() },\nClientMessage::Event\n{\n    seq: 4, event:\n    ExamEvent::SegmentFinalized(segment(1, \"2026-12-20T01:00:00Z\",\n    \"2026-12-20T01:00:30Z\", 'a',)),\n}, ClientMessage::Event\n{\n    seq: 5, event:\n    ExamEvent::Incident(ClientIncident\n    {\n        code: IncidentCode::ProxyDetected, occurred_at:\n        at(\"2026-12-20T01:00:31Z\"), detail:\n        Some(\"system proxy enabled\".to_owned()),\n    }),\n}, ClientMessage::Event\n{ seq: 6, event: ExamEvent::RecordingFinalized(manifest()), },\ncommand_result(CommandStatus::Completed, None),\ncommand_result(CommandStatus::Failed, Some(\"RECORDING_START_FAILED\")),]"
+expression: "vec![ClientMessage::Heartbeat, ClientMessage::Status { state: state() },\nClientMessage::Event\n{\n    seq: 4, event:\n    ExamEvent::SegmentFinalized(segment(1, \"2026-12-20T01:00:00Z\",\n    \"2026-12-20T01:00:30Z\", 'a',)),\n}, ClientMessage::Event\n{\n    seq: 5, event:\n    ExamEvent::Incident(ClientIncident\n    {\n        code: IncidentCode::RecordingFailed, occurred_at:\n        at(\"2026-12-20T01:00:31Z\"), detail:\n        Some(\"capture stream stopped\".to_owned()),\n    }),\n}, ClientMessage::Event\n{ seq: 6, event: ExamEvent::RecordingFinalized(manifest()), },\ncommand_result(CommandStatus::Completed, None),\ncommand_result(CommandStatus::Failed, Some(\"RECORDING_START_FAILED\")),]"
 ---
 [
   {
@@ -10,8 +10,7 @@ expression: "vec![ClientMessage::Heartbeat, ClientMessage::Status { state: state
     "type": "status",
     "state": {
       "execution": "recording",
-      "recording": "capturing",
-      "network": "clear"
+      "recording": "capturing"
     }
   },
   {
@@ -33,9 +32,9 @@ expression: "vec![ClientMessage::Heartbeat, ClientMessage::Status { state: state
     "event": {
       "kind": "incident",
       "data": {
-        "code": "proxy_detected",
+        "code": "recording_failed",
         "occurred_at": "2026-12-20T01:00:31Z",
-        "detail": "system proxy enabled"
+        "detail": "capture stream stopped"
       }
     }
   },

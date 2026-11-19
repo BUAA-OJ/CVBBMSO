@@ -8,10 +8,6 @@ use time::OffsetDateTime;
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum IncidentCode {
-    /// A system proxy, PAC, or proxy environment variable was detected.
-    ProxyDetected,
-    /// The proxy inspection could not complete.
-    ProxyCheckFailed,
     /// Recording failed.
     RecordingFailed,
     /// Recording recovered after a failure.

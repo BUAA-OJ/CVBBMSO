@@ -8,7 +8,9 @@ Guidance for coding agents working on `cvbbmso`.
 client for students and an Axum server operated by staff. Students use a
 controlled WebView to log in to Accoding; the server re-verifies the
 `connect.sid` cookie against Accoding. Exam timing is server-authoritative and
-commands are delivered over one WebSocket per student.
+commands are delivered over one WebSocket per student. During the app lifetime,
+a system-level egress guard restricts outbound network traffic to Accoding, the
+monitoring server, and essential local services.
 
 The repository is being scaffolded crate by crate. The design contracts live
 under `docs/design/`; follow their layout and contracts exactly.
@@ -31,10 +33,10 @@ English.
 crates/
 ├── cvbbmso-protocol/   # HTTP / WebSocket DTOs, enums, error codes
 ├── cvbbmso-accoding/   # Cookie normalization, Accoding identity verification
-├── cvbbmso-network/    # System proxy and server reachability checks
+├── cvbbmso-network/    # Client startup preflight and system egress guard
 ├── cvbbmso-recorder/   # Screen capture, segmentation, recovery, merge, hashing
 ├── cvbbmso-exam/       # Client exam runtime, WebSocket, local event queue
-├── cvbbmso-client/     # Tauri desktop app and controlled browser
+├── cvbbmso-client/     # Tauri desktop app, startup preflight, controlled browser
 ├── cvbbmso-domain/     # Exam rules, scheduling, persistence, incidents
 ├── cvbbmso-server/     # Axum HTTP / WebSocket service
 └── cvbbmso-cli/        # Local admin CLI for the server
@@ -43,8 +45,8 @@ crates/
 Dependency direction is one-way and must not form cycles:
 
 ```text
-client  -> exam -> recorder / network / accoding / protocol
-client  -> accoding / protocol
+client  -> exam -> recorder / accoding / protocol
+client  -> network / accoding / protocol
 server  -> domain / accoding / protocol
 cli     -> domain / protocol
 domain  -> protocol
@@ -157,12 +159,14 @@ Write idiomatic Rust and keep the design boring.
 - `cvbbmso-protocol`: DTOs, enums, validation newtypes, error-code constants.
   No I/O, no async, no database types.
 - `cvbbmso-accoding`: cookie handling and identity verification only.
-- `cvbbmso-network`: read-only inspection; never modify system proxy settings.
+- `cvbbmso-network`: client startup preflight and system egress guard.
+  Proxy inspection stays read-only; never modify system proxy settings.
 - `cvbbmso-recorder`: recording lifecycle, local files, manifests. Platform
   capture and encoding stay private.
 - `cvbbmso-exam`: runtime orchestration, WebSocket, retry/reconnect, event
-  queue, state publication. No Tauri types.
-- `cvbbmso-client`: Tauri commands and UI wiring only. No exam business rules.
+  queue, state publication. No network preflight and no Tauri types.
+- `cvbbmso-client`: startup preflight, Tauri commands and UI wiring only. No
+  exam business rules.
 - `cvbbmso-domain`: rules, transactions, scheduling, persistence, audit.
   No HTTP or WebSocket types beyond protocol DTOs.
 - `cvbbmso-server`: transport, authentication handoff, error mapping, dispatch.
