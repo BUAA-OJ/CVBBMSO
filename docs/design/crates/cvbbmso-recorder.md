@@ -151,7 +151,9 @@ cargo test -p cvbbmso-recorder --locked writes_sampled_frames_from_the_primary_d
 - 色度取 2×2 RGB 总和后统一加权、舍入，避免提前把每通道平均值截断成整数；16-bit 定点近似相对独立浮点参考允许至多一个码值差异。色度样本在 2×2 块中心，U/V 同相，按 progressive 内容解释。
 - 内部布局为 `width * height` 字节 Y 后跟 `width * height / 2` 字节 UV，两平面内部 stride 均为 width。`copy_to` 将每行有效像素拷贝到目标正 stride 缓冲区，UV 从 `stride * height` 开始；它先验证目标大小与溢出，不改动行填充。平台层应传入实际锁定缓冲区的 pitch，不把 compact 布局等同于任意 MF/D3D surface。
 
-Windows 的 `set_color_attributes` 设置 `MF_MT_YUV_MATRIX = BT709`、`MF_MT_VIDEO_NOMINAL_RANGE = 16_235`，以及匹配居中 2×2 采样的 `MF_MT_VIDEO_CHROMA_SITING = MPEG1 | ProgressiveChroma`。`Encoder::open` 会同时把它应用到 NV12 输入和 H.264 输出媒体类型。Microsoft H.264 MFT 不接受 `ICodecAPI` 的输出颜色属性，也不写入对应 VUI，因此矩阵、范围和原色由容器层补充：MKV 写 `Colour`，MP4 写 `colr`/`nclx`。MP4 没有标准的色度位置字段，居中色度只在 MKV 的 `Colour` 中表达；彩条、灰阶和彩色文字的编码/解码观感仍须在接入采集流水线后人工验收。
+Windows 的 `set_color_attributes` 设置 `MF_MT_YUV_MATRIX = BT709`、`MF_MT_VIDEO_NOMINAL_RANGE = 16_235`，以及匹配居中 2×2 采样的 `MF_MT_VIDEO_CHROMA_SITING = MPEG1 | ProgressiveChroma`。`Encoder::open` 会同时把它应用到 NV12 输入和 H.264 输出媒体类型。本机 Microsoft H.264 MFT 未写入对应 VUI，因此矩阵、范围和原色由容器层补充：MKV 写 `Colour`，MP4 写 `colr`/`nclx`。
+
+`nclx` 不承载色度位置；MP4 内 H.264 码流通过 SPS 的 VUI 表达它。编码边界同时为 AVC 配置和样本内 SPS 补齐 `chroma_loc_info_present_flag = 1`、上下场的 `chroma_sample_loc_type = 1`（居中）。修补保留其余 SPS 参数、既有 VUI 的颜色、时序、HRD 与缓冲约束，重新生成 RBSP 对齐和 emulation-prevention 字节；无法安全解析的参数集返回带 source 的错误，不静默回退到左对齐。MKV 的 `Colour` 继续声明居中色度，独立解码器应对最终 MP4 报告 `chroma_location = center`。彩条、灰阶和彩色文字在真实采集流水线中的观感仍须验收。
 
 ### M4 输出协商与封装边界
 
@@ -175,3 +177,5 @@ Windows 的 `set_color_attributes` 设置 `MF_MT_YUV_MATRIX = BT709`、`MF_MT_VI
 - MP4 由私有写入器直接生成：`ftyp`、`moov`（`mvhd`、单 `trak`、`avc1` + `avcC` + `colr`、`stts`、`stsc`、`stsz`、`stss`，偏移表按大小选择 `stco` 或 `co64`）与 `mdat`。`colr` 使用 BT.709 limited-range 的 `nclx`；样本沿用四字节长度前缀，正好匹配 `avcC` 的 `lengthSizeMinusOne = 3`。MKV 分片的视频轨同样写 `Colour`，其中包含矩阵、范围、原色和居中色度位置。
 - 先写入同目录的 `final.mp4.tmp`，同步后再重命名为 `final.mp4`；失败不会把半成品发布为最终文件。`open` 清理残留的 `final.mp4.tmp`，再次 `finish` 覆盖重建。分片清单为空时仍由 `finish` 返回 `NoSegments`。
 - `finish` 在 `spawn_blocking` 中完成解析、哈希、写盘与最终文件哈希，避免在 Tokio worker 上执行长磁盘操作；成功后将 manifest 缓存，后续调用返回同一摘要。合并产生的临时文件不进入 manifest。
+- 合并任务由 `Recorder` 的 `Finalizing` 状态持有。取消 `finish` 的等待只取消当前等待，不丢弃任务或结果；后续 `finish` 等待同一个任务，成功后返回缓存摘要，失败被观察并进入 `Failed` 后才允许新一轮尝试。`stop` 不丢弃进行中的合并，因此不会因等待超时或重试产生两个 `final.mp4.tmp` 写入者。调用方须在完成收尾前保留同一个 `Recorder`；直接销毁 recorder 不能强制终止已经运行的 blocking I/O。
+- 恢复旧分片时，合并输出同时为 `avcC` 与样本内 SPS 补齐居中色度 VUI。样本大小表和实际 `mdat` 使用同一修补规则；原 MKV/JSON 字节及封存哈希不变。缺少色度 VUI 的旧分片可合并；畸形或不支持的 SPS、错误的 NAL 长度前缀返回 `Merge`，不能发布色度位置不明确的最终文件。
