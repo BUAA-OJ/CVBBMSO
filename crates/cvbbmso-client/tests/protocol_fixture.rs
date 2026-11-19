@@ -31,8 +31,8 @@ use axum::{
 use cvbbmso_accoding::AccodingCookies;
 use cvbbmso_protocol::{
     AccodingUser, ClientHello, ClientMessage, ClientState, ExamListResponse, ExamPhase,
-    ExamSummary, ExecutionState, Platform, RecordingPolicy, RecordingState,
-    ServerMessage, error_code,
+    ExamSummary, ExecutionState, Platform, RecordingPolicy, RecordingState, ServerMessage,
+    error_code,
 };
 use futures_util::{SinkExt, StreamExt, stream};
 use reqwest::Client;
