@@ -10,19 +10,18 @@ controlled WebView to log in to Accoding; the server re-verifies the
 `connect.sid` cookie against Accoding. Exam timing is server-authoritative and
 commands are delivered over one WebSocket per student.
 
-The repository currently contains design documents only. There is no Cargo
-workspace yet. When scaffolding, follow the layout and contracts in `docs/`
-exactly.
+The repository is being scaffolded crate by crate. The design contracts live
+under `docs/design/`; follow their layout and contracts exactly.
 
 ### Source of truth
 
 Read these before changing behavior:
 
-1. `docs/overview.md` — system boundary, terminology, crate graph.
-2. `docs/crates/cvbbmso-protocol.md` — wire format and error codes.
+1. `docs/design/overview.md` — system boundary, terminology, crate graph.
+2. `docs/design/crates/cvbbmso-protocol.md` — wire format and error codes.
 3. The crate document for the crate you are touching.
 
-The documents under `docs/` are written in Chinese and define the public
+The documents under `docs/design/` are written in Chinese and define the public
 contracts. Code, comments, doc comments, and commit messages are written in
 English.
 
@@ -136,6 +135,9 @@ Write idiomatic Rust and keep the design boring.
   `pub`. Re-export only what other crates need.
 - **Modules follow responsibility, not file count.** A module should have one
   reason to change. Split by responsibility, not by line count.
+- **Use the sibling module layout.** A module with child modules lives in
+  `module.rs` next to a `module/` directory (for example `src/wire.rs` plus
+  `src/wire/`); never use the old `module/mod.rs` layout.
 - **Comments explain why.** Do not narrate what the code already says. Public
   items get doc comments that state the contract and failure modes.
 - **No dead code, no commented-out code, no debug prints.** Use `tracing`.
@@ -207,7 +209,7 @@ Write idiomatic Rust and keep the design boring.
 
 ## 7. Toolchain, Formatting, and Lints
 
-- Edition 2024, MSRV 1.85, stable toolchain pinned in `rust-toolchain.toml`.
+- Edition 2024, MSRV 1.88, stable toolchain pinned in `rust-toolchain.toml`.
 - Format with default `rustfmt` settings: `cargo fmt --all`.
 - Enable `clippy::all` and `clippy::pedantic` at workspace level. Treat
   warnings as errors in CI, not during local iteration.

@@ -61,13 +61,18 @@ pub struct RecordingPolicy {
 pub struct Sha256Digest(String);
 impl Sha256Digest {
     /// 校验并构造 64 位小写十六进制摘要。
-    pub fn parse(value: &str) -> Result<Self, DigestError>;
+    pub fn parse(value: &str) -> Result<Self, ProtocolError>;
     /// 返回适用于 JSON 的摘要原文。
     pub fn as_str(&self) -> &str;
 }
 
-pub enum DigestError {
-    InvalidFormat,
+pub enum ProtocolError {
+    InvalidDigest,
+    InvalidUserId,
+    InvalidRecordingPolicy,
+    InvalidTimeRange,
+    InvalidSegmentIndex,
+    InvalidSegmentOrder,
 }
 
 pub struct SegmentMeta {
@@ -108,7 +113,7 @@ pub enum ExamEvent {
 
 `AccodingUser.id` 为正整数。`ExamPhase` 由服务端时钟和固定考试时间推导。`RecordingPolicy` 两个参数均大于零。`SegmentMeta.index` 从 1 开始，按录制顺序连续递增；`start_at <= end_at`；`sha256` 对应封存视频片段的完整文件字节。`RecordingManifest.segments` 按 `index` 升序排列，`merged_sha256` 对合并后的整个视频文件计算。
 
-`Sha256Digest` 在构造和反序列化时校验格式，摘要统一为 64 位小写十六进制。`ClientIncident.detail` 为可选的简短字符串，异常分类以稳定的 `code` 为准。
+`AccodingUser`、`ExamSummary`、`RecordingPolicy`、`SegmentMeta`、`RecordingManifest` 均提供校验构造器（`new`），违反上述约束时返回 `ProtocolError`；反序列化执行同一套校验，非法消息直接失败而不静默回退。时间字段在构造和反序列化时归一化为 UTC，并按 RFC 3339 序列化。`Sha256Digest` 在构造和反序列化时校验格式，摘要统一为 64 位小写十六进制。`ClientIncident.detail` 为可选的简短字符串，异常分类以稳定的 `code` 为准。
 
 ## HTTP 接口
 

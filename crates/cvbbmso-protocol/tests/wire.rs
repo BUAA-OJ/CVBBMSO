@@ -1,0 +1,217 @@
+//! Wire-format tests: the documented JSON shape must round-trip and stay
+//! visible in snapshots.
+
+use cvbbmso_protocol::{
+    AccodingUser, ClientHello, ClientIncident, ClientMessage, ClientState, CommandName,
+    CommandStatus, ExamEvent, ExamListResponse, ExamPhase, ExamSummary, ExecutionState,
+    IncidentCode, NetworkState, Platform, RecordingManifest, RecordingPolicy, RecordingState,
+    SegmentMeta, ServerMessage, Sha256Digest,
+};
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+fn at(value: &str) -> OffsetDateTime {
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .expect("valid timestamp")
+}
+
+fn digest(fill: char) -> Sha256Digest {
+    Sha256Digest::parse(&fill.to_string().repeat(64)).expect("valid digest")
+}
+
+fn segment(index: u32, start: &str, end: &str, fill: char) -> SegmentMeta {
+    SegmentMeta::new(index, at(start), at(end), digest(fill)).expect("valid segment")
+}
+
+fn state() -> ClientState {
+    ClientState {
+        execution: ExecutionState::Recording,
+        recording: RecordingState::Capturing,
+        network: NetworkState::Clear,
+    }
+}
+
+fn manifest() -> RecordingManifest {
+    RecordingManifest::new(
+        vec![
+            segment(1, "2026-12-20T01:00:00Z", "2026-12-20T01:00:30Z", 'a'),
+            segment(2, "2026-12-20T01:00:30Z", "2026-12-20T01:01:00Z", 'b'),
+        ],
+        digest('c'),
+    )
+    .expect("valid manifest")
+}
+
+fn command_result(status: CommandStatus, error_code: Option<&str>) -> ClientMessage {
+    ClientMessage::CommandResult {
+        command_id: Uuid::from_u128(0x40),
+        status,
+        error_code: error_code.map(str::to_owned),
+    }
+}
+
+#[test]
+fn hello_message_matches_the_wire_format() {
+    let message = ClientMessage::Hello(ClientHello {
+        device_id: Uuid::from_u128(0x20),
+        instance_id: Uuid::from_u128(0x30),
+        platform: Platform::Windows,
+        state: ClientState {
+            execution: ExecutionState::Ready,
+            recording: RecordingState::Idle,
+            network: NetworkState::Clear,
+        },
+    });
+
+    insta::assert_json_snapshot!("hello", message);
+}
+
+#[test]
+fn server_messages_match_the_wire_format() {
+    insta::assert_json_snapshot!(
+        "server_messages",
+        vec![
+            ServerMessage::Sync {
+                server_time: at("2026-12-20T00:59:55Z"),
+                phase: ExamPhase::Scheduled,
+                start_at: at("2026-12-20T01:00:00Z"),
+                end_at: at("2026-12-20T04:00:00Z"),
+                recording_policy: RecordingPolicy::new(30, 15).expect("valid policy"),
+                ack_event_through: 3,
+            },
+            ServerMessage::Command {
+                command_id: Uuid::from_u128(0x40),
+                name: CommandName::StartExam,
+                effective_at: at("2026-12-20T01:00:00Z"),
+            },
+            ServerMessage::Ack {
+                ack_event_through: 6,
+            },
+            ServerMessage::Error {
+                code: "PROTOCOL_ERROR".to_owned(),
+                message: "hello must be the first message".to_owned(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn client_messages_match_the_wire_format() {
+    insta::assert_json_snapshot!(
+        "client_messages",
+        vec![
+            ClientMessage::Heartbeat,
+            ClientMessage::Status { state: state() },
+            ClientMessage::Event {
+                seq: 4,
+                event: ExamEvent::SegmentFinalized(segment(
+                    1,
+                    "2026-12-20T01:00:00Z",
+                    "2026-12-20T01:00:30Z",
+                    'a',
+                )),
+            },
+            ClientMessage::Event {
+                seq: 5,
+                event: ExamEvent::Incident(ClientIncident {
+                    code: IncidentCode::ProxyDetected,
+                    occurred_at: at("2026-12-20T01:00:31Z"),
+                    detail: Some("system proxy enabled".to_owned()),
+                }),
+            },
+            ClientMessage::Event {
+                seq: 6,
+                event: ExamEvent::RecordingFinalized(manifest()),
+            },
+            command_result(CommandStatus::Completed, None),
+            command_result(CommandStatus::Failed, Some("RECORDING_START_FAILED")),
+        ]
+    );
+}
+
+#[test]
+fn exam_list_matches_the_wire_format() {
+    let response = ExamListResponse {
+        user: AccodingUser::new(12345, "user@example.com".to_owned(), "示例用户".to_owned())
+            .expect("valid user"),
+        items: vec![
+            ExamSummary::new(
+                Uuid::from_u128(0x10),
+                "程序设计期末考试".to_owned(),
+                at("2026-12-20T01:00:00Z"),
+                at("2026-12-20T04:00:00Z"),
+                ExamPhase::Scheduled,
+            )
+            .expect("valid summary"),
+        ],
+    };
+
+    insta::assert_json_snapshot!("exam_list", response);
+}
+
+#[test]
+fn documented_client_messages_deserialize() {
+    let hello: ClientMessage = serde_json::from_str(
+        r#"{"type":"hello","device_id":"00000000-0000-0000-0000-000000000020","instance_id":"00000000-0000-0000-0000-000000000030","platform":"windows","state":{"execution":"ready","recording":"idle","network":"clear"}}"#,
+    )
+    .expect("hello parses");
+    assert!(matches!(hello, ClientMessage::Hello(_)));
+
+    let event: ClientMessage = serde_json::from_str(
+        r#"{"type":"event","seq":4,"event":{"kind":"segment_finalized","data":{"index":1,"start_at":"2026-12-20T01:00:00Z","end_at":"2026-12-20T01:00:30Z","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#,
+    )
+    .expect("event parses");
+    assert!(matches!(
+        event,
+        ClientMessage::Event {
+            seq: 4,
+            event: ExamEvent::SegmentFinalized(_)
+        }
+    ));
+
+    let result: ClientMessage = serde_json::from_str(
+        r#"{"type":"command_result","command_id":"00000000-0000-0000-0000-000000000040","status":"completed"}"#,
+    )
+    .expect("command result parses");
+    assert!(matches!(
+        result,
+        ClientMessage::CommandResult {
+            status: CommandStatus::Completed,
+            error_code: None,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn documented_server_messages_deserialize() {
+    let sync: ServerMessage = serde_json::from_str(
+        r#"{"type":"sync","server_time":"2026-12-20T00:59:55Z","phase":"scheduled","start_at":"2026-12-20T01:00:00Z","end_at":"2026-12-20T04:00:00Z","recording_policy":{"segment_duration_secs":30,"fps":15},"ack_event_through":3}"#,
+    )
+    .expect("sync parses");
+    assert!(matches!(
+        sync,
+        ServerMessage::Sync {
+            phase: ExamPhase::Scheduled,
+            ..
+        }
+    ));
+
+    let command: ServerMessage = serde_json::from_str(
+        r#"{"type":"command","command_id":"00000000-0000-0000-0000-000000000040","name":"start_exam","effective_at":"2026-12-20T01:00:00Z"}"#,
+    )
+    .expect("command parses");
+    assert!(matches!(
+        command,
+        ServerMessage::Command {
+            name: CommandName::StartExam,
+            ..
+        }
+    ));
+
+    let error: ServerMessage = serde_json::from_str(
+        r#"{"type":"error","code":"PROTOCOL_ERROR","message":"hello must be the first message"}"#,
+    )
+    .expect("error parses");
+    assert!(matches!(error, ServerMessage::Error { .. }));
+}
