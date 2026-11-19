@@ -28,14 +28,34 @@ pub enum DomainError {
     NotEnrolled,
     InvalidInput,
     Conflict,
-    Storage,
+    Storage { source: Box<dyn std::error::Error + Send + Sync> },
 }
 
 impl ExamService {
+    /// 打开 SQLite 并运行迁移，使用系统 UTC 时钟。
+    pub async fn open(database_url: &str) -> Result<Self, DomainError>;
+
+    /// 打开 SQLite 并运行迁移，使用传入的时钟。
+    pub async fn open_with_clock(
+        database_url: &str,
+        clock: impl Fn() -> time::OffsetDateTime + Send + Sync + 'static,
+    ) -> Result<Self, DomainError>;
+
+    /// 获取共享数据库与时钟的管理服务。
+    pub fn admin(&self) -> AdminService;
+
+    /// 服务端开始监听前，将上次进程遗留的在线记录转为离线。
+    pub async fn recover_online(&self) -> Result<(), DomainError>;
+
     /// 列出指定 Accoding 用户报名的考试。
     pub async fn list_for(
         &self, oj_user_id: i64,
     ) -> Result<Vec<cvbbmso_protocol::ExamSummary>, DomainError>;
+
+    /// 在同一只读快照中先检查考试存在，再检查报名。
+    pub async fn check_enrollment(
+        &self, exam_id: uuid::Uuid, oj_user_id: i64,
+    ) -> Result<(), DomainError>;
 
     /// 建立或恢复考试考生记录；返回服务端快照与待下发命令。
     pub async fn connect(
@@ -66,6 +86,9 @@ impl ExamService {
 }
 
 impl AdminService {
+    /// 为 CLI 打开 SQLite 并运行迁移。
+    pub async fn open(database_url: &str) -> Result<Self, DomainError>;
+
     /// 执行一个 CLI 管理操作并返回结构化结果；actor 写入审计。
     pub async fn execute(
         &self,
@@ -74,6 +97,8 @@ impl AdminService {
     ) -> Result<AdminOutput, DomainError>;
 }
 ```
+
+`ExamService::check_enrollment` 接收正数用户 ID。参数无效返回 `InvalidInput`，考试缺失返回 `NotFound`，考试存在但未报名返回 `NotEnrolled`，数据库读取失败返回 `Storage`。WS 升级后由 `connect` 在写事务内重新验证。
 
 `ExamService::connect` 验证报名资格，并在相同 `(exam_id, oj_user_id)` 上恢复既有状态。`hello.state` 是客户端连接时刻的真实状态；服务端据此校正持久状态并决定是否生成命令。
 
@@ -90,7 +115,7 @@ impl AdminService {
 
 ## 管理操作与输出
 
-`AdminOperation` 与 CLI 命令一一对应；CLI 负责参数解析、CSV 读取和展示，域层负责校验、持久化和审计。
+`AdminOperation` 与 CLI 命令一一对应；CLI 负责参数解析、CSV 读取和展示，域层负责校验、持久化和审计。CLI 打开数据库时保留在线状态。服务端启动调用 `recover_online` 时，以发现时的 UTC 时间记录未完成考试的失联，并将已完成的在线记录静默转为离线。
 
 ```rust
 pub enum AdminOperation {
@@ -252,4 +277,4 @@ pub struct IncidentRecord {
 | `Conflict` | 重复报名、命令结果与当前命令状态不匹配 | 命令结果用 `COMMAND_STATE_CONFLICT`，其他用 `INVALID_REQUEST` |
 | `Storage` | 数据库或持久化失败 | `INTERNAL_ERROR` |
 
-客户端 `command_result` 到达时，`receive` 校验 `command_id` 属于当前考生且命令仍可确认；重复的相同结果幂等忽略，未知或状态不匹配返回 `Conflict`，由 server 映射为 `COMMAND_STATE_CONFLICT`。
+客户端 `command_result` 到达时，`receive` 校验 `command_id` 属于当前考生且命令仍可确认；重复的相同结果幂等返回同 ID 的 `CommandAck`，未知或状态不匹配返回 `Conflict`，由 server 映射为 `COMMAND_STATE_CONFLICT`。

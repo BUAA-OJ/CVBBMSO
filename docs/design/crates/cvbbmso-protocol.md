@@ -162,7 +162,7 @@ pub enum ExamEvent {
 | `ACCODING_UNAVAILABLE` | HTTP 503 | Accoding 身份服务暂时不可用 |
 | `INTERNAL_ERROR` | HTTP 500 / WS error / CommandResult | 内部错误 |
 | `PROTOCOL_ERROR` | WS error | 消息顺序、类型、字段或状态组合与协议不符 |
-| `COMMAND_STATE_CONFLICT` | CommandResult | 当前客户端状态无法执行该指令 |
+| `COMMAND_STATE_CONFLICT` | WS error / CommandResult | 客户端状态无法执行指令，或服务端收到与命令状态冲突的结果 |
 | `RECORDING_START_FAILED` | CommandResult | 启动或恢复录屏失败 |
 | `RECORDING_FINISH_FAILED` | CommandResult | 停止、合并或计算摘要失败，包括无分片 |
 

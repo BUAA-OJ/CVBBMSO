@@ -1,0 +1,32 @@
+[package]
+name = "cvbbmso-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum = { workspace = true, features = ["http1", "json", "matched-path", "tokio", "ws"] }
+base64.workspace = true
+clap = { workspace = true, features = ["derive", "env", "error-context", "help", "std", "usage"] }
+cvbbmso-accoding.workspace = true
+cvbbmso-domain.workspace = true
+cvbbmso-protocol.workspace = true
+futures-util = { workspace = true, features = ["sink"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["json"] }
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tokio-tungstenite = { workspace = true, features = ["handshake"] }
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true
