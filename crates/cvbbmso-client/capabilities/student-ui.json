@@ -5,10 +5,12 @@
     "student"
   ],
   "permissions": [
+    "allow-vm-preflight",
     "allow-open-accoding",
     "allow-inspect-session",
     "allow-list-exams",
     "core:event:allow-listen",
-    "core:event:allow-unlisten"
+    "core:event:allow-unlisten",
+    "core:window:allow-close"
   ]
 }

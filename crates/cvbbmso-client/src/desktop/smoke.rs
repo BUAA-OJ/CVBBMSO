@@ -1,10 +1,11 @@
 //! Native smoke driver compiled into the test executable only.
 
 use std::{
+    collections::VecDeque,
     io,
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -31,13 +32,26 @@ use uuid::Uuid;
 
 use super::*;
 use crate::monitor::MAX_EXAM_LIST_BYTES;
+use crate::preflight::Diagnostic;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
 const DEADLINE: Duration = Duration::from_secs(20);
 const EXAM_TITLE: &str = "<b>Fixture exam</b>";
 
-pub(super) fn run() -> tauri::Result<()> {
+pub(super) struct FakeProbe(Mutex<VecDeque<Verdict>>);
+
+impl FakeProbe {
+    pub(super) fn next(&self) -> Verdict {
+        self.0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("Test probe exhausted")
+    }
+}
+
+pub(super) fn run(detected: bool) -> tauri::Result<()> {
     let data = tempfile::tempdir()?;
     let data_dir = data.path().to_owned();
     let (completed, result) = std::sync::mpsc::channel();
@@ -53,10 +67,20 @@ pub(super) fn run() -> tauri::Result<()> {
                 );
             }
             println!("Missing monitor configuration is allowed; invalid origins fail startup.");
-            let (fixture, foreign, hits) = async_runtime::block_on(start_fixture())?;
-            let (monitor_addr, cert, _) = async_runtime::block_on(tls::serve(
-                Router::new().route("/api/exams", get(exam_list)),
-            ));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let (fixture, foreign, hits) =
+                async_runtime::block_on(start_fixture(requests.clone()))?;
+            let monitor_requests = requests.clone();
+            let (monitor_addr, cert, _) = async_runtime::block_on(tls::serve(Router::new().route(
+                "/api/exams",
+                get(move |headers: HeaderMap| {
+                    let requests = monitor_requests.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        exam_list(&headers)
+                    }
+                }),
+            )));
             let monitor_origin = Url::parse(&format!("https://{monitor_addr}"))?.origin();
             let monitor = Monitor::with_root_certificate(
                 monitor_origin,
@@ -71,12 +95,30 @@ pub(super) fn run() -> tauri::Result<()> {
                 monitor,
                 blocked: Some(blocked),
             });
+            let outcomes = if detected {
+                VecDeque::from([Verdict::Detected(Diagnostic::GuestIdentity)])
+            } else {
+                VecDeque::from([
+                    Verdict::Unknown(Diagnostic::TimedOut),
+                    Verdict::NotDetected(Diagnostic::HardwareIdentity),
+                ])
+            };
+            app.manage(FakeProbe(Mutex::new(outcomes)));
             let ui = build_ui(app.handle())?;
             let app = app.handle().clone();
             async_runtime::spawn(async move {
-                let exercised =
-                    exercise(&app, &ui, &deployed, &base, foreign, &hits, &mut decisions).await;
-                if let Err(error) = exercised.and_then(|()| ui.close().map_err(Into::into)) {
+                let exercised: Result<(), Error> = async {
+                    check_blocked_preflight(&app, &ui, &requests, detected).await?;
+                    if detected {
+                        return ui
+                            .eval("document.querySelector('#vm-quit').click()")
+                            .map_err(Into::into);
+                    }
+                    exercise(&app, &ui, &deployed, &base, foreign, &hits, &mut decisions).await?;
+                    ui.close().map_err(Into::into)
+                }
+                .await;
+                if let Err(error) = exercised {
                     eprintln!("Desktop smoke failed: {error}");
                 } else {
                     sleep(DEADLINE).await;
@@ -89,13 +131,17 @@ pub(super) fn run() -> tauri::Result<()> {
         .build(tauri::generate_context!())?;
     app.run_return(move |app, event| {
         if matches!(event, tauri::RunEvent::ExitRequested { code: Some(0), .. })
-            && app.get_webview_window(OJ).is_some()
+            && app.get_webview_window(OJ).is_some() != detected
         {
             let _ = completed.send(());
         }
     });
     if result.try_recv().is_ok() {
-        println!("Closing the control window exited with Accoding open.");
+        if detected {
+            println!("The VM blocking screen exited without opening Accoding.");
+        } else {
+            println!("Closing the control window exited with Accoding open.");
+        }
         println!("Desktop smoke passed.");
         Ok(())
     } else {
@@ -103,7 +149,9 @@ pub(super) fn run() -> tauri::Result<()> {
     }
 }
 
-async fn start_fixture() -> io::Result<(SocketAddr, SocketAddr, Arc<AtomicUsize>)> {
+async fn start_fixture(
+    requests: Arc<AtomicUsize>,
+) -> io::Result<(SocketAddr, SocketAddr, Arc<AtomicUsize>)> {
     let fixture = TcpListener::bind(("127.0.0.1", 0)).await?;
     let foreign = TcpListener::bind(("127.0.0.1", 0)).await?;
     let fixture_addr = fixture.local_addr()?;
@@ -124,21 +172,24 @@ async fn start_fixture() -> io::Result<(SocketAddr, SocketAddr, Arc<AtomicUsize>
         let router = Router::new()
             .route(
                 "/user/login",
-                get(|| async {
-                    (
-                        AppendHeaders([
-                            (
-                                header::SET_COOKIE,
-                                "connect.sid=synthetic-v1; Path=/; HttpOnly",
-                            ),
-                            (header::SET_COOKIE, "_aux=synthetic; Path=/api; HttpOnly"),
-                            (
-                                header::SET_COOKIE,
-                                "_ignored=synthetic; Path=/user; HttpOnly",
-                            ),
-                        ]),
-                        Html("<title>Fixture login</title>"),
-                    )
+                get(move || {
+                    requests.fetch_add(1, Ordering::Relaxed);
+                    async {
+                        (
+                            AppendHeaders([
+                                (
+                                    header::SET_COOKIE,
+                                    "connect.sid=synthetic-v1; Path=/; HttpOnly",
+                                ),
+                                (header::SET_COOKIE, "_aux=synthetic; Path=/api; HttpOnly"),
+                                (
+                                    header::SET_COOKIE,
+                                    "_ignored=synthetic; Path=/user; HttpOnly",
+                                ),
+                            ]),
+                            Html("<title>Fixture login</title>"),
+                        )
+                    }
                 }),
             )
             .route(
@@ -195,7 +246,7 @@ async fn start_fixture() -> io::Result<(SocketAddr, SocketAddr, Arc<AtomicUsize>
     Ok((fixture_addr, foreign_addr, hits))
 }
 
-async fn exam_list(headers: HeaderMap) -> Response {
+fn exam_list(headers: &HeaderMap) -> Response {
     let cookie = headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -264,6 +315,77 @@ async fn wait_for(window: &WebviewWindow, script: &str, what: &str) -> Result<()
     })
     .await
     .map_err(|_| io::Error::other(format!("Timed out waiting for {what}")))?;
+    Ok(())
+}
+
+async fn check_blocked_preflight(
+    app: &AppHandle,
+    ui: &WebviewWindow,
+    requests: &AtomicUsize,
+    detected: bool,
+) -> Result<(), Error> {
+    let (message, description) = if detected {
+        (
+            "检测到虚拟机。请在实体设备上运行客户端。",
+            "VM blocking screen",
+        )
+    } else {
+        ("无法完成设备检查，请重试。", "retryable preflight screen")
+    };
+    let text = serde_json::to_string(message)?;
+    wait_for(ui, &format!(
+        "document.querySelector('#vm-status').textContent === {text} && document.querySelector('#student-controls').hidden && document.querySelector('#vm-retry').hidden === {detected} && !document.querySelector('#vm-quit').hidden"
+    ), description).await?;
+    ui.eval(r"
+        window.blockedCommands = 'pending';
+        (async () => {
+          const { invoke } = window.__TAURI__.core;
+          const results = await Promise.allSettled([
+            invoke('open_accoding'),
+            invoke('inspect_session'),
+            invoke('list_exams'),
+          ]);
+          const denied = ['设备检查通过后才能继续。', '设备检查通过后才能继续。', 'preflight_blocked'];
+          window.blockedCommands = results.every(
+            (result, index) => result.status === 'rejected' && result.reason === denied[index]
+          ) ? 'rejected' : 'unexpected';
+        })();
+    ")?;
+    wait_for(
+        ui,
+        "window.blockedCommands === 'rejected'",
+        "Rust admission rejection",
+    )
+    .await?;
+    if app.get_webview_window(OJ).is_some() || requests.load(Ordering::Relaxed) != 0 {
+        return Err(
+            io::Error::other("Blocked client created a remote WebView or made a request").into(),
+        );
+    }
+    println!("{description} rejected direct IPC without any remote WebView or request.");
+    if detected {
+        ui.eval(
+            r"
+            window.vmRetryResult = 'pending';
+            window.__TAURI__.core.invoke('vm_preflight', { retry: true })
+              .then((result) => { window.vmRetryResult = result.status; });
+        ",
+        )?;
+        wait_for(
+            ui,
+            "window.vmRetryResult === 'detected'",
+            "terminal VM verdict",
+        )
+        .await?;
+    } else {
+        ui.eval("document.querySelector('#vm-retry').click()")?;
+        wait_for(
+            ui,
+            "document.querySelector('#vm-preflight').hidden && !document.querySelector('#student-controls').hidden",
+            "student controls after a successful retry",
+        ).await?;
+        println!("Preflight retry admitted the client and revealed student controls.");
+    }
     Ok(())
 }
 
@@ -480,6 +602,7 @@ async fn check_ipc(ui: &WebviewWindow, oj: &WebviewWindow) -> Result<(), Error> 
                 return;
             }
             const results = await Promise.allSettled([
+                invoke("vm_preflight", { retry: true }),
                 invoke("inspect_session"),
                 invoke("list_exams"),
                 invoke("plugin:event|listen", {
