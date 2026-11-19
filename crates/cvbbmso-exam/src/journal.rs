@@ -3,8 +3,9 @@
 //! The journal owns the reliable event queue: every event is written here
 //! before it is sent, and stays until the server confirms it through
 //! `sync.ack_event_through` or the exam closes with its final `CommandAck`.
-//! It also records which recorder segments were already queued and the
-//! execution stage reached, so a restarted process resumes where it stopped.
+//! It also records which recorder segments and manifest were already queued
+//! and the client state reached, so a restarted process resumes where it
+//! stopped.
 //!
 //! Sequence numbers are anchored by the first `sync` this journal sees, not
 //! assigned from 1 locally. A journal that was lost or reset therefore cannot
@@ -18,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use cvbbmso_protocol::{ClientMessage, ExamEvent, ExecutionState};
+use cvbbmso_protocol::{ClientMessage, ClientState, ExamEvent, ExecutionState, RecordingState};
 use serde::{Deserialize, Serialize};
 
 use crate::ExamError;
@@ -46,8 +47,10 @@ struct Data {
     queue: VecDeque<Entry>,
     /// Segment indexes already queued, so recovered segments are not repeated.
     segments: BTreeSet<u32>,
-    /// Execution stage reached before the last save.
-    execution: ExecutionState,
+    /// Whether the recording manifest was already queued.
+    finalized: bool,
+    /// Client state reached before the last save.
+    state: ClientState,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -62,7 +65,11 @@ impl Default for Data {
             next_seq: None,
             queue: VecDeque::new(),
             segments: BTreeSet::new(),
-            execution: ExecutionState::Ready,
+            finalized: false,
+            state: ClientState {
+                execution: ExecutionState::Ready,
+                recording: RecordingState::Idle,
+            },
         }
     }
 }
@@ -99,13 +106,16 @@ impl Journal {
 
     /// Queues an event and returns the message to send once saved.
     ///
-    /// Returns `None` for a segment whose index was already queued, and for any
-    /// event recorded before numbering is anchored; [`Journal::anchor`] numbers
-    /// and returns those later.
+    /// Returns `None` for a segment whose index was already queued, for a
+    /// second recording manifest, and for any event recorded before numbering
+    /// is anchored; [`Journal::anchor`] numbers and returns those later.
     pub(crate) fn append(&mut self, event: ExamEvent) -> Option<ClientMessage> {
-        if let ExamEvent::SegmentFinalized(meta) = &event
-            && !self.data.segments.insert(meta.index)
-        {
+        let repeated = match &event {
+            ExamEvent::SegmentFinalized(meta) => !self.data.segments.insert(meta.index),
+            ExamEvent::RecordingFinalized(_) => std::mem::replace(&mut self.data.finalized, true),
+            _ => false,
+        };
+        if repeated {
             return None;
         }
         let seq = self.data.next_seq;
@@ -164,14 +174,14 @@ impl Journal {
         self.data.queue.clear();
     }
 
-    /// Execution stage reached before the last save.
-    pub(crate) fn execution(&self) -> ExecutionState {
-        self.data.execution
+    /// Client state reached before the last save.
+    pub(crate) fn state(&self) -> ClientState {
+        self.data.state
     }
 
-    /// Records the execution stage reached.
-    pub(crate) fn set_execution(&mut self, execution: ExecutionState) {
-        self.data.execution = execution;
+    /// Records the client state reached.
+    pub(crate) fn set_state(&mut self, state: ClientState) {
+        self.data.state = state;
     }
 }
 

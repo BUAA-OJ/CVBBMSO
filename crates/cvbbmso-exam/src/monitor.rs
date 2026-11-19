@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use cvbbmso_accoding::AccodingCookies;
-use cvbbmso_protocol::{ExamListResponse, ExamSummary};
+use cvbbmso_protocol::ExamListResponse;
 use reqwest::{Client, Response, StatusCode, header, redirect};
 use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, handshake::client::Request};
 use url::Url;
@@ -25,15 +25,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) struct Monitor {
     base: Url,
     http: Client,
-}
-
-/// Enrollment confirmed by the monitor for one exam.
-#[derive(Debug)]
-pub(crate) struct Enrollment {
-    /// Accoding user id of the authenticated student.
-    pub(crate) oj_user_id: i64,
-    /// Summary of the requested exam.
-    pub(crate) exam: ExamSummary,
 }
 
 impl Monitor {
@@ -54,7 +45,8 @@ impl Monitor {
         Ok(Self { base, http })
     }
 
-    /// Confirms that the cookie owner is enrolled in `exam_id`.
+    /// Confirms that the cookie owner is enrolled in `exam_id` and returns the
+    /// owner's Accoding user id.
     ///
     /// # Errors
     ///
@@ -66,7 +58,7 @@ impl Monitor {
         &self,
         cookies: &AccodingCookies,
         exam_id: Uuid,
-    ) -> Result<Enrollment, ExamError> {
+    ) -> Result<i64, ExamError> {
         let url = self
             .base
             .join("/api/exams")
@@ -86,15 +78,11 @@ impl Monitor {
             _ => return Err(ExamError::Http(None)),
         }
         let list = read_exam_list(response).await?;
-        let exam = list
-            .items
-            .into_iter()
-            .find(|exam| exam.id == exam_id)
-            .ok_or(ExamError::NotEnrolled)?;
-        Ok(Enrollment {
-            oj_user_id: list.user.id,
-            exam,
-        })
+        if list.items.iter().any(|exam| exam.id == exam_id) {
+            Ok(list.user.id)
+        } else {
+            Err(ExamError::NotEnrolled)
+        }
     }
 
     /// Builds the WebSocket handshake request for `exam_id`.

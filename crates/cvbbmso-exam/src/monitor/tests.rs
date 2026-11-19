@@ -47,14 +47,11 @@ async fn monitor_answering(response: ResponseTemplate) -> (MockServer, Monitor) 
 }
 
 #[tokio::test]
-async fn enrollment_returns_the_user_and_the_exam() {
+async fn enrollment_returns_the_user_id() {
     let (_server, monitor) =
         monitor_answering(ResponseTemplate::new(200).set_body_json(list(EXAM))).await;
 
-    let enrollment = monitor.enrollment(&cookies(), EXAM).await.unwrap();
-
-    assert_eq!(enrollment.oj_user_id, 42);
-    assert_eq!(enrollment.exam.id, EXAM);
+    assert_eq!(monitor.enrollment(&cookies(), EXAM).await.unwrap(), 42);
 }
 
 #[tokio::test]

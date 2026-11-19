@@ -118,7 +118,20 @@ stateDiagram-v2
 - **主动关闭**：`ExamHandle::shutdown` 调用 `Recorder::stop` 停止采集并封存当前片段，关闭 WebSocket；合并与 manifest 由后续 `finish` 完成。已封存分片保留，下次 `Recorder::open` 恢复。服务端按普通断开记录 `connection_lost`。
 - **断网跨过结束时间**：客户端使用 `sync.server_time` 计算服务端时钟偏移；到达 `end_at + 60s` 后调用 `Recorder::stop` 封存当前片段，进入 `finalizing/finalizing`，等待 `end_exam`。重连后按服务端下发的 `end_exam` 执行 `finish` 并完成收尾。
 - **Cookie 过期**：运行时继续录屏，保持本地事件队列；通过 `ClientView` 通知 UI 重新登录，并按退避策略重试连接。认证失效期间录像继续。
-- **断线重连**：保留 `instance_id` 和本地状态；完成 `hello/sync` 后补发事件。服务端根据 `hello.state` 决定是否生成新的 `start_exam` / `end_exam`。
+- **断线重连**：保留 `instance_id` 和本地状态；完成 `hello/sync` 后补发事件。服务端根据 `hello.state` 决定是否生成新的 `start_exam` / `end_exam`。重连按 1 秒起、每次翻倍、上限 30 秒退避；收到 `CookiesUpdated` 时立即重试。每次 `sync` 都使上一连接的命令失效，未确认的命令结果不再重发。
+- **进程重启**：采集不会跨进程延续。本地记录为 `recording/*` 时，`hello.state` 报 `recording/failed`：考试进行中服务端不再生成命令，运行时自行重启采集，成功后上报 `recording_recovered`；考试已结束时服务端生成 `end_exam` 完成收尾。其他本地状态按原值上报。
+
+### 时限与重试
+
+| 项 | 取值 |
+| --- | --- |
+| 心跳 | 每 5 秒发送 `heartbeat`，同时发送 WebSocket Ping |
+| 判定连接失效 | 20 秒内未收到任何帧（含 Pong）；握手与首个 `sync` 同样以 20 秒为限 |
+| 启动采集 | 最多 5 次，间隔 3 秒 |
+| finalize | 最多 3 次，间隔 3 秒；`NoSegments` 不重试 |
+| 等待 `CommandAck` | 30 秒，超时按断线重连处理 |
+
+业务消息（`event`、`status`、`command_result`）只在当前连接完成 `hello/sync` 后发送；之前产生的事件留在本地队列，由 `sync` 后的补发送出。同一来源的 `navigation_denied` 在 5 秒内只上报一次，`detail` 为截断到 200 字符的目标 Origin。
 
 ## 录屏故障与重试
 

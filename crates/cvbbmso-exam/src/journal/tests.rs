@@ -1,6 +1,6 @@
 use cvbbmso_protocol::{
-    ClientIncident, ClientMessage, ExamEvent, ExecutionState, IncidentCode, SegmentMeta,
-    Sha256Digest,
+    ClientIncident, ClientMessage, ClientState, ExamEvent, ExecutionState, IncidentCode,
+    RecordingManifest, RecordingState, SegmentMeta, Sha256Digest,
 };
 use time::OffsetDateTime;
 
@@ -29,6 +29,22 @@ fn incident(seconds: i64) -> ExamEvent {
         occurred_at: at(seconds),
         detail: None,
     })
+}
+
+fn capturing() -> ClientState {
+    ClientState {
+        execution: ExecutionState::Recording,
+        recording: RecordingState::Capturing,
+    }
+}
+
+fn manifest() -> ExamEvent {
+    let ExamEvent::SegmentFinalized(meta) = segment(1) else {
+        unreachable!()
+    };
+    ExamEvent::RecordingFinalized(
+        RecordingManifest::new(vec![meta], Sha256Digest::parse(&"b".repeat(64)).unwrap()).unwrap(),
+    )
 }
 
 fn seqs(messages: &[ClientMessage]) -> Vec<u64> {
@@ -121,12 +137,12 @@ async fn saved_state_survives_a_restart() {
         journal.anchor(3);
         journal.append(segment(1));
         journal.append(incident(45));
-        journal.set_execution(ExecutionState::Recording);
+        journal.set_state(capturing());
         journal.save().await.unwrap();
     }
 
     let mut journal = open(&dir).await;
-    assert_eq!(journal.execution(), ExecutionState::Recording);
+    assert_eq!(journal.state(), capturing());
     assert!(journal.append(segment(1)).is_none());
     assert_eq!(seqs(&journal.anchor(3)), [4, 5]);
     assert_eq!(seq_of(journal.append(segment(2))), Some(6));
@@ -156,7 +172,17 @@ async fn a_corrupt_snapshot_is_set_aside() {
 
     let mut journal = open(&dir).await;
 
-    assert_eq!(journal.execution(), ExecutionState::Ready);
+    assert_eq!(journal.state().execution, ExecutionState::Ready);
     assert!(runtime.join(CORRUPT_FILE).exists());
     assert!(journal.append(segment(1)).is_none());
+}
+
+#[tokio::test]
+async fn the_recording_manifest_is_queued_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = open(&dir).await;
+    journal.anchor(0);
+
+    assert_eq!(seq_of(journal.append(manifest())), Some(1));
+    assert!(journal.append(manifest()).is_none());
 }
