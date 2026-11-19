@@ -1,6 +1,6 @@
-# cvbbmso-network — 网络环境检查
+# cvbbmso-network — 客户端启动网络预检
 
-本 crate 提供 Windows/macOS 的系统代理检查及监考服务器连通性检查。系统相关 API 封装在 crate 内，其他模块使用统一 `NetworkReport`。错误展示和考试流程判断由 `cvbbmso-exam` 与 `cvbbmso-client` 根据检查结果负责。
+本 crate 提供 Windows/macOS 的系统代理检查及监考服务器连通性检查。系统相关 API 封装在 crate 内，其他模块使用统一 `NetworkReport`。本 crate 由 `cvbbmso-client` 在启动预检时调用，预检结果用于决定是否允许进入考试；错误展示由 `cvbbmso-client` 负责。
 
 ## 公开 Rust API
 
@@ -43,21 +43,9 @@ impl Inspector {
 
 Windows 使用 WinINet、WinHTTP 与代理环境变量；macOS 使用 SystemConfiguration/CFNetwork 与代理环境变量。`Inspector` 读取当前用户环境。
 
-## 映射到协议状态
-
-`cvbbmso-exam` 将 `NetworkReport` 映射为 [协议](cvbbmso-protocol.md) 的 `NetworkState`，优先级如下：
-
-| 条件 | `NetworkState` |
-| --- | --- |
-| `endpoint = unreachable` | `unreachable` |
-| `proxy = configured` | `proxy_detected` |
-| `proxy = unknown` | `unknown` |
-| 其余（`proxy = clear` 且 `endpoint = reachable`） | `clear` |
-
-`check` 返回 `Err(NetworkError)` 时，运行时按 `proxy_check_failed` 上报异常，并将状态视为 `unknown`。
-
 ## 行为约定
 
-- **进入考试前**：客户端必须检查一次；进入考试流程的条件是 `NetworkState::Clear`。检测到代理、服务端不可达或状态未知时，客户端停留在考试外，展示对应错误。
-- **考试中**：默认每 30 秒检查一次，可由客户端配置。发现代理或检查失败时，运行时通过 `ExamEvent::Incident` 上报 `proxy_detected` / `proxy_check_failed`，考试继续；网络恢复后发送新的 `status` 快照。
-- 检查与自动修改系统代理属于不同职责；本 crate 读取当前用户环境并提供检查结果。
+- **调用时机**：`cvbbmso-client` 在应用启动时调用一次；预检失败后应用保留，用户重试进入考试时再次调用。
+- **允许进入考试的条件**：`proxy = clear` 且 `endpoint = reachable`。
+- **阻止进入考试的条件**：`proxy = configured`、`proxy = unknown`、`endpoint = unreachable`，或 `check` 返回 `Err(NetworkError)`。客户端停留在考试外并展示对应错误，等待用户重试。
+- 本 crate 读取当前用户环境并返回检查结果；网络异常的上报与展示由 `cvbbmso-client` 负责。检查与自动修改系统代理属于不同职责。
