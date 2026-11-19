@@ -70,6 +70,17 @@ mod command {
         command.args(["-c", "exit 1"]);
         assert_eq!(read_probe(&mut command).await, Err(Diagnostic::ProbeFailed));
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_platform_reader_with_excess_output_is_rejected() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf '%4097s' ''"]);
+        assert_eq!(
+            read_probe(&mut command).await,
+            Err(Diagnostic::InvalidEvidence)
+        );
+    }
 }
 
 mod evidence {
@@ -123,8 +134,46 @@ mod evidence {
         );
         assert_eq!(
             windows_verdict(Some("To Be Filled By O.E.M."), Some("Desktop"), Some(true)),
-            Verdict::Unknown(Diagnostic::InvalidEvidence)
+            Verdict::Unknown(Diagnostic::PlaceholderIdentity)
         );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn windows_parallels_arm_matches_the_reported_model_and_versioned_vendor() {
+        // Windows 11 Pro build 22623, Parallels Desktop 18.1.1 device report.
+        let vendor = Some("Parallels International GmbH version 18.1.1 (53328)");
+        assert_eq!(
+            windows_verdict(vendor, Some("Parallels ARM Virtual Machine"), None),
+            Verdict::Detected(Diagnostic::GuestIdentity)
+        );
+        assert_eq!(
+            windows_verdict(vendor, Some("Unfamiliar model"), None),
+            Verdict::Unknown(Diagnostic::UnrecognizedGuestIdentity)
+        );
+        assert_eq!(
+            windows_verdict(
+                Some("Dell Inc."),
+                Some("Parallels ARM Virtual Machine"),
+                Some(true)
+            ),
+            Verdict::Unknown(Diagnostic::ConflictingEvidence)
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn windows_oem_placeholders_need_more_evidence_even_with_hyper_v() {
+        for hypervisor in [Some(true), Some(false), None] {
+            assert_eq!(
+                windows_verdict(
+                    Some("System manufacturer"),
+                    Some("System Product Name"),
+                    hypervisor
+                ),
+                Verdict::Unknown(Diagnostic::PlaceholderIdentity)
+            );
+        }
     }
 
     #[cfg(not(windows))]

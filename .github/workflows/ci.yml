@@ -84,8 +84,14 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber
-          Get-CimInstance Win32_ComputerSystem -Property Manufacturer,Model,HypervisorPresent |
-            Select-Object Manufacturer,Model,HypervisorPresent | Format-List
+          try {
+            Get-CimInstance Win32_ComputerSystem -Property Manufacturer,Model,HypervisorPresent -OperationTimeoutSec 3 -ErrorAction Stop |
+              Select-Object Manufacturer,Model,HypervisorPresent | Format-List
+            Get-CimInstance Win32_BaseBoard -Property Manufacturer,Product -OperationTimeoutSec 3 -ErrorAction Stop |
+              Select-Object Manufacturer,Product | Format-List
+          } catch {
+            Write-Output 'Computer-system or baseboard properties unavailable on this runner.'
+          }
       - name: Record macOS and WebKit versions
         if: runner.os == 'macOS'
         run: |
@@ -95,7 +101,18 @@ jobs:
       - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke
       - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke-detected
       - name: Record the native probe result on the hosted runner
+        if: ${{ !cancelled() }}
         run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-vm-probe
+      - name: Build Windows x64 Release for VM acceptance
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc -p cvbbmso-client
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: cvbbmso-client-windows-x64-acceptance
+          path: target/x86_64-pc-windows-msvc/release/cvbbmso-client.exe
+          if-no-files-found: error
+          retention-days: 7
 
   deny:
     name: Dependency policy

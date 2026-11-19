@@ -17,6 +17,10 @@ pub(crate) enum Diagnostic {
     HardwareIdentity,
     #[cfg(not(target_os = "macos"))]
     HypervisorPresent,
+    #[cfg(not(target_os = "macos"))]
+    PlaceholderIdentity,
+    #[cfg(not(target_os = "macos"))]
+    UnrecognizedGuestIdentity,
     ProbeUnavailable,
     ProbeFailed,
     TimedOut,

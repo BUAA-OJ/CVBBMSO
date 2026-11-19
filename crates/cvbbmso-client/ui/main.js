@@ -16,7 +16,9 @@ async function checkDevice(retry) {
   } else if (result.status === "detected") {
     vmStatus.textContent = "检测到虚拟机。请在实体设备上运行客户端。";
   } else {
-    vmStatus.textContent = "无法完成设备检查，请重试。";
+    vmStatus.textContent = result.reason === "placeholder_identity"
+      ? "设备固件提供的厂商或型号无法核验。请联系考试管理员。"
+      : "无法完成设备检查，请重试。";
     if (result.reason) {
       vmDiagnostic.textContent = `诊断信息：${result.reason}`;
       vmDiagnostic.hidden = false;

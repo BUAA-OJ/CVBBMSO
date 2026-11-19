@@ -29,34 +29,43 @@ pub(crate) fn windows_verdict(
     else {
         return Verdict::Unknown(Diagnostic::InvalidEvidence);
     };
-    if !usable(&manufacturer) || !usable(&model) {
-        return Verdict::Unknown(Diagnostic::InvalidEvidence);
-    }
-
+    let vendor = manufacturer.as_str();
+    let is_parallels = [
+        "parallels international gmbh",
+        "parallels software international inc.",
+    ]
+    .iter()
+    .any(|name| {
+        vendor == *name
+            || vendor
+                .strip_prefix(name)
+                .and_then(|suffix| suffix.strip_prefix(" version "))
+                .and_then(|version| version.bytes().next())
+                .is_some_and(|first| first.is_ascii_digit())
+    });
     // Strong evidence is a guest-model family corroborated by its expected vendor.
     // A hypervisor flag is also present on physical Windows hosts using VBS.
-    let expected_vendor = match model.as_str() {
-        "virtual machine" => Some(&["microsoft corporation"][..]),
-        "vmware virtual platform" | "vmware7,1" => Some(&["vmware, inc."][..]),
-        "virtualbox" => Some(&["innotek gmbh", "oracle corporation"][..]),
-        "parallels virtual platform" => Some(
-            &[
-                "parallels international gmbh",
-                "parallels software international inc.",
-            ][..],
-        ),
+    let guest_vendor_matches = match model.as_str() {
+        "virtual machine" => Some(vendor == "microsoft corporation"),
+        "vmware virtual platform" | "vmware7,1" => Some(vendor == "vmware, inc."),
+        "virtualbox" => Some(matches!(vendor, "innotek gmbh" | "oracle corporation")),
+        "parallels virtual platform" | "parallels arm virtual machine" => Some(is_parallels),
         "kvm virtual machine" | "qemu virtual machine" | "qemu arm virtual machine" => {
-            Some(&["qemu", "red hat"][..])
+            Some(matches!(vendor, "qemu" | "red hat"))
         }
-        model if model.starts_with("standard pc (") => Some(&["qemu"][..]),
+        model if model.starts_with("standard pc (") => Some(vendor == "qemu"),
         _ => None,
     };
-    if let Some(expected_vendor) = expected_vendor {
-        return if expected_vendor.contains(&manufacturer.as_str()) {
-            Verdict::Detected(Diagnostic::GuestIdentity)
-        } else {
-            Verdict::Unknown(Diagnostic::ConflictingEvidence)
-        };
+    match guest_vendor_matches {
+        Some(true) => return Verdict::Detected(Diagnostic::GuestIdentity),
+        Some(false) => return Verdict::Unknown(Diagnostic::ConflictingEvidence),
+        None => {}
+    }
+    if is_parallels || matches!(vendor, "vmware, inc." | "innotek gmbh" | "qemu") {
+        return Verdict::Unknown(Diagnostic::UnrecognizedGuestIdentity);
+    }
+    if !usable(vendor) || !usable(&model) {
+        return Verdict::Unknown(Diagnostic::PlaceholderIdentity);
     }
 
     Verdict::NotDetected(if hypervisor_present == Some(true) {
