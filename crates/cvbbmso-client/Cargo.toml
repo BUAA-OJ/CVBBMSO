@@ -15,8 +15,12 @@ workspace = true
 
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 cvbbmso-accoding.workspace = true
+cvbbmso-protocol.workspace = true
+reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tauri.workspace = true
+thiserror.workspace = true
 url.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -42,6 +46,7 @@ rustls.workspace = true
 serde_json.workspace = true
 time.workspace = true
 tempfile.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tokio-rustls.workspace = true
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"] }
