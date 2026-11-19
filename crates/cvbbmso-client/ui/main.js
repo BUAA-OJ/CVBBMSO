@@ -1,4 +1,39 @@
-const { core, event } = window.__TAURI__;
+const { core, event, window: tauriWindow } = window.__TAURI__;
+const preflight = document.querySelector("#vm-preflight");
+const vmStatus = document.querySelector("#vm-status");
+const vmDiagnostic = document.querySelector("#vm-diagnostic");
+const vmRetry = document.querySelector("#vm-retry");
+const studentControls = document.querySelector("#student-controls");
+
+async function checkDevice(retry) {
+  vmRetry.hidden = true;
+  vmDiagnostic.hidden = true;
+  vmStatus.textContent = "正在检查运行环境…";
+  const result = await core.invoke("vm_preflight", { retry }).catch(() => ({ status: "unknown" }));
+  if (result.status === "not_detected") {
+    preflight.hidden = true;
+    studentControls.hidden = false;
+  } else if (result.status === "detected") {
+    vmStatus.textContent = "检测到虚拟机。请在实体设备上运行客户端。";
+  } else {
+    vmStatus.textContent = result.reason === "placeholder_identity"
+      ? "设备固件提供的厂商或型号无法核验。请联系考试管理员。"
+      : "无法完成设备检查，请重试。";
+    if (result.reason) {
+      vmDiagnostic.textContent = `诊断信息：${result.reason}`;
+      vmDiagnostic.hidden = false;
+    }
+    vmRetry.hidden = false;
+  }
+}
+
+vmRetry.addEventListener("click", () => checkDevice(true));
+document.querySelector("#vm-quit").addEventListener("click", () => {
+  tauriWindow.getCurrentWindow().close().catch(() => {
+    vmStatus.textContent = "请关闭客户端窗口以退出。";
+  });
+});
+
 const session = document.querySelector("#session");
 const open = document.querySelector("#open");
 const inspect = document.querySelector("#inspect");
@@ -20,6 +55,7 @@ const refreshExams = document.querySelector("#refresh-exams");
 const examStatus = document.querySelector("#exam-status");
 const examList = document.querySelector("#exams");
 const examErrors = new Map([
+  ["preflight_blocked", "设备检查通过后才能继续。"],
   ["sign_in_required", "请在 Accoding 窗口登录或重新登录，再刷新列表。"],
   ["session_unreadable", "无法读取 Accoding 会话，请重新登录后刷新。"],
   ["monitor_unconfigured", "未配置监考服务地址，请联系考试管理员。"],
@@ -85,6 +121,7 @@ refreshExams.addEventListener("click", async () => {
   }
 });
 refreshExams.disabled = false;
+void checkDevice(false);
 
 try {
   await event.listen("accoding-session", ({ payload }) => {

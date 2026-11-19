@@ -4,7 +4,7 @@
 
 ## 桌面底座
 
-当前底座可在 Windows 和 macOS 启动本地控制窗，并通过独立窗口打开 Accoding 登录页。用 `cargo run --release --locked -p cvbbmso-client` 启动。底座提供 `open_accoding`、`inspect_session` 和 `list_exams` 三个本地命令。关闭控制窗将退出应用，同时关闭 Accoding 窗口。`inspect_session` 将 Cookie 是否可用定向通知本地 UI。加载报名列表时由监考服务复验 Accoding 身份。
+当前底座可在 Windows 和 macOS 启动本地控制窗，并通过独立窗口打开 Accoding 登录页。用 `cargo run --release --locked -p cvbbmso-client` 启动。虚拟机预检通过后，控制窗可调用 `open_accoding`、`inspect_session` 和 `list_exams`。关闭控制窗将退出应用，同时关闭 Accoding 窗口。`inspect_session` 将 Cookie 是否可用定向通知本地 UI。加载报名列表时由监考服务复验 Accoding 身份。
 
 部署时可在编译环境中设置 `CVBBMSO_SERVER_ORIGIN`，例如 `https://monitor.example.org`。该值须为 HTTPS Origin，可含端口。显式配置无效地址（含空字符串）会导致启动失败。未设置该变量时，控制窗可照常启动，加载报名列表会提示未配置监考服务地址。远程页面和前端命令均无法设置请求目的地。应用数据根目录通过 Tauri 的 `app_local_data_dir()` 取得。Windows 的 Accoding WebView 用该目录下的 `accoding/` 保存浏览器配置，macOS 使用系统管理的应用 WebKit 数据存储。
 
@@ -12,7 +12,7 @@
 
 同源弹窗链接在现有 Accoding 窗口打开。客户端根据身份接口 URL 读取原生 Cookie Store，并保留适用的 HttpOnly 会话和附加 Cookie。界面只显示是否读取到会话，Cookie 原值仅供 Rust 使用。
 
-运行 `cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke` 可在交互式桌面验证两类 WebView 的权限隔离、导航、Release 调试设置、合成 Cookie 更新以及关闭并重新打开 Accoding 窗口后的会话保留。该测试也会打开真实 Accoding 登录页，无需登录。协议替身绑定回环地址，以临时 TLS 证书和合成凭据验证 HTTPS 接口、WSS 握手及首帧。
+运行 `cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke` 可在交互式桌面验证预检失败后的重试、两类 WebView 的权限隔离、导航、Release 调试设置、合成 Cookie 更新以及关闭并重新打开 Accoding 窗口后的会话保留。该测试也会打开真实 Accoding 登录页，无需登录。将末尾参数换为 `--native-smoke-detected` 可验证检测到虚拟机后的本地阻断与退出。两组冒烟都验证直接调用受限命令不会创建远程 WebView 或外发请求。协议替身绑定回环地址，以临时 TLS 证书和合成凭据验证 HTTPS 接口、WSS 握手及首帧。
 
 ## 应用接口
 
@@ -20,6 +20,7 @@
 
 | Tauri command | 入参 | 返回数据 | 语义 |
 | --- | --- | --- | --- |
+| `vm_preflight` | `{ retry: bool }` | `{ status, reason }` | 读取设备检查结果。仅在上次结果为 `unknown` 时响应重试 |
 | `list_exams` | 无 | `ExamSummary[]` | 使用当前 Cookie 调用 `GET /api/exams` |
 | `open_exam` | `{ exam_id: uuid }` | `{ "connected": true }` | 调用 `Exam::connect`；等待初始 `sync` 后返回。网络、出站守卫和权限预检已在启动时完成 |
 | `get_exam_status` | 无 | `ClientView` 或 `null` | 读取当前考试状态快照 |
@@ -58,10 +59,22 @@ impl AppState {
 
 应用启动时、以及预检失败后用户重试进入考试时，客户端执行一次启动流程：
 
-1. 检查当前进程是否具备管理员/root 权限。系统级出站守卫需要特权；无法取得权限时，客户端停留在考试外并展示提权指引。
-2. 调用 `cvbbmso-network::Inspector::check`。只有 `proxy = clear` 且 `endpoint = reachable` 才允许进入考试。检测到代理、代理状态未知、服务端不可达或检查失败时，客户端停留在考试外并展示对应错误，等待用户重试。
-3. 调用 `cvbbmso-network::EgressGuard::install`，传入 Accoding Origin 和监考服务器 Origin。守卫保持到应用退出，期间系统只放行允许的出站流量。安装失败时同样停留在考试外。
-4. macOS 上由本 crate 的平台适配层探测屏幕录制权限；未授权时发起系统授权请求。仍无权限或授权后需要重启应用时，展示明确指引并阻止进入考试。Windows 视为已授权。
+1. 在 Rust 中执行虚拟机预检。只有 `NotDetected` 放行。其余结果阻断 Accoding 窗口、会话检查、报名列表请求和进入考试。
+2. 检查当前进程是否具备管理员/root 权限。系统级出站守卫需要特权。无法取得权限时，客户端停留在考试外并展示提权指引。
+3. 调用 `cvbbmso-network::Inspector::check`。只有 `proxy = clear` 且 `endpoint = reachable` 才允许进入考试。检测到代理、代理状态未知、服务端不可达或检查失败时，客户端停留在考试外并展示对应错误，等待用户重试。
+4. 调用 `cvbbmso-network::EgressGuard::install`，传入 Accoding Origin 和监考服务器 Origin。守卫保持到应用退出，期间系统只放行允许的出站流量。安装失败时同样停留在考试外。
+5. macOS 上由本 crate 的平台适配层探测屏幕录制权限，未授权时发起系统授权请求。仍无权限或授权后需要重启应用时，展示明确指引并阻止进入考试。Windows 视为已授权。
+
+当前桌面底座已接入第 1 步。接入提权、网络预检、出站守卫、录屏授权和 `open_exam` 时，须先通过虚拟机预检，再继续后续步骤。
+
+### 虚拟机预检
+
+- Windows 通过系统自带的本地 CIM 查询读取 `Win32_ComputerSystem` 的厂商和型号。首版识别 Hyper-V、VMware、VirtualBox、Parallels（含 Windows ARM）以及 QEMU/KVM 的已知厂商和型号组合。厂商和型号冲突，或已识别为虚拟化厂商但型号无法核对时，返回 `Unknown`。`HypervisorPresent` 只记录辅助诊断，启用 Hyper-V、VBS 或内存完整性的实体机可在硬件信息通过核验后正常使用。[Windows CIM 字段](https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-computersystem) · [Parallels ARM 来宾设备报告](https://learn.microsoft.com/en-us/answers/questions/5181595/i-am-unable-to-activate-office-365-arm-on-windows?page=6)
+- 主板固件可能为实体机提供 `System manufacturer`、`System Product Name` 等占位值。首版对无法核验的占位值显示 `Unknown` 和联系考试管理员的指引。验证补充信号时，可只读采集 `Win32_BaseBoard` 的厂商和产品型号，并与实体机产品资料及虚拟主板样本交叉核对。主板字段也来自 SMBIOS，需在带占位值的实体机与来宾上完成对照后才能作为准入证据。[ASUS 硬件管理手册](https://dlcdnets.asus.com/pub/ASUS/mb/14Utilities/ASUS_Control_Center_Express_EM_WEB.pdf) · [Windows 主板字段](https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-baseboard)
+- macOS 读取 `hw.model` 和 `kern.hv_vmm_present`。`VirtualMac` 系列型号与内核客户机标志一致时判为 `Detected`。识别为实体 Mac 型号且内核客户机标志为 0 时判为 `NotDetected`。结果不一致、关键值缺失或无法识别时返回 `Unknown`。该检查不使用宿主机虚拟化能力、图形渲染模式或 WebGL。
+- 查询只读。macOS 最长等待 5 秒。Windows 的 15 秒上限涵盖系统进程启动、CIM 加载及查询。关键读取失败、超时或证据冲突的诊断仅在本地保留预定义类别，内容不含设备序列号或唯一标识。`Detected` 显示阻断信息及退出入口。`Unknown` 显示原因和重试入口。初次结果返回前也禁止使用受限命令。
+- 新增本地命令 `vm_preflight`，输入 `{ retry: bool }`，返回 `{ status, reason }`，供控制窗显示状态。显式重试只在 `Unknown` 后重新读取系统信息。现有命令的名称、入参和成功载荷保持原契约。阻断时，`open_accoding` 和 `inspect_session` 返回本地提示，`list_exams` 返回 `preflight_blocked`。
+- 托管运行器的桌面冒烟仅在测试构建中使用预设结果。换用测试参数 `--native-vm-probe` 可记录当前系统原生探测的结果。部署验收还需记录实际 Windows 实体机（启用内存完整性）、Windows 虚拟机、Apple silicon 实体 Mac 和 Apple silicon macOS 虚拟机的系统版本及适用的虚拟机产品。
 
 屏幕权限探测与申请由 binary crate 内部实现，发生在应用启动流程中；未通过时 UI 展示阻断提示。`open_exam` 在启动流程全部通过后调用 `Exam::connect`。网络预检在应用启动和用户重试进入考试时执行，出站守卫在此时安装并保持到应用退出；`close_exam` 只释放考试运行时，应用退出时调用 `shutdown`。客户端每 30 秒调用 `EgressGuard::verify`；运行期校验失败时停止考试并提示用户。
 
