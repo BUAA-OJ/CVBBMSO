@@ -1,5 +1,7 @@
 //! Desktop Duplication capture of the primary display.
 
+use std::marker::PhantomData;
+
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
@@ -31,6 +33,9 @@ pub(crate) struct Desktop {
     rotation: Rotation,
     // Declared last so the apartment outlives the interfaces created in it.
     _com: ComGuard,
+    // The duplication and its COM apartment are bound to one thread; moving the
+    // backend elsewhere would run `CoUninitialize` on the wrong thread.
+    _thread: PhantomData<*const ()>,
 }
 
 impl Desktop {
@@ -99,6 +104,7 @@ impl Desktop {
                 context,
                 rotation,
                 _com: com,
+                _thread: PhantomData,
             })
         }
     }
@@ -204,9 +210,9 @@ impl Drop for MapGuard<'_> {
     }
 }
 
-/// Wraps a platform error so the caller keeps the code without platform types.
+/// Wraps a platform error so the caller keeps its code and cause.
 fn failure(error: &WindowsError) -> PlatformError {
-    PlatformError::Failed(CaptureFailure::new(error.code().0))
+    PlatformError::Failed(CaptureFailure::from_windows(error))
 }
 
 /// Copies a mapped surface into tightly packed rows.

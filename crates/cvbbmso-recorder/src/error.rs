@@ -38,19 +38,41 @@ pub enum PlatformError {
 
 /// Failure reported by the platform capture backend.
 ///
-/// Only the platform error code is kept, so callers can classify the failure
-/// without this crate exposing platform types in its public surface.
+/// The platform error is kept as the source so a diagnosable cause survives, but
+/// the value is opaque: the platform type never appears in this crate's public
+/// signatures.
 #[derive(Debug, Error)]
 #[error("capture failed with platform error 0x{code:X}")]
 pub struct CaptureFailure {
     code: i32,
+    #[source]
+    cause: Option<PlatformCause>,
 }
 
+/// Text of the platform error, kept as the source of a [`CaptureFailure`].
+#[derive(Debug)]
+struct PlatformCause {
+    detail: String,
+}
+
+impl std::fmt::Display for PlatformCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for PlatformCause {}
+
 impl CaptureFailure {
-    /// Creates a failure from a platform error code.
-    #[must_use]
-    pub const fn new(code: i32) -> Self {
-        Self { code }
+    /// Wraps the platform error raised by a failed call.
+    #[cfg(windows)]
+    pub(crate) fn from_windows(cause: &windows::core::Error) -> Self {
+        Self {
+            code: cause.code().0,
+            cause: Some(PlatformCause {
+                detail: cause.to_string(),
+            }),
+        }
     }
 
     /// Returns the platform error code.
