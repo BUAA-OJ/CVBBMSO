@@ -30,6 +30,7 @@ use super::Nv12Frame;
 use crate::RecordingError;
 use crate::container::{
     AvcConfig, ContainerError, Sample, annex_b_nals, length_prefixed, nal_type,
+    with_centered_chroma,
 };
 
 /// Failure inside the Windows encoder adapter.
@@ -533,7 +534,7 @@ fn build_config(header: Option<Vec<u8>>) -> EncoderResult<AvcConfig> {
         .iter()
         .find(|unit| nal_type(unit) == 8)
         .ok_or(EncoderError::MissingParameterSet("picture parameter set"))?;
-    Ok(AvcConfig::new(sequence.to_vec(), picture.to_vec())?)
+    Ok(AvcConfig::new(sequence.to_vec(), picture.to_vec())?.with_centered_chroma()?)
 }
 
 /// Converts a frame rate into the 100-nanosecond sample duration.
@@ -596,9 +597,7 @@ fn drain(transform: &IMFTransform, layout: &mut OutputLayout) -> EncoderResult<V
                 {
                     samples.push(sample);
                 }
-                let stream_end =
-                    output.dwStatus & MFT_OUTPUT_DATA_BUFFER_STREAM_END.0.cast_unsigned() != 0;
-                if stream_end {
+                if stream_ended(output.dwStatus) {
                     return Ok(samples);
                 }
             }
@@ -627,6 +626,12 @@ fn drain(transform: &IMFTransform, layout: &mut OutputLayout) -> EncoderResult<V
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+/// These status codes are alternatives, not independent bits: `NO_SAMPLE` is
+/// 0x300 and contains `STREAM_END`'s 0x200 bit without ending the stream.
+fn stream_ended(status: u32) -> bool {
+    status == MFT_OUTPUT_DATA_BUFFER_STREAM_END.0.cast_unsigned()
 }
 
 /// Allocates the output buffer the transform expects, or none when it provides
@@ -683,7 +688,7 @@ fn frame_sample(stream: &[u8], timestamp: i64, clean_point: bool) -> EncoderResu
         return Ok(None);
     }
     let unit_keyframe = units.iter().any(|unit| nal_type(unit) == 5);
-    let data = length_prefixed(&units)?;
+    let data = with_centered_chroma(&length_prefixed(&units)?)?;
     Ok(Some(Sample {
         timestamp_ms: u64::try_from(timestamp.max(0) / 10_000).unwrap_or(0),
         keyframe: clean_point || unit_keyframe,
@@ -705,6 +710,17 @@ fn encoder_failure(error: EncoderError) -> RecordingError {
 mod tests {
     use super::*;
     use windows::Win32::Media::MediaFoundation::MFCreateMediaType;
+
+    #[test]
+    fn no_sample_keeps_the_output_stream_alive() {
+        assert!(!stream_ended(
+            MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0.cast_unsigned()
+        ));
+        assert!(!stream_ended(0));
+        assert!(stream_ended(
+            MFT_OUTPUT_DATA_BUFFER_STREAM_END.0.cast_unsigned()
+        ));
+    }
 
     #[test]
     fn color_attributes_match_the_bt709_limited_centered_conversion() {
@@ -738,9 +754,13 @@ mod tests {
 
     #[test]
     fn frame_sample_frames_nals_and_detects_a_keyframe() {
-        let stream = [
-            0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 4, 5,
+        let sequence = [
+            0x67, 0x4D, 0x40, 0x15, 0x95, 0xA0, 0x50, 0x7E, 0x84, 0, 0, 3, 0, 4, 0, 0, 3, 0, 0x78,
+            0x36, 0x82, 0x21, 0x1A, 0x80,
         ];
+        let mut stream = vec![0, 0, 0, 1];
+        stream.extend(sequence);
+        stream.extend([0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 4, 5]);
 
         let sample = frame_sample(&stream, 660_000, false)
             .expect("framing")
@@ -751,7 +771,9 @@ mod tests {
         assert_eq!(
             sample.data,
             [
-                0, 0, 0, 3, 0x67, 1, 2, 0, 0, 0, 2, 0x68, 3, 0, 0, 0, 3, 0x65, 4, 5
+                0, 0, 0, 24, 0x67, 0x4D, 0x40, 0x15, 0x95, 0xA0, 0x50, 0x7E, 0x8A, 0x50, 0, 0, 3,
+                0, 0x10, 0, 0, 3, 1, 0xE0, 0xDA, 8, 0x84, 0x6A, 0, 0, 0, 2, 0x68, 3, 0, 0, 0, 3,
+                0x65, 4, 5
             ]
         );
     }

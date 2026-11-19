@@ -3,7 +3,10 @@
 use super::{Mp4Writer, boxed};
 use crate::container::{AvcConfig, Sample};
 
-const SEQUENCE: [u8; 6] = [0x67, 0x42, 0xC0, 0x1E, 0xD9, 0x01];
+const SEQUENCE: [u8; 24] = [
+    0x67, 0x4D, 0x40, 0x15, 0x95, 0xA0, 0x50, 0x7E, 0x84, 0, 0, 3, 0, 4, 0, 0, 3, 0, 0x78, 0x36,
+    0x82, 0x21, 0x1A, 0x80,
+];
 const PICTURE: [u8; 4] = [0x68, 0xCE, 0x38, 0x80];
 
 fn config() -> AvcConfig {
@@ -203,7 +206,10 @@ fn writes_a_playable_movie_header() {
 
     assert_eq!(parsed.width, 640);
     assert_eq!(parsed.height, 360);
-    assert_eq!(parsed.config, config());
+    assert_eq!(
+        parsed.config,
+        config().with_centered_chroma().expect("centered SPS")
+    );
     assert_eq!(parsed.colour, Some((1, 1, 1, 0)));
     assert_eq!(parsed.sizes, [12, 8, 9]);
     assert_eq!(parsed.deltas, [66, 66, 66]);

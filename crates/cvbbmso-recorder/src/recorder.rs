@@ -8,6 +8,7 @@ use std::{
 
 use cvbbmso_protocol::{RecordingManifest, RecordingPolicy};
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::{RecorderEvent, RecordingError, store::SegmentStore};
@@ -31,6 +32,8 @@ enum State {
     Capturing,
     /// The last capture or finish attempt failed; the recorder can retry.
     Failed,
+    /// The recorder owns the merge even if its caller stops awaiting it.
+    Finalizing(JoinHandle<Result<RecordingManifest, RecordingError>>),
     /// Finishing succeeded; the manifest is cached so repeated calls agree.
     Complete(RecordingManifest),
 }
@@ -114,6 +117,10 @@ impl Recorder {
     ///
     /// The merge runs on a blocking task because it reads, hashes, and writes
     /// whole segments; awaiting it does not block a Tokio worker.
+    /// Cancelling this future only stops waiting: the recorder retains the
+    /// task and its result, and the next call awaits the same merge. Keep this
+    /// recorder alive until finishing completes; dropping it cannot stop an
+    /// already running filesystem operation.
     ///
     /// # Errors
     ///
@@ -122,30 +129,38 @@ impl Recorder {
     /// attempt leaves the recorder retryable; repeating the call after a
     /// successful finish returns the same manifest.
     pub async fn finish(&mut self) -> Result<RecordingManifest, RecordingError> {
-        if let State::Complete(manifest) = &self.state {
-            return Ok(manifest.clone());
-        }
-        if self.store.segments().is_empty() {
-            return Err(RecordingError::NoSegments);
-        }
-        let store = self.store.clone();
-        let merged = tokio::task::spawn_blocking(move || {
-            let digest = store.merge()?;
-            store.manifest(digest)
-        })
-        .await;
-        match merged {
-            Ok(Ok(manifest)) => {
-                self.state = State::Complete(manifest.clone());
-                Ok(manifest)
-            }
-            Ok(Err(error)) => {
-                self.state = State::Failed;
-                Err(error)
-            }
-            Err(error) => {
-                self.state = State::Failed;
-                Err(RecordingError::Merge(Some(io::Error::other(error))))
+        loop {
+            match &mut self.state {
+                State::Complete(manifest) => return Ok(manifest.clone()),
+                State::Finalizing(task) => {
+                    // Await by reference so cancelling the caller cannot detach
+                    // the task or allow another writer of final.mp4.tmp.
+                    let merged = task.await;
+                    return match merged {
+                        Ok(Ok(manifest)) => {
+                            self.state = State::Complete(manifest.clone());
+                            Ok(manifest)
+                        }
+                        Ok(Err(error)) => {
+                            self.state = State::Failed;
+                            Err(error)
+                        }
+                        Err(error) => {
+                            self.state = State::Failed;
+                            Err(RecordingError::Merge(Some(io::Error::other(error))))
+                        }
+                    };
+                }
+                State::Opened | State::Capturing | State::Failed => {
+                    if self.store.segments().is_empty() {
+                        return Err(RecordingError::NoSegments);
+                    }
+                    let store = self.store.clone();
+                    self.state = State::Finalizing(tokio::task::spawn_blocking(move || {
+                        let digest = store.merge()?;
+                        store.manifest(digest)
+                    }));
+                }
             }
         }
     }

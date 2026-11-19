@@ -371,7 +371,10 @@ fn sample_description(layout: &Layout<'_>) -> Result<Vec<u8>, ContainerError> {
     entry.extend_from_slice(&compressor);
     push_u16(&mut entry, 0x0018); // depth
     push_u16(&mut entry, 0xFFFF); // pre-defined
-    entry.extend_from_slice(&boxed(*b"avcC", &layout.config.record()?));
+    entry.extend_from_slice(&boxed(
+        *b"avcC",
+        &layout.config.with_centered_chroma()?.record()?,
+    ));
     // MP4 has no separate chroma-siting field; nclx carries the matrix, range,
     // and primaries so players do not infer a different matrix from the stream.
     let colour = Colour::BT709_LIMITED_CENTERED;

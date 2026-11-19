@@ -258,3 +258,39 @@ Internal task orchestration, cancellation mechanics, retry algorithms, and the
 recorder capture/encoding pipeline are implementation decisions. Do not infer
 rules for them from this file; decide them in the crate and record the
 reasoning in code comments or the crate document.
+
+## 11. Work In Progress: Recorder Encoding
+
+This section is a handoff note for the `cvbbmso-recorder` milestone. Delete it
+once the milestone lands; it is not a standing rule of this repository.
+
+State as of 2026-11-19, branch `feat/recorder-container`, no pull request yet.
+
+- **M0–M2 complete.** Storage, recovery, the Matroska writer and reader, and the
+  EBML and AVC primitives are implemented and unit tested with no new runtime
+  dependency; the muxer is hand-written because no crate writes Matroska.
+- **M3 complete.** `capture/windows.rs` duplicates the primary display and
+  `capture::run` samples it at the recording frame rate on its own thread. The
+  hardware tests are `#[ignore]`d because CI has no display; run
+  `cargo test -p cvbbmso-recorder -- --ignored` on a real desktop, and note that
+  the hook needs an escalated shell.
+- **M4 complete.** `Encoder` negotiates H.264 output and NV12 input over Media
+  Foundation, disables B-frames, allocates output samples, drains
+  `MF_E_NOTACCEPTING` and stream changes, reads SPS/PPS from
+  `MF_MT_MPEG_SEQUENCE_HEADER`, and returns four-byte length-prefixed
+  `container::Sample`s plus an `AvcConfig` for `MkvWriter`. Its hardware test
+  encodes real frames and parses the resulting Matroska file.
+- **M6 complete.** `Recorder::finish` verifies every sealed segment, merges its
+  samples into a hand-written MP4 (`final.mp4.tmp` then atomic rename), hashes
+  the result, and caches the manifest. `RecordingError::Encoder` and
+  `RecordingError::Merge` now carry an optional `std::io::Error` source.
+- **M5 remains.** `Recorder::start` still returns `RecordingError::Platform`.
+  The capture sampler is not yet connected to the encoder, segment rotation,
+  `SegmentStore::seal`, `RecorderEvent::Fault`/`SegmentFinalized`, or the
+  `stop`/retry lifecycle. Client integration should not treat `Recorder` as
+  recording until that lands.
+
+Environment notes that already cost time: `cargo test -p cvbbmso-recorder` works
+now that `cvbbmso-protocol` declares the serde features it needs; the DSH sandbox
+cannot reach crates.io or a display, so dependency downloads and the hardware
+tests need an escalated shell.

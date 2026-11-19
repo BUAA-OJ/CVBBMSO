@@ -9,7 +9,10 @@ use super::SegmentStore;
 use crate::RecordingError;
 use crate::container::{AvcConfig, MkvWriter, Sample};
 
-const SEQUENCE: [u8; 6] = [0x67, 0x42, 0xC0, 0x1E, 0xD9, 0x01];
+const SEQUENCE: [u8; 24] = [
+    0x67, 0x4D, 0x40, 0x15, 0x95, 0xA0, 0x50, 0x7E, 0x84, 0, 0, 3, 0, 4, 0, 0, 3, 0, 0x78, 0x36,
+    0x82, 0x21, 0x1A, 0x80,
+];
 const PICTURE: [u8; 4] = [0x68, 0xCE, 0x38, 0x80];
 
 fn config() -> AvcConfig {
@@ -24,7 +27,7 @@ fn sample(timestamp_ms: u64, keyframe: bool, byte: u8) -> Sample {
     Sample {
         timestamp_ms,
         keyframe,
-        data: vec![byte; 7],
+        data: vec![0, 0, 0, 3, 0x41, byte, byte],
     }
 }
 
@@ -167,6 +170,64 @@ fn merges_segments_into_one_movie() {
     assert_eq!(
         digest,
         crate::store::hash_file(&store.final_path()).expect("digest")
+    );
+}
+
+#[test]
+fn legacy_in_band_sps_matches_avcc_and_preserves_the_sealed_segment() {
+    let directory = TempDir::new().expect("temp dir");
+    let mut store = store(&directory);
+    let sequence = [0x67, 0x42, 0, 0x1E, 0xF4, 0x0A, 0x0F, 0xC8];
+    let legacy = AvcConfig::new(sequence.to_vec(), PICTURE.to_vec()).expect("legacy config");
+    let mut payload = u32::try_from(sequence.len())
+        .expect("length")
+        .to_be_bytes()
+        .to_vec();
+    payload.extend(sequence);
+    payload.extend([0, 0, 0, 3, 0x65, 0x88, 0x80]);
+    let expected = crate::container::with_centered_chroma(&payload).expect("updated NALs");
+    assert_ne!(payload.len(), expected.len(), "fixture changes SPS length");
+    let mut writer = MkvWriter::new(legacy.clone(), 320, 240);
+    writer
+        .push(Sample {
+            timestamp_ms: 0,
+            keyframe: true,
+            data: payload,
+        })
+        .expect("sample");
+    let original = writer.finish().expect("segment");
+    seal(&mut store, 1, 0, &original);
+
+    store.merge().expect("merge legacy recording");
+    let movie = fs::read(store.final_path()).expect("movie");
+    assert_eq!(mdat(&movie), expected);
+    let mut table = movie.as_slice();
+    for id in [*b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl"] {
+        table = Boxes::parse(table).child(id);
+    }
+    let sizes = Boxes::parse(table).child(*b"stsz");
+    assert_eq!(
+        u32::from_be_bytes(sizes[12..16].try_into().expect("sample size")),
+        u32::try_from(expected.len()).expect("expected length")
+    );
+    let description = Boxes::parse(table).child(*b"stsd");
+    let entry = Boxes::parse(&description[8..]).child(*b"avc1");
+    let config = Boxes::parse(&entry[78..]).child(*b"avcC");
+    assert_eq!(
+        config,
+        legacy
+            .with_centered_chroma()
+            .expect("VUI")
+            .record()
+            .expect("record")
+    );
+    assert_eq!(
+        fs::read(store.video_path(1)).expect("sealed video"),
+        original
+    );
+    assert_eq!(
+        store.segments()[0].sha256,
+        crate::store::hash_file(&store.video_path(1)).expect("hash")
     );
 }
 

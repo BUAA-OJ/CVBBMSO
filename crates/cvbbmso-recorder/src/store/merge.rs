@@ -132,7 +132,15 @@ impl SegmentStore {
                 meta.index
             )));
         }
-        MkvFile::parse(&bytes).map_err(merge_container)
+        let mut file = MkvFile::parse(&bytes).map_err(merge_container)?;
+        // Recovery may encounter older segments whose in-band SPS omitted VUI.
+        // Rewrite both passes so MP4 sample sizes match the bytes actually copied.
+        // The sealed segment and the digest checked above remain untouched.
+        for sample in &mut file.samples {
+            sample.data =
+                crate::container::with_centered_chroma(&sample.data).map_err(merge_container)?;
+        }
+        Ok(file)
     }
 }
 
