@@ -1,6 +1,7 @@
 //! Exercises HTTPS and WSS against a loopback monitor with synthetic sessions.
 
 use std::{
+    convert::Infallible,
     net::SocketAddr,
     sync::{
         Arc,
@@ -14,10 +15,11 @@ mod monitor;
 #[path = "support/tls.rs"]
 mod tls;
 
-use monitor::{Monitor, MonitorError};
+use monitor::{MAX_EXAM_LIST_BYTES, Monitor, MonitorError};
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{
         Path,
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -32,7 +34,7 @@ use cvbbmso_protocol::{
     ExamSummary, ExecutionState, NetworkState, Platform, RecordingPolicy, RecordingState,
     ServerMessage, error_code,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream};
 use reqwest::Client;
 use rustls::{ClientConfig, RootCertStore, pki_types::CertificateDer};
 use serde_json::{Value, json};
@@ -104,6 +106,13 @@ async fn exam_list(headers: HeaderMap) -> Response {
             "user": {"id": 0, "username": "test", "nickname": "Test"},
             "items": []
         }))
+        .into_response();
+    }
+    if headers.get(header::COOKIE) == Some(&cookie("positional-list").header_value()) {
+        return Json(json!([
+            {"id": 42, "username": "test", "nickname": "Test"},
+            []
+        ]))
         .into_response();
     }
     match enrollments(&headers) {
@@ -331,6 +340,10 @@ async fn monitor_validates_the_https_exam_list_and_returns_only_items() {
         monitor.list_exams(&cookie("malformed")).await,
         Err(MonitorError::InvalidResponse(_))
     ));
+    assert!(matches!(
+        monitor.list_exams(&cookie("positional-list")).await,
+        Err(MonitorError::NonObjectResponse)
+    ));
 
     let untrusted = Monitor::new(Some(origin)).unwrap();
     assert!(matches!(
@@ -345,6 +358,42 @@ async fn monitor_validates_the_https_exam_list_and_returns_only_items() {
     assert!(matches!(
         Monitor::new(Some(plaintext)),
         Err(MonitorError::Configuration)
+    ));
+    server.abort();
+}
+
+#[tokio::test]
+async fn monitor_accepts_the_size_limit_and_stops_reading_chunked_overflow() {
+    let (addr, cert, server) = tls::serve(Router::new().route(
+        "/api/exams",
+        get(|headers: HeaderMap| async move {
+            let mut body =
+                br#" {"user":{"id":42,"username":"test","nickname":"Test"},"items":[]}"#.to_vec();
+            body.resize(MAX_EXAM_LIST_BYTES, b' ');
+            let body = if headers.get(header::COOKIE) == Some(&cookie("at-limit").header_value()) {
+                Body::from(body)
+            } else {
+                // An unknown-length HTTP/1.1 body crosses the cap without ever ending.
+                let chunks = [Ok::<_, Infallible>(body), Ok(vec![b' '])];
+                Body::from_stream(stream::iter(chunks).chain(stream::pending()))
+            };
+            ([(header::CONTENT_TYPE, "application/json")], body)
+        }),
+    ))
+    .await;
+    let origin = url::Url::parse(&format!("https://{addr}"))
+        .unwrap()
+        .origin();
+    let root = reqwest::Certificate::from_der(cert.as_ref()).unwrap();
+    let monitor = Monitor::with_root_certificate(origin, root).unwrap();
+
+    let items = monitor.list_exams(&cookie("at-limit")).await.unwrap();
+    assert!(items.is_empty());
+    assert!(matches!(
+        timeout(LIMIT, monitor.list_exams(&cookie("oversized")))
+            .await
+            .expect("the monitor transport must stop before the body ends"),
+        Err(MonitorError::ResponseTooLarge)
     ));
     server.abort();
 }

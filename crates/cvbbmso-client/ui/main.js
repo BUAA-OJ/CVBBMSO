@@ -22,7 +22,7 @@ const examList = document.querySelector("#exams");
 const examErrors = new Map([
   ["sign_in_required", "请在 Accoding 窗口登录或重新登录，再刷新列表。"],
   ["session_unreadable", "无法读取 Accoding 会话，请重新登录后刷新。"],
-  ["monitor_unconfigured", "监考服务地址缺失或无效，请联系考试管理员。"],
+  ["monitor_unconfigured", "未配置监考服务地址，请联系考试管理员。"],
   ["connection_failed", "无法连接监考服务，请检查网络后重试。"],
   ["service_unavailable", "监考服务暂时无法核验身份，请稍后重试。"],
   ["unexpected_response", "监考服务返回了异常响应，请稍后重试。"],

@@ -16,8 +16,9 @@ workspace = true
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 cvbbmso-accoding.workspace = true
 cvbbmso-protocol.workspace = true
-reqwest = { workspace = true, features = ["json"] }
+reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tauri.workspace = true
 thiserror.workspace = true
 url.workspace = true

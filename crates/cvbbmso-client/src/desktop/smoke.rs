@@ -30,6 +30,7 @@ use tokio::{
 use uuid::Uuid;
 
 use super::*;
+use crate::monitor::MAX_EXAM_LIST_BYTES;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -42,7 +43,16 @@ pub(super) fn run() -> tauri::Result<()> {
     let (completed, result) = std::sync::mpsc::channel();
     let app = builder()
         .setup(move |app| {
-            let deployed = Desktop::deployed(data_dir.clone())?;
+            let deployed = Desktop::deployed(data_dir.clone(), None)?;
+            assert!(matches!(deployed.monitor, Err(MonitorError::Configuration)));
+            for invalid in ["", "http://monitor.example.org"] {
+                assert!(
+                    Desktop::deployed(data_dir.clone(), Some(invalid)).is_err_and(|error| error
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|error| error.kind() == io::ErrorKind::InvalidInput))
+                );
+            }
+            println!("Missing monitor configuration is allowed; invalid origins fail startup.");
             let (fixture, foreign, hits) = async_runtime::block_on(start_fixture())?;
             let (monitor_addr, cert, _) = async_runtime::block_on(tls::serve(
                 Router::new().route("/api/exams", get(exam_list)),
@@ -165,6 +175,18 @@ async fn start_fixture() -> io::Result<(SocketAddr, SocketAddr, Arc<AtomicUsize>
                 }),
             )
             .route(
+                "/oversized",
+                get(|| async {
+                    (
+                        [(
+                            header::SET_COOKIE,
+                            "connect.sid=oversized; Path=/; HttpOnly",
+                        )],
+                        Html("<title>Oversized list</title>"),
+                    )
+                }),
+            )
+            .route(
                 "/redirect",
                 get(move || async move { Redirect::temporary(&format!("http://{foreign_addr}/")) }),
             );
@@ -198,6 +220,12 @@ async fn exam_list(headers: HeaderMap) -> Response {
         }
         ["_aux=synthetic", "connect.sid=unavailable"] => {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        ["_aux=synthetic", "connect.sid=oversized"] => {
+            let mut body =
+                br#"{"user":{"id":42,"username":"test","nickname":"Test"},"items":[]}"#.to_vec();
+            body.resize(MAX_EXAM_LIST_BYTES + 1, b' ');
+            return ([(header::CONTENT_TYPE, "application/json")], body).into_response();
         }
         _ => return StatusCode::UNAUTHORIZED.into_response(),
     };
@@ -373,6 +401,7 @@ async fn check_exam_refresh(
     for (route, status) in [
         ("expired", "请在 Accoding 窗口登录或重新登录，再刷新列表。"),
         ("unavailable", "监考服务暂时无法核验身份，请稍后重试。"),
+        ("oversized", "监考服务返回了异常响应，请稍后重试。"),
     ] {
         oj.navigate(base.join(route)?)?;
         let path = serde_json::to_string(&format!("/{route}"))?;
@@ -390,7 +419,7 @@ async fn check_exam_refresh(
         refresh_exams(ui, enrolled, Some(EXAM_TITLE)).await?;
     }
     println!(
-        "Exam list loaded and refreshed through HTTPS; empty, expired and unavailable states verified."
+        "Exam list loaded and refreshed through HTTPS; empty, expired, unavailable, and oversized responses verified."
     );
     Ok(())
 }

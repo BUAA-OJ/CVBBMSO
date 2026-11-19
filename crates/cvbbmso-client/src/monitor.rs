@@ -2,9 +2,11 @@ use std::time::Duration;
 
 use cvbbmso_accoding::AccodingCookies;
 use cvbbmso_protocol::{ExamListResponse, ExamSummary};
-use reqwest::{Client, ClientBuilder, StatusCode, header, redirect};
+use reqwest::{Client, ClientBuilder, Response, StatusCode, header, redirect};
 use thiserror::Error;
 use url::{Origin, Url};
+
+pub(crate) const MAX_EXAM_LIST_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct Monitor {
     endpoint: Url,
@@ -25,8 +27,12 @@ pub(crate) enum MonitorError {
     Connection(#[source] reqwest::Error),
     #[error("The monitor returned HTTP {0}")]
     UnexpectedStatus(StatusCode),
+    #[error("The exam list exceeds the maximum response size")]
+    ResponseTooLarge,
+    #[error("The exam list response must be a JSON object")]
+    NonObjectResponse,
     #[error("The monitor returned an invalid exam list")]
-    InvalidResponse(#[source] reqwest::Error),
+    InvalidResponse(#[from] serde_json::Error),
 }
 
 impl Monitor {
@@ -77,20 +83,26 @@ impl Monitor {
             .map_err(MonitorError::Connection)?;
 
         match response.status() {
-            StatusCode::OK => response
-                .json::<ExamListResponse>()
-                .await
-                .map(|list| list.items)
-                .map_err(|error| {
-                    if error.is_decode() {
-                        MonitorError::InvalidResponse(error)
-                    } else {
-                        MonitorError::Connection(error)
-                    }
-                }),
+            StatusCode::OK => read_exam_list(response).await,
             StatusCode::UNAUTHORIZED => Err(MonitorError::SignInRequired),
             StatusCode::SERVICE_UNAVAILABLE => Err(MonitorError::Unavailable),
             status => Err(MonitorError::UnexpectedStatus(status)),
         }
     }
+}
+
+async fn read_exam_list(mut response: Response) -> Result<Vec<ExamSummary>, MonitorError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(MonitorError::Connection)? {
+        if chunk.len() > MAX_EXAM_LIST_BYTES - body.len() {
+            return Err(MonitorError::ResponseTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    // Serde's struct decoder also accepts positional arrays, which the HTTP contract excludes.
+    if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(MonitorError::NonObjectResponse);
+    }
+    Ok(serde_json::from_slice::<ExamListResponse>(&body)?.items)
 }

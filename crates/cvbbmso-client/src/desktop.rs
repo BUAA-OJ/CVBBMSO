@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{io, path::PathBuf};
 
 #[cfg(test)]
 mod smoke;
@@ -42,12 +42,25 @@ enum SessionObservation {
 }
 
 impl Desktop {
-    fn deployed(data_dir: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+    fn deployed(
+        data_dir: PathBuf,
+        raw_origin: Option<&str>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let origin = raw_origin
+            .map(|raw| {
+                server_origin(raw).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "CVBBMSO_SERVER_ORIGIN must be an HTTPS origin",
+                    )
+                })
+            })
+            .transpose()?;
         Ok(Self {
             login: Url::parse(LOGIN_URL)?,
             identity: Url::parse(IDENTITY_URL)?,
             data_dir,
-            monitor: Monitor::new(option_env!("CVBBMSO_SERVER_ORIGIN").and_then(server_origin)),
+            monitor: Monitor::new(origin),
             #[cfg(test)]
             blocked: None,
         })
@@ -67,7 +80,10 @@ pub fn run() -> tauri::Result<()> {
         .setup(|app| {
             let data_dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
-            app.manage(Desktop::deployed(data_dir)?);
+            app.manage(Desktop::deployed(
+                data_dir,
+                option_env!("CVBBMSO_SERVER_ORIGIN"),
+            )?);
             build_ui(app.handle())?;
             Ok(())
         })
@@ -248,9 +264,10 @@ impl From<&MonitorError> for ListExamsError {
             MonitorError::Initialization(_) | MonitorError::Connection(_) => Self::ConnectionFailed,
             MonitorError::SignInRequired => Self::SignInRequired,
             MonitorError::Unavailable => Self::ServiceUnavailable,
-            MonitorError::UnexpectedStatus(_) | MonitorError::InvalidResponse(_) => {
-                Self::UnexpectedResponse
-            }
+            MonitorError::UnexpectedStatus(_)
+            | MonitorError::ResponseTooLarge
+            | MonitorError::NonObjectResponse
+            | MonitorError::InvalidResponse(_) => Self::UnexpectedResponse,
         }
     }
 }
