@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/cvbbmso-accoding", "crates/cvbbmso-protocol"]
+members = ["crates/cvbbmso-accoding", "crates/cvbbmso-network", "crates/cvbbmso-protocol"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,6 +9,7 @@ rust-version = "1.88"
 publish = false
 
 [workspace.dependencies]
+core-foundation = "0.10"
 cvbbmso-protocol = { version = "0.1.0", path = "crates/cvbbmso-protocol" }
 http = "1.0"
 insta = { version = "1.43", features = ["json"] }
@@ -16,6 +17,7 @@ proptest = "1.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = "1.0"
+system-configuration = "0.8"
 thiserror = "2.0"
 time = { version = "0.3", default-features = false, features = [
     "formatting",
@@ -24,7 +26,9 @@ time = { version = "0.3", default-features = false, features = [
     "serde-well-known",
 ] }
 tokio = { version = "1.0", default-features = false }
+url = "2.5"
 uuid = { version = "1.11", default-features = false, features = ["serde"] }
+windows-sys = "0.61"
 wiremock = "0.6"
 
 [workspace.lints.rust]
