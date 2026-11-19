@@ -1,0 +1,15 @@
+---
+source: crates/cvbbmso-protocol/tests/wire.rs
+expression: message
+---
+{
+  "type": "hello",
+  "device_id": "00000000-0000-0000-0000-000000000020",
+  "instance_id": "00000000-0000-0000-0000-000000000030",
+  "platform": "windows",
+  "state": {
+    "execution": "ready",
+    "recording": "idle",
+    "network": "clear"
+  }
+}

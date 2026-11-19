@@ -1,0 +1,77 @@
+---
+source: crates/cvbbmso-protocol/tests/wire.rs
+expression: "vec![ClientMessage::Heartbeat, ClientMessage::Status { state: state() },\nClientMessage::Event\n{\n    seq: 4, event:\n    ExamEvent::SegmentFinalized(segment(1, \"2026-12-20T01:00:00Z\",\n    \"2026-12-20T01:00:30Z\", 'a',)),\n}, ClientMessage::Event\n{\n    seq: 5, event:\n    ExamEvent::Incident(ClientIncident\n    {\n        code: IncidentCode::ProxyDetected, occurred_at:\n        at(\"2026-12-20T01:00:31Z\"), detail:\n        Some(\"system proxy enabled\".to_owned()),\n    }),\n}, ClientMessage::Event\n{ seq: 6, event: ExamEvent::RecordingFinalized(manifest()), },\ncommand_result(CommandStatus::Completed, None),\ncommand_result(CommandStatus::Failed, Some(\"RECORDING_START_FAILED\")),]"
+---
+[
+  {
+    "type": "heartbeat"
+  },
+  {
+    "type": "status",
+    "state": {
+      "execution": "recording",
+      "recording": "capturing",
+      "network": "clear"
+    }
+  },
+  {
+    "type": "event",
+    "seq": 4,
+    "event": {
+      "kind": "segment_finalized",
+      "data": {
+        "index": 1,
+        "start_at": "2026-12-20T01:00:00Z",
+        "end_at": "2026-12-20T01:00:30Z",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  },
+  {
+    "type": "event",
+    "seq": 5,
+    "event": {
+      "kind": "incident",
+      "data": {
+        "code": "proxy_detected",
+        "occurred_at": "2026-12-20T01:00:31Z",
+        "detail": "system proxy enabled"
+      }
+    }
+  },
+  {
+    "type": "event",
+    "seq": 6,
+    "event": {
+      "kind": "recording_finalized",
+      "data": {
+        "segments": [
+          {
+            "index": 1,
+            "start_at": "2026-12-20T01:00:00Z",
+            "end_at": "2026-12-20T01:00:30Z",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          {
+            "index": 2,
+            "start_at": "2026-12-20T01:00:30Z",
+            "end_at": "2026-12-20T01:01:00Z",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+        ],
+        "merged_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      }
+    }
+  },
+  {
+    "type": "command_result",
+    "command_id": "00000000-0000-0000-0000-000000000040",
+    "status": "completed"
+  },
+  {
+    "type": "command_result",
+    "command_id": "00000000-0000-0000-0000-000000000040",
+    "status": "failed",
+    "error_code": "RECORDING_START_FAILED"
+  }
+]
