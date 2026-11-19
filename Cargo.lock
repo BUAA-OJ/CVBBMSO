@@ -694,6 +694,7 @@ dependencies = [
 name = "cvbbmso-exam"
 version = "0.1.0"
 dependencies = [
+ "cvbbmso-accoding",
  "cvbbmso-protocol",
  "cvbbmso-recorder",
  "reqwest 0.12.28",
@@ -705,6 +706,9 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "url",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]

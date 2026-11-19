@@ -9,9 +9,12 @@
 #![forbid(unsafe_code)]
 
 mod error;
-// The journal is wired into the runtime by the session layer that follows in
-// the same pull request; until then only its tests reach it.
+// The journal and the monitor endpoints are wired into the runtime by the
+// session layer that follows in the same pull request; until then only their
+// tests reach them.
 #[allow(dead_code)]
 mod journal;
+#[allow(dead_code)]
+mod monitor;
 
 pub use error::ExamError;
