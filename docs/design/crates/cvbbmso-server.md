@@ -43,8 +43,8 @@ async fn serve(config: ServerConfig) -> Result<(), ServerError>;
 
 | HTTP 状态 | `error.code` | 语义 |
 | --- | --- | --- |
-| `400` | `INVALID_REQUEST` | 参数、路径或请求格式无效 |
-| `401` | `ACCODING_AUTH_EXPIRED` | Cookie 缺失或 Accoding 返回匿名状态 |
+| `400` | `INVALID_REQUEST` | 参数、路径、请求格式或 Cookie 无效，包括重复的 `connect.sid` |
+| `401` | `ACCODING_AUTH_EXPIRED` | 会话 Cookie 缺失、为空或已失效，或 Accoding 返回匿名状态 |
 | `403` | `NOT_ENROLLED` | 访问者不在该考试的报名名单中 |
 | `404` | `EXAM_NOT_FOUND` | 指定的考试不存在 |
 | `500` | `INTERNAL_ERROR` | 内部错误 |
@@ -54,7 +54,7 @@ async fn serve(config: ServerConfig) -> Result<(), ServerError>;
 
 ## WebSocket 处理
 
-协议端点为 `wss://<监考服务端>/api/exams/{exam_id}/ws`。客户端首帧发送 `hello`，服务端从握手 Cookie 确认考生身份，再调用 `ExamService::connect(exam_id, oj_user_id, hello)` 返回 `sync` 和待执行指令。后续消息 `heartbeat`、`status`、`event`、`command_result` 交给 `ExamService::receive`；向客户端推送 `sync`、`command`、`ack` 和 `error`。所有消息字段见 [cvbbmso-protocol](cvbbmso-protocol.md)。
+协议端点为 `wss://<监考服务端>/api/exams/{exam_id}/ws`。服务端在升级前从握手 Cookie 确认考生身份，失败时按上表返回同格式的 HTTP 错误。升级成功后，客户端先发送 `hello`，服务端调用 `ExamService::connect(exam_id, oj_user_id, hello)` 返回 `sync` 和待执行指令。后续消息 `heartbeat`、`status`、`event`、`command_result` 交给 `ExamService::receive`，服务端向客户端推送 `sync`、`command`、`ack` 和 `error`。所有消息字段见 [cvbbmso-protocol](cvbbmso-protocol.md)。
 
 同一 `(exam_id, oj_user_id)` 同时保留一条有效 WebSocket。服务端维护“当前连接”：
 
