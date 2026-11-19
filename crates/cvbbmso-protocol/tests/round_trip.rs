@@ -3,8 +3,8 @@
 use cvbbmso_protocol::{
     AccodingUser, ClientHello, ClientIncident, ClientMessage, ClientState, CommandName,
     CommandStatus, ExamEvent, ExamListResponse, ExamPhase, ExamSummary, ExecutionState,
-    IncidentCode, NetworkState, Platform, RecordingManifest, RecordingPolicy, RecordingState,
-    SegmentMeta, ServerMessage, Sha256Digest,
+    IncidentCode, Platform, RecordingManifest, RecordingPolicy, RecordingState, SegmentMeta,
+    ServerMessage, Sha256Digest,
 };
 use proptest::prelude::*;
 use time::{OffsetDateTime, UtcOffset};
@@ -38,46 +38,39 @@ fn arb_platform() -> impl Strategy<Value = Platform> {
     prop_oneof![Just(Platform::Windows), Just(Platform::Macos)]
 }
 
-fn arb_execution_state() -> impl Strategy<Value = ExecutionState> {
-    prop_oneof![
-        Just(ExecutionState::Ready),
-        Just(ExecutionState::Recording),
-        Just(ExecutionState::Finalizing),
-        Just(ExecutionState::Finished),
-        Just(ExecutionState::Error),
-    ]
-}
-
-fn arb_recording_state() -> impl Strategy<Value = RecordingState> {
-    prop_oneof![
-        Just(RecordingState::Idle),
-        Just(RecordingState::Capturing),
-        Just(RecordingState::Finalizing),
-        Just(RecordingState::Complete),
-        Just(RecordingState::Failed),
-    ]
-}
-
-fn arb_network_state() -> impl Strategy<Value = NetworkState> {
-    prop_oneof![
-        Just(NetworkState::Clear),
-        Just(NetworkState::ProxyDetected),
-        Just(NetworkState::Unreachable),
-        Just(NetworkState::Unknown),
-    ]
-}
-
 fn arb_client_state() -> impl Strategy<Value = ClientState> {
-    (
-        arb_execution_state(),
-        arb_recording_state(),
-        arb_network_state(),
-    )
-        .prop_map(|(execution, recording, network)| ClientState {
-            execution,
-            recording,
-            network,
-        })
+    prop_oneof![
+        (Just(ExecutionState::Ready), Just(RecordingState::Idle)),
+        (
+            Just(ExecutionState::Recording),
+            Just(RecordingState::Capturing)
+        ),
+        (
+            Just(ExecutionState::Recording),
+            Just(RecordingState::Failed)
+        ),
+        (
+            Just(ExecutionState::Finalizing),
+            Just(RecordingState::Finalizing)
+        ),
+        (
+            Just(ExecutionState::Finalizing),
+            Just(RecordingState::Complete)
+        ),
+        (
+            Just(ExecutionState::Finalizing),
+            Just(RecordingState::Failed)
+        ),
+        (
+            Just(ExecutionState::Finished),
+            Just(RecordingState::Complete)
+        ),
+        (Just(ExecutionState::Finished), Just(RecordingState::Failed)),
+    ]
+    .prop_map(|(execution, recording)| ClientState {
+        execution,
+        recording,
+    })
 }
 
 fn arb_phase() -> impl Strategy<Value = ExamPhase> {
@@ -104,7 +97,7 @@ fn arb_segment() -> impl Strategy<Value = SegmentMeta> {
 
 fn arb_manifest() -> impl Strategy<Value = RecordingManifest> {
     (
-        prop::collection::vec((arb_ordered_times(), arb_digest()), 0..4),
+        prop::collection::vec((arb_ordered_times(), arb_digest()), 1..4),
         arb_digest(),
     )
         .prop_map(|(parts, merged_sha256)| {
@@ -122,8 +115,6 @@ fn arb_manifest() -> impl Strategy<Value = RecordingManifest> {
 
 fn arb_incident_code() -> impl Strategy<Value = IncidentCode> {
     prop_oneof![
-        Just(IncidentCode::ProxyDetected),
-        Just(IncidentCode::ProxyCheckFailed),
         Just(IncidentCode::RecordingFailed),
         Just(IncidentCode::RecordingRecovered),
         Just(IncidentCode::NavigationDenied),
@@ -217,7 +208,7 @@ fn arb_server_message() -> impl Strategy<Value = ServerMessage> {
                 effective_at,
             }
         ),
-        (any::<u64>(),).prop_map(|(ack_event_through,)| ServerMessage::Ack { ack_event_through }),
+        arb_uuid().prop_map(|command_id| ServerMessage::CommandAck { command_id }),
         ("[A-Z_]{1,32}", prop::option::of("[ -~]{0,32}")).prop_map(|(code, message)| {
             ServerMessage::Error {
                 code,
