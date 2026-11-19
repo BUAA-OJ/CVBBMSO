@@ -234,6 +234,7 @@ async fn exercise(
         "same-origin popup routed in place",
     )
     .await?;
+    check_reopen(ui, &oj).await?;
     expect_cookie(&oj, base, "connect.sid=synthetic-v2").await?;
     oj.eval("location.assign('/redirect')")?;
     expect_denial(decisions, "navigation", &foreign_url).await?;
@@ -263,6 +264,31 @@ async fn exercise(
         return Err(error);
     }
     println!("Accoding login form loaded.");
+    Ok(())
+}
+
+async fn check_reopen(ui: &WebviewWindow, oj: &WebviewWindow) -> Result<(), Error> {
+    oj.close()?;
+    wait_for_visibility(oj, false).await?;
+    ui.eval("document.querySelector('#open').click()")?;
+    wait_for_visibility(oj, true).await?;
+    wait_for(
+        oj,
+        "document.title === 'Fixture updated'",
+        "the original Accoding page",
+    )
+    .await
+}
+
+async fn wait_for_visibility(window: &WebviewWindow, visible: bool) -> Result<(), Error> {
+    timeout(DEADLINE, async {
+        while window.is_visible()? != visible {
+            sleep(Duration::from_millis(50)).await;
+        }
+        Ok::<_, tauri::Error>(())
+    })
+    .await
+    .map_err(|_| io::Error::other(format!("Accoding visibility did not change to {visible}")))??;
     Ok(())
 }
 

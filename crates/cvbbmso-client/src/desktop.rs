@@ -8,8 +8,8 @@ mod smoke;
 use cvbbmso_accoding::{AccodingCookies, AccodingError};
 use serde::Serialize;
 use tauri::{
-    AppHandle, Emitter, EventTarget, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Wry,
-    async_runtime, webview::NewWindowResponse,
+    AppHandle, Emitter, EventTarget, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    WindowEvent, Wry, async_runtime, webview::NewWindowResponse,
 };
 use url::Url;
 
@@ -82,10 +82,23 @@ pub fn run() -> tauri::Result<()> {
 fn builder() -> tauri::Builder<Wry> {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![open_accoding, inspect_session])
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                match window.label() {
+                    UI => {
+                        api.prevent_close();
+                        window.app_handle().exit(0);
+                    }
+                    // Keep the current page and session cookies in the existing WebView.
+                    OJ if window.hide().is_ok() => api.prevent_close(),
+                    _ => {}
+                }
+            }
+        })
 }
 
 fn build_ui(app: &AppHandle) -> tauri::Result<WebviewWindow> {
-    let ui = WebviewWindowBuilder::new(app, UI, WebviewUrl::App("index.html".into()))
+    WebviewWindowBuilder::new(app, UI, WebviewUrl::App("index.html".into()))
         .title("CVBBMSO")
         .inner_size(560.0, 420.0)
         .min_inner_size(340.0, 320.0)
@@ -102,15 +115,7 @@ fn build_ui(app: &AppHandle) -> tauri::Result<WebviewWindow> {
                 && matches!(url.path(), "" | "/" | "/index.html")
         })
         .on_new_window(|_, _| NewWindowResponse::Deny)
-        .build()?;
-    let app = app.clone();
-    ui.on_window_event(move |event| {
-        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-            api.prevent_close();
-            app.exit(0);
-        }
-    });
-    Ok(ui)
+        .build()
 }
 
 #[tauri::command]
@@ -124,6 +129,7 @@ async fn open_accoding(app: AppHandle) -> Result<(), &'static str> {
 
 fn open_browser(app: &AppHandle, desktop: &Desktop) -> tauri::Result<()> {
     if let Some(existing) = app.get_webview_window(OJ) {
+        existing.show()?;
         return existing.set_focus();
     }
 
