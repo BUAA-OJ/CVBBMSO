@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use tokio::process::Command;
 
 use crate::preflight::{Diagnostic, Verdict, command::read_probe, evidence::macos_verdict};
@@ -5,7 +7,7 @@ use crate::preflight::{Diagnostic, Verdict, command::read_probe, evidence::macos
 pub(crate) async fn detect() -> Verdict {
     let mut command = Command::new("/usr/sbin/sysctl");
     command.args(["-n", "hw.model", "kern.hv_vmm_present"]);
-    let output = match read_probe(&mut command).await {
+    let output = match read_probe(&mut command, Duration::from_secs(5)).await {
         Ok(output) => output,
         Err(error) => return Verdict::Unknown(error),
     };

@@ -41,15 +41,20 @@ mod admission {
 }
 
 mod command {
+    use std::time::Duration;
+
     use super::preflight::{
         Diagnostic,
         command::{read_probe, within_deadline},
     };
     use tokio::process::Command;
 
+    const DEADLINE: Duration = Duration::from_secs(5);
+
     #[tokio::test(start_paused = true)]
     async fn a_probe_that_never_completes_times_out() {
-        let result = within_deadline(std::future::pending::<Result<(), Diagnostic>>()).await;
+        let result =
+            within_deadline(DEADLINE, std::future::pending::<Result<(), Diagnostic>>()).await;
         assert_eq!(result, Err(Diagnostic::TimedOut));
     }
 
@@ -58,7 +63,7 @@ mod command {
         let dir = tempfile::tempdir().unwrap();
         let mut command = Command::new(dir.path().join("missing-probe.exe"));
         assert_eq!(
-            read_probe(&mut command).await,
+            read_probe(&mut command, DEADLINE).await,
             Err(Diagnostic::ProbeUnavailable)
         );
     }
@@ -68,7 +73,10 @@ mod command {
     async fn a_platform_reader_with_a_nonzero_exit_fails() {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "exit 1"]);
-        assert_eq!(read_probe(&mut command).await, Err(Diagnostic::ProbeFailed));
+        assert_eq!(
+            read_probe(&mut command, DEADLINE).await,
+            Err(Diagnostic::ProbeFailed)
+        );
     }
 
     #[cfg(unix)]
@@ -77,7 +85,7 @@ mod command {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "printf '%4097s' ''"]);
         assert_eq!(
-            read_probe(&mut command).await,
+            read_probe(&mut command, DEADLINE).await,
             Err(Diagnostic::InvalidEvidence)
         );
     }

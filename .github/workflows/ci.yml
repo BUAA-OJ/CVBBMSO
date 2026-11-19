@@ -98,19 +98,22 @@ jobs:
           sw_vers
           sysctl hw.model kern.hv_vmm_present || true
           defaults read /System/Library/Frameworks/WebKit.framework/Resources/Info CFBundleVersion
+      - name: Record the native probe result on the hosted runner
+        run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-vm-probe
       - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke
       - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke-detected
-      - name: Record the native probe result on the hosted runner
-        if: ${{ !cancelled() }}
-        run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-vm-probe
       - name: Build Windows x64 Release for VM acceptance
         if: runner.os == 'Windows'
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc -p cvbbmso-client
+        run: |
+          if ((rustc -vV) -notcontains 'host: x86_64-pc-windows-msvc') {
+            throw 'The Windows acceptance build must use the x64 MSVC host toolchain.'
+          }
+          cargo build --release --locked -p cvbbmso-client
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Windows'
         with:
           name: cvbbmso-client-windows-x64-acceptance
-          path: target/x86_64-pc-windows-msvc/release/cvbbmso-client.exe
+          path: target/release/cvbbmso-client.exe
           if-no-files-found: error
           retention-days: 7
 

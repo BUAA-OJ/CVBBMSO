@@ -1,4 +1,4 @@
-use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
+use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf, time::Duration};
 
 use serde::Deserialize;
 use tokio::process::Command;
@@ -17,7 +17,8 @@ $json = @{ Manufacturer = $rows[0].Manufacturer; Model = $rows[0].Model; Hypervi
 $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
 $stdout = [Console]::OpenStandardOutput()
 $stdout.Write($bytes, 0, $bytes.Length)
-$stdout.Flush()
+$stdout.Dispose()
+exit 0
 ";
 
 #[derive(Deserialize)]
@@ -44,7 +45,8 @@ pub(crate) async fn detect() -> Verdict {
             "-Command",
             QUERY,
         ]);
-    let output = match read_probe(&mut command).await {
+    // Starting Windows PowerShell and loading CIM can outlast the WMI query.
+    let output = match read_probe(&mut command, Duration::from_secs(15)).await {
         Ok(output) => output,
         Err(error) => return Verdict::Unknown(error),
     };

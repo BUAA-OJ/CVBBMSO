@@ -76,7 +76,12 @@ pub fn run() -> tauri::Result<()> {
             Some("--native-smoke") => return smoke::run(false),
             Some("--native-smoke-detected") => return smoke::run(true),
             Some("--native-vm-probe") => {
+                let start = std::time::Instant::now();
                 let verdict = async_runtime::block_on(host_probe::detect());
+                println!(
+                    "Native VM probe completed in {} ms.",
+                    start.elapsed().as_millis()
+                );
                 println!(
                     "{}",
                     serde_json::to_string(&verdict).map_err(io::Error::other)?

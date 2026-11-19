@@ -72,7 +72,7 @@ impl AppState {
 - Windows 通过系统自带的本地 CIM 查询读取 `Win32_ComputerSystem` 的厂商和型号。首版识别 Hyper-V、VMware、VirtualBox、Parallels（含 Windows ARM）以及 QEMU/KVM 的已知厂商和型号组合。厂商和型号冲突，或已识别为虚拟化厂商但型号无法核对时，返回 `Unknown`。`HypervisorPresent` 只记录辅助诊断，启用 Hyper-V、VBS 或内存完整性的实体机可在硬件信息通过核验后正常使用。[Windows CIM 字段](https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-computersystem) · [Parallels ARM 来宾设备报告](https://learn.microsoft.com/en-us/answers/questions/5181595/i-am-unable-to-activate-office-365-arm-on-windows?page=6)
 - 主板固件可能为实体机提供 `System manufacturer`、`System Product Name` 等占位值。首版对无法核验的占位值显示 `Unknown` 和联系考试管理员的指引。验证补充信号时，可只读采集 `Win32_BaseBoard` 的厂商和产品型号，并与实体机产品资料及虚拟主板样本交叉核对。主板字段也来自 SMBIOS，需在带占位值的实体机与来宾上完成对照后才能作为准入证据。[ASUS 硬件管理手册](https://dlcdnets.asus.com/pub/ASUS/mb/14Utilities/ASUS_Control_Center_Express_EM_WEB.pdf) · [Windows 主板字段](https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-baseboard)
 - macOS 读取 `hw.model` 和 `kern.hv_vmm_present`。`VirtualMac` 系列型号与内核客户机标志一致时判为 `Detected`。识别为实体 Mac 型号且内核客户机标志为 0 时判为 `NotDetected`。结果不一致、关键值缺失或无法识别时返回 `Unknown`。该检查不使用宿主机虚拟化能力、图形渲染模式或 WebGL。
-- 查询只读，最长等待 5 秒。关键读取失败、超时或证据冲突的诊断仅在本地保留预定义类别，内容不含设备序列号或唯一标识。`Detected` 显示阻断信息及退出入口。`Unknown` 显示原因和重试入口。初次结果返回前也禁止使用受限命令。
+- 查询只读。macOS 最长等待 5 秒。Windows 的 15 秒上限涵盖系统进程启动、CIM 加载及查询。关键读取失败、超时或证据冲突的诊断仅在本地保留预定义类别，内容不含设备序列号或唯一标识。`Detected` 显示阻断信息及退出入口。`Unknown` 显示原因和重试入口。初次结果返回前也禁止使用受限命令。
 - 新增本地命令 `vm_preflight`，输入 `{ retry: bool }`，返回 `{ status, reason }`，供控制窗显示状态。显式重试只在 `Unknown` 后重新读取系统信息。现有命令的名称、入参和成功载荷保持原契约。阻断时，`open_accoding` 和 `inspect_session` 返回本地提示，`list_exams` 返回 `preflight_blocked`。
 - 托管运行器的桌面冒烟仅在测试构建中使用预设结果。换用测试参数 `--native-vm-probe` 可记录当前系统原生探测的结果。部署验收还需记录实际 Windows 实体机（启用内存完整性）、Windows 虚拟机、Apple silicon 实体 Mac 和 Apple silicon macOS 虚拟机的系统版本及适用的虚拟机产品。
 

@@ -4,11 +4,13 @@ use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 
 use super::Diagnostic;
 
-const DEADLINE: Duration = Duration::from_secs(5);
 const MAX_OUTPUT: u64 = 4096;
 
-pub(crate) async fn read_probe(command: &mut Command) -> Result<Vec<u8>, Diagnostic> {
-    within_deadline(async {
+pub(crate) async fn read_probe(
+    command: &mut Command,
+    deadline: Duration,
+) -> Result<Vec<u8>, Diagnostic> {
+    within_deadline(deadline, async {
         let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -36,9 +38,10 @@ pub(crate) async fn read_probe(command: &mut Command) -> Result<Vec<u8>, Diagnos
 }
 
 pub(crate) async fn within_deadline<T>(
+    deadline: Duration,
     probe: impl Future<Output = Result<T, Diagnostic>>,
 ) -> Result<T, Diagnostic> {
-    timeout(DEADLINE, probe)
+    timeout(deadline, probe)
         .await
         .map_err(|_| Diagnostic::TimedOut)?
 }
