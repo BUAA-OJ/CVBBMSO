@@ -167,3 +167,36 @@ async fn finish_reports_merge_and_stays_retryable() {
         Err(RecordingError::Merge(_))
     ));
 }
+
+#[tokio::test]
+async fn open_fails_when_sealed_metadata_cannot_be_read() {
+    let directory = TempDir::new().expect("temp dir");
+    let candidate = candidate_dir(&directory, OJ_USER_ID);
+    seal_segments(&candidate, 1);
+
+    let segments = candidate.join("recording").join("segments");
+    let metadata = segments.join("000001.json");
+    let backup = segments.join("000001.json.bak");
+    fs::rename(&metadata, &backup).expect("move metadata aside");
+    fs::create_dir(&metadata).expect("block the metadata path");
+
+    let result = Recorder::open(exam_id(), OJ_USER_ID, candidate.clone(), policy()).await;
+
+    assert!(matches!(result, Err(RecordingError::Io(_))));
+    assert!(
+        segments.join("000001.mkv").is_file(),
+        "the sealed video must survive a failed recovery"
+    );
+
+    fs::remove_dir(&metadata).expect("unblock the metadata path");
+    fs::rename(&backup, &metadata).expect("restore metadata");
+
+    let (_recorder, mut events) = Recorder::open(exam_id(), OJ_USER_ID, candidate, policy())
+        .await
+        .expect("open once the fault clears");
+
+    match events.recv().await.expect("event") {
+        RecorderEvent::SegmentFinalized(meta) => assert_eq!(meta.index, 1),
+        other => panic!("unexpected event: {other:?}"),
+    }
+}

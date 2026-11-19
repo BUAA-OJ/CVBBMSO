@@ -17,6 +17,11 @@ use crate::RecordingError;
 /// metadata parses, and its index matches the file name. Files left behind by an
 /// interrupted seal are ignored so their index can be reused.
 ///
+/// A metadata file that exists but cannot be read fails recovery instead of
+/// counting as an unsealed leftover: the segment is sealed, and reporting it as
+/// absent would let a later recording reuse its index and overwrite evidence.
+/// The files are left untouched so the fault can be repaired and retried.
+///
 /// The video digest is not recomputed: metadata is published only after the
 /// video was written and synchronized, so its presence already proves the
 /// segment is complete.
@@ -49,9 +54,7 @@ pub(super) fn recover(segments_dir: &Path) -> Result<BTreeMap<u32, SegmentMeta>,
         if *index != expected {
             break;
         }
-        let Ok(bytes) = fs::read(segments_dir.join(file_name(*index, META_EXTENSION))) else {
-            break;
-        };
+        let bytes = fs::read(segments_dir.join(file_name(*index, META_EXTENSION)))?;
         let Ok(meta) = serde_json::from_slice::<SegmentMeta>(&bytes) else {
             break;
         };
