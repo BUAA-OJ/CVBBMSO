@@ -85,3 +85,104 @@ pub(crate) struct Sample {
     /// NAL units framed with the four-byte lengths the container stores.
     pub(crate) data: Vec<u8>,
 }
+
+impl Sample {
+    /// Normalises one H.264 access unit in four-byte length-prefixed form.
+    ///
+    /// `VideoToolbox` and other platform encoders hand back access units framed
+    /// like the container stores them. The in-band SPS is rewritten to the
+    /// recorder's centered chroma location so keyframes agree with the
+    /// out-of-band `AvcConfig`; an IDR slice marks the sample as a keyframe even
+    /// when the platform did not report a sync flag.
+    ///
+    /// # Errors
+    ///
+    /// Returns a container error for truncated framing, a malformed parameter
+    /// set, or a NAL unit that does not fit the four-byte length.
+    pub(crate) fn from_access_unit(
+        data: &[u8],
+        timestamp_ms: u64,
+        keyframe: bool,
+    ) -> Result<Option<Self>, ContainerError> {
+        let units = avc::length_prefixed_nals(data)?;
+        if units.is_empty() {
+            return Ok(None);
+        }
+        let idr = units.iter().any(|unit| avc::nal_type(unit) == 5);
+        Ok(Some(Self {
+            timestamp_ms,
+            keyframe: keyframe || idr,
+            data: avc::with_centered_chroma(data)?,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::avc::{length_prefixed, with_centered_chroma};
+    use super::{ContainerError, Sample};
+
+    /// Microsoft MFT SPS with timing, bitstream restrictions and escaped bytes.
+    const SEQUENCE: [u8; 24] = [
+        0x67, 0x4D, 0x40, 0x15, 0x95, 0xA0, 0x50, 0x7E, 0x84, 0, 0, 3, 0, 4, 0, 0, 3, 0, 0x78,
+        0x36, 0x82, 0x21, 0x1A, 0x80,
+    ];
+    const PICTURE: [u8; 4] = [0x68, 0xCE, 0x38, 0x80];
+    const IDR: [u8; 3] = [0x65, 0x88, 0x84];
+
+    fn access_unit(units: &[&[u8]]) -> Vec<u8> {
+        length_prefixed(units).expect("framing")
+    }
+
+    #[test]
+    fn idr_marks_the_sample_as_a_keyframe() {
+        let units = access_unit(&[&SEQUENCE, &PICTURE, &IDR]);
+
+        let sample = Sample::from_access_unit(&units, 1_500, false)
+            .expect("sample")
+            .expect("non-empty access unit");
+
+        assert_eq!(sample.timestamp_ms, 1_500);
+        assert!(sample.keyframe);
+        assert_eq!(sample.data, with_centered_chroma(&units).expect("centered"));
+    }
+
+    #[test]
+    fn a_non_idr_access_unit_keeps_the_platform_keyframe_flag() {
+        let units = access_unit(&[&SEQUENCE, &PICTURE, &[0x41, 0x9A]]);
+
+        assert!(
+            !Sample::from_access_unit(&units, 0, false)
+                .expect("sample")
+                .expect("non-empty access unit")
+                .keyframe
+        );
+        assert!(
+            Sample::from_access_unit(&units, 0, true)
+                .expect("sample")
+                .expect("non-empty access unit")
+                .keyframe
+        );
+    }
+
+    #[test]
+    fn an_empty_access_unit_produces_no_sample() {
+        assert!(
+            Sample::from_access_unit(&[], 0, false)
+                .expect("empty")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn truncated_framing_is_rejected() {
+        assert!(matches!(
+            Sample::from_access_unit(&[0, 0, 0], 0, false),
+            Err(ContainerError::InvalidContainer)
+        ));
+        assert!(matches!(
+            Sample::from_access_unit(&[0, 0, 0, 8, 0x65], 0, false),
+            Err(ContainerError::InvalidContainer)
+        ));
+    }
+}

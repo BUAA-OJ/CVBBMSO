@@ -12,11 +12,18 @@ pub(crate) use sampling::{SampledFrame, run};
 #[cfg(windows)]
 mod windows;
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 #[cfg(windows)]
 #[allow(unused_imports)] // Wired into `Recorder::start` with the capture milestone.
 pub(crate) use windows::Desktop;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+#[allow(unused_imports)] // Wired into `Recorder::start` with the capture milestone.
+pub(crate) use macos::Desktop;
+
+#[cfg(not(any(windows, target_os = "macos")))]
 #[allow(unused_imports)] // Wired into `Recorder::start` with the capture milestone.
 pub(crate) use unsupported::Desktop;
 
@@ -25,6 +32,44 @@ pub(crate) struct Frame {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) pixels: Vec<u8>,
+}
+
+impl Frame {
+    /// Packs rows of padded BGRA pixels into a tightly packed frame.
+    ///
+    /// Platform surfaces carry a row pitch that can exceed the visible width;
+    /// only the first `width * 4` bytes of each row belong to the image. Returns
+    /// `None` when the pitch cannot hold a row, when `pixels` is shorter than
+    /// `pitch * height`, or when the dimensions are zero.
+    pub(crate) fn from_padded_bgra(
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        pitch: usize,
+    ) -> Option<Self> {
+        const BGRA: usize = 4;
+
+        let columns = usize::try_from(width).ok()?;
+        let rows = usize::try_from(height).ok()?;
+        let row_bytes = columns.checked_mul(BGRA)?;
+        if columns == 0 || rows == 0 || pitch < row_bytes {
+            return None;
+        }
+        let length = pitch.checked_mul(rows)?;
+        let capacity = row_bytes.checked_mul(rows)?;
+        if pixels.len() < length {
+            return None;
+        }
+        let mut packed = Vec::with_capacity(capacity);
+        for row in pixels[..length].chunks_exact(pitch) {
+            packed.extend_from_slice(&row[..row_bytes]);
+        }
+        Some(Self {
+            width,
+            height,
+            pixels: packed,
+        })
+    }
 }
 
 /// Rotation the desktop applies to the captured surface.
@@ -90,7 +135,7 @@ pub(crate) fn rotate(
     (rotated, out_width, out_height)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 mod unsupported {
     use super::Frame;
     use crate::RecordingError;
@@ -102,7 +147,7 @@ mod unsupported {
         /// # Errors
         ///
         /// Always returns [`RecordingError::Platform`].
-        pub(crate) fn open() -> Result<Self, RecordingError> {
+        pub(crate) fn open(_fps: u32) -> Result<Self, RecordingError> {
             Err(RecordingError::Platform(None))
         }
 
@@ -123,7 +168,7 @@ mod unsupported {
 
 #[cfg(test)]
 mod tests {
-    use super::{Rotation, rotate};
+    use super::{Frame, Rotation, rotate};
 
     /// A 2x3 image whose pixels encode their own coordinates: `x | y << 4`.
     fn source() -> (Vec<u8>, u32, u32) {
@@ -178,5 +223,41 @@ mod tests {
     #[test]
     fn mismatched_length_is_rejected() {
         assert_eq!(rotate(&[0, 0, 0], 2, 3, Rotation::None), (Vec::new(), 0, 0));
+    }
+
+    #[test]
+    fn padded_rows_are_packed_without_the_padding() {
+        // Two 2-pixel rows with a three-byte tail of platform padding each.
+        let pixels = [
+            1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, //
+            9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0,
+        ];
+
+        let frame = Frame::from_padded_bgra(&pixels, 2, 2, 11).expect("frame");
+
+        assert_eq!(frame.width, 2);
+        assert_eq!(frame.height, 2);
+        assert_eq!(
+            frame.pixels,
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+    }
+
+    #[test]
+    fn a_tight_pitch_keeps_every_byte() {
+        let pixels: Vec<u8> = (1..=8).collect();
+
+        let frame = Frame::from_padded_bgra(&pixels, 2, 1, 8).expect("frame");
+
+        assert_eq!(frame.pixels, pixels);
+    }
+
+    #[test]
+    fn unpadded_and_short_rows_are_rejected() {
+        assert!(Frame::from_padded_bgra(&[0; 12], 4, 1, 12).is_none());
+        assert!(Frame::from_padded_bgra(&[0; 4], 2, 2, 8).is_none());
+        assert!(Frame::from_padded_bgra(&[], 0, 1, 8).is_none());
+        assert!(Frame::from_padded_bgra(&[], 2, 0, 8).is_none());
+        assert!(Frame::from_padded_bgra(&[], u32::MAX, 1, usize::MAX).is_none());
     }
 }

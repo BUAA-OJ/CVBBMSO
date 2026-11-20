@@ -7,15 +7,22 @@
 #[cfg(windows)]
 mod windows;
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 #[cfg(windows)]
 #[allow(unused_imports)] // Wired into `Recorder::start` with the encoding milestone.
-pub(crate) use windows::available_encoders;
+pub(crate) use windows::{DEFAULT_BITRATE, Encoder, available_encoders};
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+#[allow(unused_imports)] // Wired into `Recorder::start` with the encoding milestone.
+pub(crate) use macos::{DEFAULT_BITRATE, Encoder, available_encoders};
+
+#[cfg(not(any(windows, target_os = "macos")))]
 #[allow(unused_imports)] // Wired into `Recorder::start` with the encoding milestone.
 pub(crate) use unsupported::available_encoders;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 mod unsupported {
     use crate::RecordingError;
 
