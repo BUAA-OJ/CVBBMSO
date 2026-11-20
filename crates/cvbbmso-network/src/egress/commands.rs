@@ -568,6 +568,7 @@ pub(crate) mod testing {
         pub(crate) calls: RefCell<Vec<Call>>,
         pub(crate) files: RefCell<HashMap<String, String>>,
         replies: RefCell<Replies>,
+        times: RefCell<VecDeque<u64>>,
     }
 
     impl Recorder {
@@ -586,6 +587,10 @@ pub(crate) mod testing {
 
         pub(crate) fn contents(&self, path: &str) -> Option<String> {
             self.files.borrow().get(path).cloned()
+        }
+
+        pub(crate) fn times(&self, times: impl IntoIterator<Item = u64>) {
+            self.times.borrow_mut().extend(times);
         }
 
         pub(crate) fn reply(&self, args: &[&str], result: Result<&str, NetworkError>) {
@@ -619,7 +624,7 @@ pub(crate) mod testing {
 
     impl Commands for Recorder {
         fn unix_seconds(&self) -> Result<u64, NetworkError> {
-            Ok(1_800_000_000)
+            Ok(self.times.borrow_mut().pop_front().unwrap_or(1_800_000_000))
         }
 
         fn run(&self, program: &str, args: &[&str]) -> Result<(), NetworkError> {

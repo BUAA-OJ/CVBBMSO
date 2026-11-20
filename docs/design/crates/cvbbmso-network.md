@@ -110,7 +110,9 @@ Windows 使用 WinINet、WinHTTP 与代理环境变量；macOS 使用 SystemConf
 
 macOS 在 PF 已清理但 launchd 任务状态未确认时保留受保护的 `egress-cleanup.pending`，记录需要卸载的任务。仍在运行的看门狗、下一次计划任务或新版安装只对该标识重试。CLI 超时本身无法撤销 launchd 已收到的请求。
 
-PF 启用前保存引用快照，子进程在执行 `pfctl -E` 前将自己的 PID 写入 `pf.enable.capture`，随后在同一文件捕获原始输出。核对完整令牌行与内核中的 PF 引用归属后，将文件原子改名为旧 helper 使用的 `pf.enable`。客户端在改名前退出时，旧 helper 可以清理 anchor、所有者记录和恢复任务，启用记录留给新版恢复或下一次新版安装。没有完整令牌且内核仍列出引用时，新版保留记录并报告清理失败。内核可能复用引用令牌。释放前记录 PID、进程名和创建时间，再次释放前核对这些记录。若数字已分给另一引用，保留新引用。归属无法确认时保留故障记录。PF 的释放接口按令牌操作，无法原子核对其他字段。 [Apple XNU 的 PF 引用实现](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/pf_ioctl.c)
+PF 启用前保存引用快照，子进程在执行 `pfctl -E` 前将自己的 PID 写入 `pf.enable.capture`，随后在同一文件捕获原始输出。核对完整令牌行与内核中的 PF 引用归属后，将文件原子改名为旧 helper 使用的 `pf.enable`。采样无法确认引用创建时间时，启动失败，完整捕获留待后续精确采样。客户端在改名前退出时，旧 helper 可以清理 anchor、所有者记录和恢复任务，启用记录留给新版恢复或下一次新版安装。没有完整令牌且内核仍列出引用时，新版保留记录并报告清理失败。
+
+新版开始清理时原子移走 `pf.enable`，避免旧 helper 接手续跑新版已发出的释放操作。释放前记录 PID、进程名和创建时间，再次释放前核对这些记录。内核把同一数值令牌分给另一引用时，保留新引用。归属无法确认时保留故障记录。PF 的释放接口按令牌操作，无法原子核对其他字段。 [Apple XNU 的 PF 引用实现](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/pf_ioctl.c)
 
 新版 guard 在改动 PF 或登记任务前，以有界命令探测 helper 的 `--capabilities`。确认响应 `cvbbmso-egress-leases-v2` 后，每个租约分配新代次，使用唯一的 launchd 标识和一次写入的 plist 路径。持续运行和计划恢复都携带代次。任务在锁内核对当前所有者，过期任务只能清自己的任务文件和标识。旧接口 `--watch PID`、`--recover` 及旧租约状态仍可用。
 

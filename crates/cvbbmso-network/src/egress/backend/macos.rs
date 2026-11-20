@@ -28,6 +28,7 @@ const TOKEN: &str = "/Library/Application Support/com.cvbbmso/pf.enable";
 const ENABLE_BASELINE: &str = "/Library/Application Support/com.cvbbmso/pf.enable.before";
 const ENABLE_CAPTURE: &str = "/Library/Application Support/com.cvbbmso/pf.enable.capture";
 const ENABLE_OWNER: &str = "/Library/Application Support/com.cvbbmso/pf.enable.owner";
+const ENABLE_RELEASING: &str = "/Library/Application Support/com.cvbbmso/pf.enable.releasing";
 const PFCTL: &str = "/sbin/pfctl";
 const REFERENCES: &[&str] = &["-s", "References"];
 const ROOT_RULE: &str = "anchor \"com.cvbbmso.egress\" all";
@@ -80,8 +81,18 @@ impl GuardBackend for PfGuard {
         let commands = crate::egress::commands::SystemCommands::new(Some(&lock));
         let mut watchdog = self.watchdog.lock().map_err(|_| NetworkError::Platform)?;
         if let Some(running) = watchdog.as_mut() {
-            if running.owns_state()? {
-                lifecycle::recover_job(&commands, &running.job)?;
+            match state::read(&commands)? {
+                Some(state) if running.owns(&state) => {
+                    lifecycle::recover_job(&commands, &running.job)?;
+                }
+                None => {
+                    lifecycle::recover_without_owner(
+                        &commands,
+                        &running.job,
+                        Some(std::process::id()),
+                    )?;
+                }
+                _ => {}
             }
             running.stop();
             *watchdog = None;
@@ -312,7 +323,7 @@ fn enable_pf(commands: &dyn Commands) -> Result<(), NetworkError> {
     let pid = capture_pid(&capture).ok_or(NetworkError::Io)?;
     let references = reference_list(commands)?;
     let owner = references.get(&token).ok_or(NetworkError::Platform)?;
-    if before.contains(&token) || !owner.matches_capture(Some(pid)) {
+    if before.contains(&token) || !owner.matches_capture(Some(pid)) || !owner.exact_start() {
         return Err(NetworkError::Io);
     }
     write_reference_owner(commands, token, owner)?;
@@ -346,19 +357,37 @@ fn recover_with(commands: &dyn Commands) -> Result<(), NetworkError> {
     }
 
     recover_reference(commands)?;
-    for path in [ENABLE_CAPTURE, TOKEN, ENABLE_OWNER, ENABLE_BASELINE, RULES] {
+    for path in [
+        ENABLE_CAPTURE,
+        ENABLE_RELEASING,
+        ENABLE_OWNER,
+        ENABLE_BASELINE,
+        RULES,
+    ] {
         commands.remove(path)?;
     }
     Ok(())
 }
 
 fn recover_reference(commands: &dyn Commands) -> Result<(), NetworkError> {
-    let journal = commands.read(TOKEN)?;
-    let capture = commands.read(ENABLE_CAPTURE)?;
+    let (contents, journal) = match (
+        commands.read(TOKEN)?,
+        commands.read(ENABLE_CAPTURE)?,
+        commands.read(ENABLE_RELEASING)?,
+    ) {
+        (Some(canonical), None, None) => {
+            // Old helpers read this path without checking ownership. Once a
+            // new helper starts release, only the new retry path may see it.
+            commands.publish(TOKEN, ENABLE_RELEASING)?;
+            (canonical, ENABLE_RELEASING)
+        }
+        (None, Some(capture), None) => (capture, ENABLE_CAPTURE),
+        (None, None, Some(releasing)) => (releasing, ENABLE_RELEASING),
+        (None, None, None) => return Ok(()),
+        _ => return Err(NetworkError::Io),
+    };
     let baseline = commands.read(ENABLE_BASELINE)?;
-    let canonical = journal.as_deref().and_then(complete_token);
-    let captured = capture.as_deref().and_then(complete_token);
-    if capture.is_some() && (journal.is_some() || baseline.is_none()) {
+    if journal == ENABLE_CAPTURE && baseline.is_none() {
         return Err(NetworkError::Io);
     }
     let before = baseline
@@ -366,7 +395,7 @@ fn recover_reference(commands: &dyn Commands) -> Result<(), NetworkError> {
         .map(serde_json::from_str::<BTreeSet<u64>>)
         .transpose()
         .map_err(|_| NetworkError::Io)?;
-    if let Some(token) = canonical.or(captured) {
+    if let Some(token) = complete_token(&contents) {
         if before
             .as_ref()
             .is_some_and(|tokens| tokens.contains(&token))
@@ -377,14 +406,12 @@ fn recover_reference(commands: &dyn Commands) -> Result<(), NetworkError> {
                 Ok(())
             };
         }
-        let pid = canonical
-            .and_then(|_| journal.as_deref().and_then(capture_pid))
-            .or_else(|| capture.as_deref().and_then(capture_pid));
+        let pid = capture_pid(&contents);
         if before.is_some() && pid.is_none() {
             return Err(NetworkError::Io);
         }
-        release_reference(commands, token, pid)?;
-    } else if (journal.is_some() || capture.is_some()) && !reference_list(commands)?.is_empty() {
+        release_reference(commands, token, pid, journal)?;
+    } else if !reference_list(commands)?.is_empty() {
         // DIOCSTARTREF may have committed before pfctl printed its token.
         // Even a baseline token could have been released and recycled.
         return Err(NetworkError::Io);
@@ -396,6 +423,7 @@ fn release_reference(
     commands: &dyn Commands,
     token: u64,
     pid: Option<u32>,
+    journal: &str,
 ) -> Result<(), NetworkError> {
     let references = reference_list(commands)?;
     let Some(current) = references.get(&token) else {
@@ -415,10 +443,15 @@ fn release_reference(
         if !current.matches_capture(pid) {
             return Ok(());
         }
+        // A later reading may resolve this sampling window. Don't store an
+        // ambiguous first observation or run a release before it is exact.
+        if !current.exact_start() {
+            return Err(NetworkError::Io);
+        }
         if pid.is_none() {
             // Older helpers never recorded a process identity, but their
             // original token file must have been written after acquisition.
-            let written = commands.modified_seconds(TOKEN)?;
+            let written = commands.modified_seconds(journal)?;
             if current.earliest_start > written {
                 return Ok(());
             }
@@ -468,7 +501,8 @@ fn write_reference_owner(
 fn has_enable_record(commands: &dyn Commands) -> Result<bool, NetworkError> {
     Ok(commands.read(ENABLE_BASELINE)?.is_some()
         || commands.read(ENABLE_CAPTURE)?.is_some()
-        || commands.read(ENABLE_OWNER)?.is_some())
+        || commands.read(ENABLE_OWNER)?.is_some()
+        || commands.read(ENABLE_RELEASING)?.is_some())
 }
 
 #[derive(Deserialize, Serialize)]
@@ -492,9 +526,11 @@ impl ReferenceOwner {
     }
 
     fn definitely_matches(&self, other: &Self) -> bool {
+        self.exact_start() && other.exact_start() && !self.distinct_from(other)
+    }
+
+    fn exact_start(&self) -> bool {
         self.earliest_start == self.latest_start
-            && other.earliest_start == other.latest_start
-            && !self.distinct_from(other)
     }
 }
 
@@ -816,30 +852,37 @@ mod tests {
         recorder.reply(&["-X", "42"], Err(NetworkError::Io));
         recorder.reply(REFERENCES, Ok(""));
         assert_eq!(recover_with(&recorder), Err(NetworkError::Platform));
-        assert_eq!(read_token(&recorder).unwrap(), Some(42));
+        assert!(read_token(&recorder).unwrap().is_none());
+        assert_eq!(
+            recorder.contents(ENABLE_RELEASING).as_deref(),
+            Some("Token : 42\n")
+        );
         assert!(recorder.contents(ENABLE_OWNER).is_some());
     }
 
     #[test]
     fn a_release_that_committed_before_timeout_does_not_replay_on_a_recycled_token() {
-        let recorder = Recorder::with_file(TOKEN, "Token : 42\n");
-        recorder.reply(REFERENCES, Ok(PROJECT_REFERENCE));
-        recorder.reply(&["-X", "42"], Err(NetworkError::Io));
-        recorder.reply(REFERENCES, Err(NetworkError::Io));
-        assert_eq!(recover_with(&recorder), Err(NetworkError::Io));
-        assert!(recorder.contents(ENABLE_OWNER).is_some());
-
         for recycled in [
             "101 Host Firewall 42 0 days 00:00:00\n",
             "202 pfctl 42 0 days 00:00:00\n",
         ] {
+            let recorder = Recorder::with_file(TOKEN, "Token : 42\n");
+            recorder.reply(REFERENCES, Ok(PROJECT_REFERENCE));
+            recorder.reply(&["-X", "42"], Err(NetworkError::Io));
+            recorder.reply(REFERENCES, Err(NetworkError::Io));
+            assert_eq!(recover_with(&recorder), Err(NetworkError::Io));
+            // An older watchdog can no longer see the token at its old path.
+            assert!(recorder.contents(TOKEN).is_none());
+            assert!(recorder.contents(ENABLE_RELEASING).is_some());
+            assert!(recorder.contents(ENABLE_OWNER).is_some());
             recorder.reply(
                 REFERENCES,
                 Ok(&format!(
                     "TOKENS:\nPID Process Name TOKEN TIMESTAMP\n{recycled}"
                 )),
             );
-            release_reference(&recorder, 42, None).unwrap();
+            recover_with(&recorder).unwrap();
+            assert!(!has_enable_record(&recorder).unwrap());
             let releases = recorder
                 .calls()
                 .into_iter()
@@ -866,7 +909,8 @@ mod tests {
         write_reference_owner(&recorder, 42, &owner).unwrap();
         recorder.reply(REFERENCES, Ok(PROJECT_REFERENCE));
         assert_eq!(recover_with(&recorder), Err(NetworkError::Io));
-        assert!(recorder.contents(TOKEN).is_some());
+        assert!(recorder.contents(TOKEN).is_none());
+        assert!(recorder.contents(ENABLE_RELEASING).is_some());
         assert!(recorder.contents(ENABLE_OWNER).is_some());
         assert!(
             recorder
@@ -874,6 +918,54 @@ mod tests {
                 .iter()
                 .all(|call| matches!(call, Call::Output(..)))
         );
+    }
+
+    #[test]
+    fn an_inexact_enable_snapshot_does_not_publish_and_can_be_recovered_later() {
+        let recorder = Recorder::default();
+        let now = recorder.unix_seconds().unwrap();
+        recorder.times([
+            now,
+            now,
+            now,
+            now + 1,
+            now + 2,
+            now + 3,
+            now + 4,
+            now + 5,
+            now + 6,
+            now + 6,
+        ]);
+        recorder.reply(REFERENCES, Ok(HOST_REFERENCE));
+        for _ in 0..5 {
+            recorder.reply(REFERENCES, Ok(BOTH_REFERENCES));
+        }
+        recorder.reply(&["-E"], Ok("Token : 42\n"));
+
+        assert_eq!(enable_pf(&recorder), Err(NetworkError::Io));
+        assert!(recorder.contents(TOKEN).is_none());
+        assert!(recorder.contents(ENABLE_OWNER).is_none());
+        assert!(recorder.contents(ENABLE_CAPTURE).is_some());
+        assert_eq!(recover_with(&recorder), Err(NetworkError::Io));
+        assert!(recorder.contents(ENABLE_OWNER).is_none());
+        assert!(
+            recorder
+                .calls()
+                .iter()
+                .all(|call| matches!(call, Call::Output(..)))
+        );
+
+        recover_with(&recorder).unwrap();
+        let releases = recorder
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Run(_, args) => Some(args),
+                Call::Output(..) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(releases, [vec!["-X", "42"]]);
+        assert!(!has_enable_record(&recorder).unwrap());
     }
 
     #[test]

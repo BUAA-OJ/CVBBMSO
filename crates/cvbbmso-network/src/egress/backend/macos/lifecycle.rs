@@ -138,11 +138,6 @@ impl Watchdog {
         Ok(Self { child, job })
     }
 
-    pub(super) fn owns_state(&self) -> Result<bool, NetworkError> {
-        let commands = SystemCommands::new(None);
-        Ok(state::read(&commands)?.is_some_and(|state| self.owns(&state)))
-    }
-
     pub(super) fn check(&mut self) -> Result<GuardState, NetworkError> {
         let state = state::read(&SystemCommands::new(None))?
             .filter(|state| self.owns(state) && !state.expired())
@@ -158,7 +153,7 @@ impl Watchdog {
         Ok(state)
     }
 
-    fn owns(&self, state: &GuardState) -> bool {
+    pub(super) fn owns(&self, state: &GuardState) -> bool {
         state.parent == std::process::id()
             && state.watchdog == self.child.id()
             && matches_job(state, &self.job)
@@ -267,7 +262,7 @@ fn recovery_tick_with(
     Ok(recover_now)
 }
 
-fn recover_without_owner(
+pub(super) fn recover_without_owner(
     commands: &dyn Commands,
     job: &Job,
     parent: Option<u32>,
