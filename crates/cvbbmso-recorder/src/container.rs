@@ -1,7 +1,6 @@
 //! Matroska container support for sealed recording segments.
 
-// The capture and encoding pipeline consumes this module once its milestone
-// lands; until then the container is reached only from tests.
+// Annex B and container inspection helpers have platform-specific consumers.
 #![allow(dead_code)]
 
 mod avc;
@@ -15,7 +14,6 @@ pub(crate) use avc::{AvcConfig, with_centered_chroma};
 #[cfg(windows)]
 pub(crate) use avc::{annex_b_nals, length_prefixed, nal_type};
 pub(crate) use mkv::MkvFile;
-#[allow(unused_imports)] // Wired into the capture pipeline with M5.
 pub(crate) use mkv::MkvWriter;
 pub(crate) use mp4::Mp4Writer;
 
@@ -87,6 +85,12 @@ pub(crate) struct Sample {
 }
 
 impl Sample {
+    pub(crate) fn is_idr(&self) -> Result<bool, ContainerError> {
+        Ok(avc::length_prefixed_nals(&self.data)?
+            .iter()
+            .any(|unit| avc::nal_type(unit) == 5))
+    }
+
     /// Normalises one H.264 access unit in four-byte length-prefixed form.
     ///
     /// `VideoToolbox` and other platform encoders hand back access units framed

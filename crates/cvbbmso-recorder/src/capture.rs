@@ -1,21 +1,20 @@
 //! Primary-display capture.
 
-// `Recorder::start` reaches this module once the capture pipeline is wired; the
-// platform test exercises it until then.
-#![allow(dead_code)]
-
+#[cfg(any(test, target_os = "macos"))]
 use std::{
     io,
     sync::{Condvar, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 
+#[cfg(any(test, target_os = "macos"))]
 use crate::RecordingError;
 
 mod sampling;
 
-#[allow(unused_imports)] // Consumed by the encoder pipeline in the next milestone.
-pub(crate) use sampling::{SampledFrame, run};
+#[cfg(all(test, any(windows, target_os = "macos")))]
+pub(crate) use sampling::run;
+pub(crate) use sampling::{SampledFrame, run_started};
 
 #[cfg(windows)]
 mod windows;
@@ -24,16 +23,13 @@ mod windows;
 mod macos;
 
 #[cfg(windows)]
-#[allow(unused_imports)] // Wired into `Recorder::start` with the capture milestone.
-pub(crate) use windows::Desktop;
+use windows::Desktop;
 
 #[cfg(target_os = "macos")]
-#[allow(unused_imports)] // Wired into `Recorder::start` with the capture milestone.
-pub(crate) use macos::Desktop;
+use macos::Desktop;
 
 #[cfg(not(any(windows, target_os = "macos")))]
-#[allow(unused_imports)] // Wired into `Recorder::start` with the capture milestone.
-pub(crate) use unsupported::Desktop;
+use unsupported::Desktop;
 
 /// One captured frame in BGRA byte order, already in its viewing orientation.
 pub(crate) struct Frame {
@@ -48,6 +44,7 @@ pub(crate) struct Frame {
 /// sampler pulls them. Keeping only the newest image means a slow consumer can
 /// never read a stale frame after a newer one was produced, and a still screen
 /// cannot strand the last change behind an unconsumed older image.
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) struct FrameSlot {
     state: Mutex<SlotState>,
     ready: Condvar,
@@ -55,11 +52,13 @@ pub(crate) struct FrameSlot {
 
 /// Contents of a [`FrameSlot`].
 #[derive(Default)]
+#[cfg(any(test, target_os = "macos"))]
 struct SlotState {
     frame: Option<Frame>,
     stopped: Option<String>,
 }
 
+#[cfg(any(test, target_os = "macos"))]
 impl FrameSlot {
     /// Creates an empty slot.
     pub(crate) fn new() -> Self {
@@ -128,6 +127,7 @@ impl FrameSlot {
 
 /// Rotation the desktop applies to the captured surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(any(windows, test))]
 pub(crate) enum Rotation {
     /// The surface already matches the viewing orientation.
     None,
@@ -136,9 +136,11 @@ pub(crate) enum Rotation {
     /// The surface must be turned 180 degrees.
     Half,
     /// The surface must be turned 270 degrees clockwise.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Clockwise270,
 }
 
+#[cfg(any(windows, test))]
 impl Rotation {
     /// Returns whether the rotation swaps the image axes.
     const fn swaps_axes(self) -> bool {
@@ -150,6 +152,7 @@ impl Rotation {
 ///
 /// Returns an empty image when `pixels` does not describe `width * height` BGRA
 /// pixels.
+#[cfg(any(windows, test))]
 pub(crate) fn rotate(
     pixels: &[u8],
     width: u32,

@@ -11,6 +11,8 @@ use super::{Recorder, State};
 use crate::container::{AvcConfig, MkvWriter, Sample};
 use crate::{RecorderEvent, RecordingError, store::SegmentStore};
 
+mod pipeline;
+
 const SEQUENCE: [u8; 24] = [
     0x67, 0x4D, 0x40, 0x15, 0x95, 0xA0, 0x50, 0x7E, 0x84, 0, 0, 3, 0, 4, 0, 0, 3, 0, 0x78, 0x36,
     0x82, 0x21, 0x1A, 0x80,
@@ -138,6 +140,7 @@ async fn open_reports_restored_segments_in_order() {
 }
 
 #[tokio::test]
+#[cfg(not(any(windows, target_os = "macos")))]
 async fn start_reports_the_platform_error() {
     let (mut recorder, _events, _directory) = open_empty().await;
 
@@ -145,14 +148,6 @@ async fn start_reports_the_platform_error() {
         recorder.start().await,
         Err(RecordingError::Platform(_))
     ));
-}
-
-#[tokio::test]
-async fn start_is_idempotent_while_capturing() {
-    let (mut recorder, _events, _directory) = open_empty().await;
-    recorder.state = State::Capturing;
-
-    assert!(recorder.start().await.is_ok());
 }
 
 #[tokio::test]

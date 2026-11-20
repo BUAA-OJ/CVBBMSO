@@ -1,8 +1,5 @@
 //! Sealed segment files of one candidate recording.
 
-// Capture-side entry points are wired in the next commit.
-#![allow(dead_code)]
-
 mod lock;
 mod merge;
 mod recovery;

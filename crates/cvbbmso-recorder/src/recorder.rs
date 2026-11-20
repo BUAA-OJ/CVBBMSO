@@ -1,17 +1,29 @@
 //! Recording lifecycle: opening a candidate, capturing, stopping, and finishing.
 
+mod events;
+mod worker;
+
 use std::{
     ffi::OsStr,
     io,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use cvbbmso_protocol::{RecordingManifest, RecordingPolicy};
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::{
+    mpsc::{self, Receiver},
+    oneshot,
+};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::{RecorderEvent, RecordingError, store::SegmentStore};
+use events::Events;
+use worker::{Job, Outcome};
 
 /// Capacity reserved for live events beyond the restored segments.
 const EVENT_BUFFER: usize = 16;
@@ -19,23 +31,48 @@ const EVENT_BUFFER: usize = 16;
 /// Recorder of one candidate in one exam.
 pub struct Recorder {
     store: SegmentStore,
-    events: Sender<RecorderEvent>,
+    policy: RecordingPolicy,
+    events: Arc<Events>,
     state: State,
+    #[cfg(test)]
+    driver: Option<TestDriver>,
 }
+
+#[cfg(test)]
+type TestDriver = Box<dyn FnOnce(Job, &AtomicBool, oneshot::Sender<()>) -> Outcome + Send>;
 
 /// Lifecycle position of a recorder, as described by the crate document.
 enum State {
     /// The directory is open and no capture is running.
     Opened,
     /// Capture is running.
-    #[allow(dead_code)] // Entered once the capture backend lands.
-    Capturing,
+    Capturing(CaptureTask),
     /// The last capture or finish attempt failed; the recorder can retry.
     Failed,
+    /// A worker exited without returning the latest sealed-segment state.
+    Interrupted,
     /// The recorder owns the merge even if its caller stops awaiting it.
     Finalizing(JoinHandle<Result<RecordingManifest, RecordingError>>),
     /// Finishing succeeded; the manifest is cached so repeated calls agree.
     Complete(RecordingManifest),
+}
+
+struct CaptureTask {
+    stop: Arc<AtomicBool>,
+    task: JoinHandle<Outcome>,
+    startup: Startup,
+}
+
+enum Startup {
+    Pending(oneshot::Receiver<()>),
+    Ready,
+    Failed,
+}
+
+impl Drop for CaptureTask {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
 }
 
 impl Recorder {
@@ -49,14 +86,17 @@ impl Recorder {
     ///
     /// Returns [`RecordingError::Io`] when `candidate_dir` does not end in
     /// `<exam_id>/<oj_user_id>`, when the recording directory cannot be created,
+    /// when a second recorder owns that directory, when the policy is invalid,
     /// or when an existing segment cannot be read.
     pub async fn open(
         exam_id: Uuid,
         oj_user_id: i64,
         candidate_dir: PathBuf,
-        _policy: RecordingPolicy,
+        policy: RecordingPolicy,
     ) -> Result<(Self, Receiver<RecorderEvent>), RecordingError> {
         require_candidate_dir(&candidate_dir, exam_id, oj_user_id)?;
+        let policy = RecordingPolicy::new(policy.segment_duration_secs, policy.fps)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         // Recovery reads and hashes every sealed segment, so keep it off the
         // runtime worker instead of stalling unrelated tasks on disk latency.
         let directory = candidate_dir.clone();
@@ -67,15 +107,14 @@ impl Recorder {
         let (events, receiver) = mpsc::channel(restored.len() + EVENT_BUFFER);
         let recorder = Self {
             store,
-            events,
+            policy,
+            events: Events::new(events),
             state: State::Opened,
+            #[cfg(test)]
+            driver: None,
         };
         for meta in restored {
-            recorder
-                .events
-                .send(RecorderEvent::SegmentFinalized(meta))
-                .await
-                .map_err(|_| io::Error::other("recorder event receiver was closed"))?;
+            recorder.events.send(RecorderEvent::SegmentFinalized(meta));
         }
         Ok((recorder, receiver))
     }
@@ -84,15 +123,54 @@ impl Recorder {
     ///
     /// # Errors
     ///
-    /// Returns [`RecordingError::Platform`] until the capture backend lands.
-    /// Calling it while capture already runs succeeds without side effects;
-    /// calling it after a failure retries the capture.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // Signatures are fixed by the crate contract.
+    /// Returns the capture setup error when the desktop cannot be opened or the
+    /// recording has already been finalized. Once capture begins, faults are
+    /// delivered through [`RecorderEvent::Fault`]. Calling this while capture
+    /// runs is idempotent and calling it after a fault starts a new attempt.
     pub async fn start(&mut self) -> Result<(), RecordingError> {
-        if matches!(self.state, State::Capturing) {
-            return Ok(());
+        if let State::Capturing(capture) = &mut self.state {
+            if !capture.stop.load(Ordering::Acquire) {
+                if matches!(capture.startup, Startup::Pending(_) | Startup::Failed) {
+                    return self.await_capture_start().await;
+                }
+                if !capture.task.is_finished() {
+                    return Ok(());
+                }
+            }
+            self.wait_for_capture().await?;
         }
-        Err(RecordingError::Platform(None))
+        self.refresh_after_interruption().await?;
+        if matches!(self.state, State::Finalizing(_) | State::Complete(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a finalizing or completed recording cannot resume",
+            )
+            .into());
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_worker = Arc::clone(&stop);
+        let (ready, startup) = oneshot::channel();
+        let job = Job {
+            store: self.store.clone(),
+            policy: self.policy,
+            events: Arc::clone(&self.events),
+        };
+        #[cfg(test)]
+        let driver = self.driver.take();
+        let task = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(driver) = driver {
+                return driver(job, &stop_worker, ready);
+            }
+            job.platform(&stop_worker, ready)
+        });
+        self.state = State::Capturing(CaptureTask {
+            stop,
+            task,
+            startup: Startup::Pending(startup),
+        });
+        self.await_capture_start().await
     }
 
     /// Stops capture and seals the segment being recorded.
@@ -103,10 +181,14 @@ impl Recorder {
     ///
     /// # Errors
     ///
-    /// Returns [`RecordingError::Io`] when the pending segment cannot be sealed.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)] // Signatures are fixed by the crate contract.
+    /// Returns the drain or storage error when the pending segment cannot be sealed.
     pub async fn stop(&mut self) -> Result<(), RecordingError> {
-        if matches!(self.state, State::Capturing | State::Failed) {
+        if let State::Capturing(capture) = &self.state {
+            capture.stop.store(true, Ordering::Release);
+            self.wait_for_capture().await?;
+        }
+        self.refresh_after_interruption().await?;
+        if matches!(self.state, State::Failed) {
             self.state = State::Opened;
         }
         Ok(())
@@ -152,8 +234,14 @@ impl Recorder {
                         }
                     };
                 }
-                State::Opened | State::Capturing | State::Failed => {
+                State::Capturing(capture) => {
+                    capture.stop.store(true, Ordering::Release);
+                    self.wait_for_capture().await?;
+                }
+                State::Interrupted => self.refresh_after_interruption().await?,
+                State::Opened | State::Failed => {
                     if self.store.segments().is_empty() {
+                        self.state = State::Failed;
                         return Err(RecordingError::NoSegments);
                     }
                     let store = self.store.clone();
@@ -164,6 +252,49 @@ impl Recorder {
                 }
             }
         }
+    }
+
+    async fn await_capture_start(&mut self) -> Result<(), RecordingError> {
+        if let State::Capturing(capture) = &mut self.state {
+            if let Startup::Pending(ready) = &mut capture.startup {
+                capture.startup = if ready.await.is_ok() {
+                    Startup::Ready
+                } else {
+                    Startup::Failed
+                };
+            }
+            if matches!(capture.startup, Startup::Ready) {
+                return Ok(());
+            }
+        }
+        self.wait_for_capture().await
+    }
+
+    async fn wait_for_capture(&mut self) -> Result<(), RecordingError> {
+        let State::Capturing(capture) = &mut self.state else {
+            return Ok(());
+        };
+        let outcome = (&mut capture.task).await;
+        self.state = State::Interrupted;
+        let outcome = outcome.map_err(io::Error::other)?;
+        self.store = outcome.store;
+        self.state = if outcome.faulted {
+            State::Failed
+        } else {
+            State::Opened
+        };
+        outcome.result
+    }
+
+    async fn refresh_after_interruption(&mut self) -> Result<(), RecordingError> {
+        if matches!(self.state, State::Interrupted) {
+            let store = self.store.clone();
+            self.store = tokio::task::spawn_blocking(move || store.refresh())
+                .await
+                .map_err(io::Error::other)??;
+            self.state = State::Failed;
+        }
+        Ok(())
     }
 }
 
