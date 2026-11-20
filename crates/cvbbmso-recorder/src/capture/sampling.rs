@@ -45,7 +45,7 @@ pub(crate) struct SampledFrame {
 ///
 /// Rejects invalid policies before opening the backend. Returns platform capture
 /// failures and sink failures unchanged. The caller handles reporting the fault.
-#[cfg(all(test, any(windows, target_os = "macos")))]
+#[cfg(test)]
 pub(crate) fn run(
     policy: RecordingPolicy,
     stopped: &AtomicBool,
