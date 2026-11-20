@@ -5,26 +5,26 @@
     reason = "PF needs native privilege and interface queries"
 )]
 
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 
 use crate::NetworkError;
 use crate::egress::backend::{GuardBackend, InstallResult};
 use crate::egress::commands::Commands;
-use crate::egress::{
-    policy::{Plan, Transport},
-    state,
-};
+use crate::egress::{policy::Plan, state};
 
 mod lifecycle;
+mod rules;
 use lifecycle::Prepared;
 pub(crate) use lifecycle::{HELPER, watchdog_entry};
+use rules::Rules;
 
 const ANCHOR: &str = "com.cvbbmso.egress";
 const RULES: &str = "/Library/Application Support/com.cvbbmso/pf.rules";
 const TOKEN: &str = "/Library/Application Support/com.cvbbmso/pf.enable";
 const PFCTL: &str = "/sbin/pfctl";
-const ROOT_RULE: &str = "anchor \"com.cvbbmso.egress\" out quick all";
+const ROOT_RULE: &str = "anchor \"com.cvbbmso.egress\" out all";
 pub(crate) fn prepare() -> Result<(), NetworkError> {
     Prepared::new().map(drop)
 }
@@ -39,7 +39,7 @@ struct PfGuard {
 }
 
 struct Expected {
-    rendered: String,
+    rules: Rules,
     kernel: String,
 }
 
@@ -49,8 +49,8 @@ impl GuardBackend for PfGuard {
         let commands = crate::egress::commands::SystemCommands(Some(&lock));
         self.verify_owner()?;
         let mut expected = self.expected.lock().map_err(|_| NetworkError::Platform)?;
-        verify_with(&commands, &expected.kernel)?;
-        replace_with(&commands, &mut expected, render_rules(plan))
+        verify_with(&commands, &expected)?;
+        replace_with(&commands, &mut expected, Rules::new(plan), local_addresses)
     }
 
     fn verify(&self) -> Result<(), NetworkError> {
@@ -60,7 +60,7 @@ impl GuardBackend for PfGuard {
         let watchdog = watchdog.as_mut().ok_or(NetworkError::Platform)?;
         let mut guard_state = watchdog.check()?;
         let expected = self.expected.lock().map_err(|_| NetworkError::Platform)?;
-        verify_with(&commands, &expected.kernel)?;
+        verify_with(&commands, &expected)?;
         if guard_state.renewal_due() {
             crate::egress::cleanup::verify(&commands)?;
             guard_state.renew();
@@ -98,11 +98,11 @@ fn install_with(
     local: &[IpAddr],
 ) -> Result<Expected, NetworkError> {
     verify_deployment(commands)?;
-    let expected = stage(commands, render_rules(plan))?;
+    let expected = stage(commands, Rules::new(plan))?;
     load_anchor(commands)?;
     commands.capture(PFCTL, &["-E"], TOKEN)?;
     read_token(commands)?.ok_or(NetworkError::Platform)?;
-    verify_with(commands, &expected.kernel)?;
+    verify_with(commands, &expected)?;
     // A PF state predating the anchor would otherwise pass without matching
     // the new rules. Only remove states whose initiating address is local.
     for ip in local.iter().filter(|ip| !ip.is_loopback()) {
@@ -111,29 +111,56 @@ fn install_with(
     Ok(expected)
 }
 
-fn stage(commands: &dyn Commands, rendered: String) -> Result<Expected, NetworkError> {
-    commands.write(RULES, &rendered)?;
+fn stage(commands: &dyn Commands, rules: Rules) -> Result<Expected, NetworkError> {
+    commands.write(RULES, &rules.source)?;
     let output = commands.output(
         PFCTL,
         &["-a", ANCHOR, "-n", "-v", "-o", "none", "-f", RULES],
     )?;
-    let kernel = output.trim().to_owned();
-    if kernel.lines().last() != Some("block drop out quick all") {
+    let filter = output
+        .lines()
+        .filter(|line| !line.starts_with("table ") && !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    if filter.is_empty()
+        || filter
+            .iter()
+            .any(|line| !line.starts_with("block drop out quick "))
+    {
         return Err(NetworkError::Platform);
     }
-    Ok(Expected { rendered, kernel })
+    Ok(Expected {
+        rules,
+        kernel: filter.join("\n"),
+    })
 }
 
 fn replace_with(
     commands: &dyn Commands,
     expected: &mut Expected,
-    rendered: String,
+    rules: Rules,
+    local: impl FnOnce() -> Result<Vec<IpAddr>, NetworkError>,
 ) -> Result<(), NetworkError> {
-    if rendered != expected.rendered {
-        let next = stage(commands, rendered)?;
+    if rules != expected.rules {
+        let revoke = expected.rules.revoked_destinations(&rules);
+        let next = stage(commands, rules)?;
         load_anchor(commands)?;
-        if let Err(error) = verify_with(commands, &next.kernel) {
-            commands.write(RULES, &expected.rendered)?;
+        let checked = verify_with(commands, &next).and_then(|()| {
+            if !revoke.is_empty() {
+                // Host pass rules may have created states for previously
+                // allowed ports. PF checks those states before evaluating rules.
+                for source in local()?.into_iter().filter(|source| !source.is_loopback()) {
+                    for target in revoke.iter().filter(|ip| ip.is_ipv4() == source.is_ipv4()) {
+                        commands.run(
+                            PFCTL,
+                            &["-k", &source.to_string(), "-k", &target.to_string()],
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        });
+        if let Err(error) = checked {
+            commands.write(RULES, &expected.rules.source)?;
             load_anchor(commands)?;
             return Err(error);
         }
@@ -149,31 +176,74 @@ fn load_anchor(commands: &dyn Commands) -> Result<(), NetworkError> {
 fn verify_deployment(commands: &dyn Commands) -> Result<(), NetworkError> {
     let root = commands.output(PFCTL, &["-s", "rules"])?;
     let interfaces = commands.output(PFCTL, &["-vv", "-s", "Interfaces"])?;
+    let translations = commands.output(PFCTL, &["-a", "*", "-s", "nat"])?;
     let skipped = interfaces.lines().any(|line| {
         let mut words = line.split_whitespace();
         words.next().is_some_and(|name| name != "lo0") && words.any(|word| word == "(skip)")
     });
-    // An earlier terminal rule could skip the guard. A runtime root reload
-    // cannot restore unrelated live rules and children from the disk config.
-    if root.lines().next().map(str::trim) != Some(ROOT_RULE) || skipped {
+    let skips_filtering = translations.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        matches!(
+            (fields.next(), fields.next()),
+            (Some("nat" | "rdr" | "binat"), Some("pass"))
+        )
+    });
+    // Translation rules using 'pass' can terminate processing before the
+    // filter stage, even when the guard is the first filter rule.
+    if root.lines().next().map(str::trim) != Some(ROOT_RULE) || skipped || skips_filtering {
         return Err(NetworkError::Platform);
     }
     Ok(())
 }
 
-fn verify_with(commands: &dyn Commands, expected: &str) -> Result<(), NetworkError> {
+fn verify_with(commands: &dyn Commands, expected: &Expected) -> Result<(), NetworkError> {
     verify_deployment(commands)?;
     let info = commands.output(PFCTL, &["-s", "info"])?;
     let live = commands.output(PFCTL, &["-a", ANCHOR, "-s", "rules"])?;
     let reference = read_token(commands)?.ok_or(NetworkError::Platform)?;
     let references = commands.output(PFCTL, &["-s", "References"])?;
     if !info.lines().any(|line| line.starts_with("Status: Enabled"))
-        || live.trim() != expected
+        || live.trim() != expected.kernel
         || !has_reference(&references, reference)
     {
         return Err(NetworkError::Platform);
     }
+    let tables = commands.output(PFCTL, &["-a", ANCHOR, "-s", "Tables"])?;
+    if tables.split_whitespace().collect::<BTreeSet<_>>()
+        != expected.rules.tables.keys().map(String::as_str).collect()
+    {
+        return Err(NetworkError::Platform);
+    }
+    for (table, addresses) in &expected.rules.tables {
+        let live = commands.output(PFCTL, &["-a", ANCHOR, "-t", table, "-T", "show"])?;
+        let live = live
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(normalize_address)
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if &live != addresses {
+            return Err(NetworkError::Platform);
+        }
+    }
     Ok(())
+}
+
+fn normalize_address(address: &str) -> Result<String, NetworkError> {
+    let (ip, prefix) = match address.split_once('/') {
+        Some((ip, prefix)) => (
+            ip,
+            Some(prefix.parse::<u8>().map_err(|_| NetworkError::Platform)?),
+        ),
+        None => (address, None),
+    };
+    let ip = ip.parse::<IpAddr>().map_err(|_| NetworkError::Platform)?;
+    match prefix {
+        Some(prefix) if prefix != if ip.is_ipv4() { 32 } else { 128 } => {
+            Ok(format!("{ip}/{prefix}"))
+        }
+        _ => Ok(ip.to_string()),
+    }
 }
 
 fn read_token(commands: &dyn Commands) -> Result<Option<u64>, NetworkError> {
@@ -190,11 +260,17 @@ fn read_token(commands: &dyn Commands) -> Result<Option<u64>, NetworkError> {
 
 fn recover_with(commands: &dyn Commands) -> Result<(), NetworkError> {
     let live = commands.output(PFCTL, &["-a", ANCHOR, "-s", "rules"])?;
-    if !live.trim().is_empty() {
+    let tables = commands.output(PFCTL, &["-a", ANCHOR, "-s", "Tables"])?;
+    if !live.trim().is_empty() || !tables.trim().is_empty() {
         // A load always writes the protected journal before changing PF.
         // Existing rules without that journal cannot be attributed to us.
         commands.read(RULES)?.ok_or(NetworkError::Platform)?;
-        commands.run(PFCTL, &["-a", ANCHOR, "-F", "rules"])?;
+        if !live.trim().is_empty() {
+            commands.run(PFCTL, &["-a", ANCHOR, "-F", "rules"])?;
+        }
+        if !tables.trim().is_empty() {
+            commands.run(PFCTL, &["-a", ANCHOR, "-F", "Tables"])?;
+        }
     }
 
     if let Some(token) = read_token(commands)?
@@ -218,50 +294,6 @@ fn has_reference(output: &str, token: u64) -> bool {
             .and_then(|value| value.parse::<u64>().ok())
             == Some(token)
     })
-}
-
-/// Renders the complete PF rule set for `plan`.
-fn render_rules(plan: &Plan) -> String {
-    let mut rules = String::from("# cvbbmso egress guard\n");
-    rules.push_str("pass out quick on lo0 inet from any to 127.0.0.1 no state\npass out quick on lo0 inet6 from any to ::1 no state\n");
-
-    rules.push_str(concat!(
-        "pass out quick inet6 proto ipv6-icmp from any to ff02::2 icmp6-type routersol no state\n",
-        "pass out quick inet6 proto ipv6-icmp from any to ff02::1:ff00:0/104 icmp6-type neighbrsol no state\n",
-        "pass out quick inet6 proto ipv6-icmp from any to ff02::1 icmp6-type neighbradv no state\n",
-        "pass out quick inet6 proto ipv6-icmp from any to fe80::/10 icmp6-type { neighbrsol neighbradv } no state\n",
-    ));
-    for service in &plan.services {
-        let protocol = match service.transport {
-            Transport::Tcp => "tcp",
-            Transport::Udp => "udp",
-        };
-        push_pass(
-            &mut rules,
-            &service.remote.ip(),
-            service.remote.port(),
-            protocol,
-        );
-    }
-    for target in [&plan.accoding, &plan.server] {
-        for address in &target.addresses {
-            push_pass(&mut rules, address, target.port, "{ tcp udp }");
-        }
-    }
-    for address in &plan.certificate {
-        push_pass(&mut rules, &address.ip(), address.port(), "tcp");
-    }
-    rules.push_str("block drop out quick all\n");
-    rules
-}
-
-/// Appends one pass rule for TCP and UDP towards `address:port`.
-fn push_pass(rules: &mut String, address: &IpAddr, port: u16, protocol: &str) {
-    let family = if address.is_ipv4() { "inet" } else { "inet6" };
-    let rule = format!(
-        "pass out quick {family} proto {protocol} from any to {address} port {port} no state\n"
-    );
-    rules.push_str(&rule);
 }
 
 fn local_addresses() -> Result<Vec<IpAddr>, NetworkError> {
@@ -311,19 +343,21 @@ fn local_addresses() -> Result<Vec<IpAddr>, NetworkError> {
 mod tests {
     use super::*;
     use crate::egress::commands::testing::{Call, Recorder};
-    use crate::egress::policy::{Service, Target};
+    use crate::egress::policy::{Service, Target, Transport};
 
     const PF_CONF: &str = "/etc/pf.conf";
-    const BASE: &str = "# on-disk PF configuration\nanchor \"com.cvbbmso.egress\" out quick\n";
+    const BASE: &str = "# on-disk PF configuration\nanchor \"com.cvbbmso.egress\" out\n";
     const LIVE_ROOT: &str = concat!(
-        "anchor \"com.cvbbmso.egress\" out quick all\n",
+        "anchor \"com.cvbbmso.egress\" out all\n",
         "anchor \"system.keep/*\" all\n",
-        "block drop in on en0 all\n",
+        "block drop out quick inet proto tcp from any to 203.0.113.10 port = 443\n",
+        "pass out quick all\n",
     );
-    const BLOCK: &str = "block drop out quick all";
+    const BLOCK: &str = "block drop out quick from any to ! <cvbbmso_destinations>";
     const PARSE: &[&str] = &["-a", ANCHOR, "-n", "-v", "-o", "none", "-f", RULES];
     const LIVE: &[&str] = &["-a", ANCHOR, "-s", "rules"];
     const ROOT: &[&str] = &["-s", "rules"];
+    const TABLES: &[&str] = &["-a", ANCHOR, "-s", "Tables"];
 
     fn plan() -> Plan {
         let ip = |text: &str| text.parse::<IpAddr>().unwrap();
@@ -340,11 +374,21 @@ mod tests {
         )
     }
 
-    fn healthy(recorder: &Recorder, live: &str) {
+    fn healthy(recorder: &Recorder, live: &str, rules: &Rules) {
         recorder.reply(&["-s", "info"], Ok("Status: Enabled for 0 days"));
         recorder.reply(ROOT, Ok(LIVE_ROOT));
         recorder.reply(LIVE, Ok(live));
         recorder.reply(&["-s", "References"], Ok("202 pfctl 42 0 days"));
+        recorder.reply(
+            TABLES,
+            Ok(&rules.tables.keys().cloned().collect::<Vec<_>>().join("\n")),
+        );
+        for (name, addresses) in &rules.tables {
+            recorder.reply(
+                &["-a", ANCHOR, "-t", name, "-T", "show"],
+                Ok(&addresses.iter().cloned().collect::<Vec<_>>().join("\n")),
+            );
+        }
     }
 
     #[test]
@@ -353,7 +397,7 @@ mod tests {
         recorder.reply(ROOT, Ok(LIVE_ROOT));
         recorder.reply(PARSE, Ok(BLOCK));
         recorder.reply(&["-E"], Ok("pf enabled\nToken : 42\n"));
-        healthy(&recorder, BLOCK);
+        healthy(&recorder, BLOCK, &Rules::new(&plan()));
 
         let local = "192.0.2.123".parse().unwrap();
         install_with(&recorder, &plan(), &[local]).unwrap();
@@ -402,7 +446,7 @@ mod tests {
     fn a_rejected_anchor_refresh_leaves_the_current_rules() {
         let recorder = Recorder::with_file(TOKEN, "Token : 42\n");
         let mut expected = Expected {
-            rendered: BLOCK.to_owned(),
+            rules: Rules::new(&plan()),
             kernel: BLOCK.to_owned(),
         };
         recorder.reply(PARSE, Ok(BLOCK));
@@ -411,10 +455,15 @@ mod tests {
             Err(NetworkError::Platform),
         );
         assert_eq!(
-            replace_with(&recorder, &mut expected, format!("# next\n{BLOCK}")),
+            replace_with(
+                &recorder,
+                &mut expected,
+                Rules::new(&Plan::default()),
+                || Ok(Vec::new())
+            ),
             Err(NetworkError::Platform)
         );
-        assert_eq!(expected.rendered, BLOCK);
+        assert!(expected.rules == Rules::new(&plan()));
         let calls = recorder.calls();
         assert_eq!(calls.len(), 2);
         assert!(calls.iter().all(|call| match call {
@@ -425,29 +474,94 @@ mod tests {
 
     #[test]
     fn verification_detects_partial_rules_or_a_missing_enable_reference() {
+        let expected = Expected {
+            rules: Rules::new(&plan()),
+            kernel: BLOCK.to_owned(),
+        };
+
         let recorder = Recorder::with_file(TOKEN, "Token : 42\n");
-        healthy(&recorder, "pass out quick on lo0 all");
-        assert_eq!(verify_with(&recorder, BLOCK), Err(NetworkError::Platform));
-        healthy(&recorder, BLOCK);
-        assert_eq!(verify_with(&recorder, BLOCK), Ok(()));
-        healthy(&recorder, BLOCK);
+        healthy(&recorder, "pass out quick on lo0 all", &expected.rules);
+        assert_eq!(
+            verify_with(&recorder, &expected),
+            Err(NetworkError::Platform)
+        );
+
+        let recorder = Recorder::with_file(TOKEN, "Token : 42\n");
+        healthy(&recorder, BLOCK, &expected.rules);
+        assert_eq!(verify_with(&recorder, &expected), Ok(()));
+        healthy(&recorder, BLOCK, &expected.rules);
         recorder.remove(TOKEN).unwrap();
-        assert_eq!(verify_with(&recorder, BLOCK), Err(NetworkError::Platform));
+        assert_eq!(
+            verify_with(&recorder, &expected),
+            Err(NetworkError::Platform)
+        );
+
+        let recorder = Recorder::with_file(TOKEN, "Token : 42\n");
+        recorder.reply(
+            &["-a", ANCHOR, "-t", "cvbbmso_destinations", "-T", "show"],
+            Ok("192.0.2.99"),
+        );
+        healthy(&recorder, BLOCK, &expected.rules);
+        assert_eq!(
+            verify_with(&recorder, &expected),
+            Err(NetworkError::Platform)
+        );
     }
 
     #[test]
-    fn rules_parse_with_pf_and_keep_service_permissions_narrow() {
-        let rules = render_rules(&plan());
-        assert!(rules.contains("proto tcp from any to 192.0.2.53 port 53"));
-        assert!(rules.contains("proto udp from any to 192.0.2.53 port 53"));
-        assert!(rules.contains("proto udp from any to 192.0.2.67 port 67"));
-        assert!(rules.contains("proto udp from any to 192.0.2.123 port 123"));
-        assert!(rules.contains("proto tcp from any to 203.0.113.20 port 80"));
-        assert!(!rules.contains("to any port"));
-        assert!(!rules.contains("udp from any to 203.0.113.20"));
+    fn refresh_rechecks_states_for_revoked_destinations() {
+        let recorder = Recorder::with_file(TOKEN, "Token : 42\n");
+        let mut expected = Expected {
+            rules: Rules::new(&plan()),
+            kernel: BLOCK.to_owned(),
+        };
+        let mut next = plan();
+        next.services.retain(|service| service.remote.port() != 67);
+        let next = Rules::new(&next);
+        recorder.reply(PARSE, Ok(BLOCK));
+        healthy(&recorder, BLOCK, &next);
+        replace_with(&recorder, &mut expected, next, || {
+            Ok(vec!["192.0.2.2".parse().unwrap()])
+        })
+        .unwrap();
+        assert_eq!(
+            recorder.calls().last(),
+            Some(&Call::Run(
+                PFCTL.to_owned(),
+                vec![
+                    "-k".into(),
+                    "192.0.2.2".into(),
+                    "-k".into(),
+                    "192.0.2.67".into()
+                ]
+            )),
+        );
+    }
+
+    #[test]
+    fn rules_parse_as_terminal_drops_and_preserve_the_hosts_decisions() {
+        let rules = Rules::new(&plan());
+        assert!(rules.tables["cvbbmso_tcp_53"].contains("192.0.2.53"));
+        assert!(rules.tables["cvbbmso_udp_53"].contains("192.0.2.53"));
+        assert!(rules.tables["cvbbmso_udp_67"].contains("192.0.2.67"));
+        assert!(rules.tables["cvbbmso_udp_123"].contains("192.0.2.123"));
+        assert!(rules.tables["cvbbmso_tcp_80"].contains("203.0.113.20"));
+        assert!(!rules.tables.contains_key("cvbbmso_udp_80"));
+        assert!(rules.tables["cvbbmso_tcp_443"].contains("203.0.113.10"));
+        assert!(!rules.tables["cvbbmso_tcp_443"].contains("192.0.2.99"));
+        assert!(
+            rules
+                .source
+                .contains("proto tcp from any to ! <cvbbmso_tcp_443> port 443")
+        );
+        assert!(
+            rules
+                .source
+                .contains("port { 0:52 54:79 81:442 444:8442 8444:65535 }")
+        );
         let directory = tempfile::tempdir().unwrap();
         let rules_path = directory.path().join("guard.rules");
-        std::fs::write(&rules_path, rules).unwrap();
+        std::fs::write(&rules_path, rules.source).unwrap();
         let output = std::process::Command::new(PFCTL)
             .args(["-a", ANCHOR, "-n", "-v", "-o", "none", "-f"])
             .arg(rules_path)
@@ -459,10 +573,22 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let printed = String::from_utf8(output.stdout).unwrap();
-        assert_eq!(printed.trim().lines().last(), Some(BLOCK));
+        let filters = printed
+            .lines()
+            .filter(|line| !line.starts_with("table "))
+            .collect::<Vec<_>>();
+        assert!(filters.contains(&BLOCK));
+        assert!(
+            filters
+                .iter()
+                .all(|line| line.starts_with("block drop out quick "))
+        );
 
         let root_path = directory.path().join("pf.conf");
-        std::fs::write(root_path.as_path(), BASE).unwrap();
+        let host_policy = format!(
+            "{BASE}block drop out quick proto tcp from any to 203.0.113.10 port 443\npass out quick all\n"
+        );
+        std::fs::write(root_path.as_path(), host_policy).unwrap();
         let root = std::process::Command::new(PFCTL)
             .args(["-n", "-v", "-f"])
             .arg(root_path)
@@ -473,10 +599,14 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&root.stderr)
         );
-        assert_eq!(
-            String::from_utf8(root.stdout).unwrap().lines().next(),
-            Some(ROOT_RULE)
+        let live_root = String::from_utf8(root.stdout).unwrap();
+        assert_eq!(live_root.lines().next(), Some(ROOT_RULE));
+        assert!(
+            live_root.contains(
+                "block drop out quick inet proto tcp from any to 203.0.113.10 port = 443"
+            )
         );
+        assert!(live_root.contains("pass out quick all"));
     }
 
     fn assert_only_own_mutations(recorder: &Recorder) {
@@ -493,7 +623,7 @@ mod tests {
     #[test]
     fn an_on_disk_hook_cannot_make_an_incompatible_live_ruleset_safe() {
         let recorder = Recorder::with_file(PF_CONF, BASE);
-        let live = "anchor \"system.keep/*\" all\npass out quick all";
+        let live = "anchor \"com.cvbbmso.egress\" out quick all\npass out quick all";
         recorder.reply(ROOT, Ok(live));
         assert_eq!(
             install_with(&recorder, &plan(), &[]).err(),
@@ -502,6 +632,24 @@ mod tests {
         assert_eq!(recorder.contents(PF_CONF).as_deref(), Some(BASE));
         assert!(recorder.contents(RULES).is_none());
         assert!(recorder.contents(TOKEN).is_none());
+        assert!(
+            recorder
+                .calls()
+                .iter()
+                .all(|call| matches!(call, Call::Output(..)))
+        );
+    }
+
+    #[test]
+    fn deployment_rejects_translation_that_skips_filtering() {
+        let recorder = Recorder::with_file(PF_CONF, BASE);
+        recorder.reply(ROOT, Ok(LIVE_ROOT));
+        recorder.reply(&["-a", "*", "-s", "nat"], Ok("nat-anchor \"system/*\" all {\n  nat pass on en0 inet from 192.0.2.0/24 to any -> 203.0.113.1\n}"));
+        assert_eq!(
+            install_with(&recorder, &plan(), &[]).err(),
+            Some(NetworkError::Platform)
+        );
+        assert!(recorder.contents(RULES).is_none());
         assert!(
             recorder
                 .calls()
