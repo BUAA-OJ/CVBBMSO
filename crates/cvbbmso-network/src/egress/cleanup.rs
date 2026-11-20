@@ -12,6 +12,10 @@ const LAUNCHCTL: &str = "/bin/launchctl";
 pub(crate) fn schedule(commands: &dyn Commands) -> Result<(), NetworkError> {
     commands.write(DEFINITION, &render_definition())?;
     commands.run(LAUNCHCTL, &["bootstrap", "system", DEFINITION])?;
+    verify(commands)
+}
+
+pub(crate) fn verify(commands: &dyn Commands) -> Result<(), NetworkError> {
     commands.run(LAUNCHCTL, &["print", DOMAIN])
 }
 

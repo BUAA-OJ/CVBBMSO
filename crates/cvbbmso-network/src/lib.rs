@@ -41,7 +41,7 @@ pub use self::egress::{EgressGuard, EgressPolicy};
 /// items; this entry point exists only for it and is hidden from the
 /// documentation.
 #[doc(hidden)]
-#[must_use]
+#[must_use = "return the watchdog status to the operating system"]
 pub fn watchdog_main() -> std::process::ExitCode {
     egress::watchdog_entry()
 }

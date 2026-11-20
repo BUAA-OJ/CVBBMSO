@@ -66,6 +66,7 @@ impl GuardBackend for PfGuard {
         let expected = self.expected.lock().map_err(|_| NetworkError::Platform)?;
         verify_with(&commands, &expected.kernel)?;
         if guard_state.renewal_due() {
+            crate::egress::cleanup::verify(&commands)?;
             guard_state.renew();
             state::write(&commands, &guard_state)?;
         }

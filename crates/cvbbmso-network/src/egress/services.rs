@@ -34,7 +34,7 @@ impl Services {
             Ok(services)
         }
         #[cfg(not(any(target_os = "macos", windows)))]
-        Ok(Self::default())
+        Err(NetworkError::Platform)
     }
 
     pub(crate) fn rules(&self) -> &[Service] {

@@ -42,7 +42,11 @@ pub(crate) struct SystemCommands<'a>(pub(crate) Option<&'a File>);
 impl SystemCommands<'_> {
     fn command(&self, program: &str, args: &[&str]) -> Result<Command, NetworkError> {
         let mut command = Command::new(program);
-        command.args(args).env_clear().env("LC_ALL", "C");
+        command
+            .args(args)
+            .current_dir("/")
+            .env_clear()
+            .env("LC_ALL", "C");
         if let Some(lock) = self.0 {
             command.stdin(lock.try_clone().map_err(|_| NetworkError::Io)?);
         }

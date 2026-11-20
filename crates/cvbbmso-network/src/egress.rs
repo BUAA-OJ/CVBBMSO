@@ -129,9 +129,9 @@ impl EgressGuard {
         let endpoints = self.endpoints.clone();
         let runtime = Arc::clone(&self.runtime);
         let refresh = tokio::task::spawn_blocking(move || {
+            let mut runtime = runtime.lock().map_err(|_| NetworkError::Platform)?;
             backend.verify()?;
             let config = Services::discover()?;
-            let mut runtime = runtime.lock().map_err(|_| NetworkError::Platform)?;
             if runtime.config != config {
                 // The new resolver must be reachable before DNS queries can
                 // refresh the origins after a network change.
