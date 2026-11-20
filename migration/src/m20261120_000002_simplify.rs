@@ -1,10 +1,11 @@
 use sea_orm_migration::prelude::*;
 
-use super::initial::{
+use super::m20261119_000001_initial::{
     AUDIT, COMMANDS, EVENTS, EXAMS, INCIDENTS, MANIFESTS, RUNTIMES, Schema, clear_lost_incidents,
 };
 
-pub(super) struct Simplify;
+#[derive(DeriveMigrationName)]
+pub(super) struct Migration;
 
 const OLD_RUNTIME: &str = "migration_runtimes";
 const OLD_COMMAND: &str = "migration_commands";
@@ -41,14 +42,8 @@ const INCIDENT_FIELDS: [&str; 6] = [
     "detail",
 ];
 
-impl MigrationName for Simplify {
-    fn name(&self) -> &'static str {
-        "m20261120_000002_simplify"
-    }
-}
-
 #[sea_orm_migration::async_trait::async_trait]
-impl MigrationTrait for Simplify {
+impl MigrationTrait for Migration {
     fn use_transaction(&self) -> Option<bool> {
         Some(true)
     }

@@ -10,7 +10,6 @@ mod db;
 mod entity;
 mod events;
 mod exam;
-mod migration;
 
 pub use admin::{
     AdminOperation, AdminOutput, AdminService, EventRecord, IncidentRecord, IncidentSource,

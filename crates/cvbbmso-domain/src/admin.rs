@@ -342,10 +342,8 @@ async fn audit(
     now: OffsetDateTime,
 ) -> Result<(), DomainError> {
     let mut operation = serde_json::to_value(op).map_err(DomainError::storage)?;
-    match output {
-        AdminOutput::ExamCreated { exam_id } => operation["exam_id"] = exam_id.to_string().into(),
-        AdminOutput::ParticipantsImported { count } => operation["change_count"] = (*count).into(),
-        _ => {}
+    if let AdminOutput::ExamCreated { exam_id } = output {
+        operation["exam_id"] = exam_id.to_string().into();
     }
     stored_audit::Entity::insert(stored_audit::ActiveModel {
         actor: Set(actor.into()),

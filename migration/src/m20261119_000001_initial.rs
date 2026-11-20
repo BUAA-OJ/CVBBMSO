@@ -1,6 +1,7 @@
 use sea_orm_migration::prelude::*;
 
-pub(super) struct Initial;
+#[derive(DeriveMigrationName)]
+pub(super) struct Migration;
 
 // Keep this schema independent of entities that may change in future migrations.
 pub(super) const EXAMS: &str = "exams";
@@ -18,14 +19,8 @@ pub(super) enum Schema {
     Simplified,
 }
 
-impl MigrationName for Initial {
-    fn name(&self) -> &'static str {
-        "m20261119_000001_initial"
-    }
-}
-
 #[sea_orm_migration::async_trait::async_trait]
-impl MigrationTrait for Initial {
+impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         for table in [exams(), enrollments()]
             .into_iter()

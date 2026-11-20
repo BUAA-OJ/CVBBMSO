@@ -1,12 +1,12 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
 use cvbbmso_protocol::{ClientState, ExamPhase, ExamSummary, RecordingPolicy};
+use migration::{Migrator, MigratorTrait};
 use sea_orm::{
     ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
     DatabaseTransaction, DbErr, EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect,
     QueryTrait, RelationTrait, RuntimeErr, TransactionTrait, sqlx,
 };
-use sea_orm_migration::MigratorTrait;
 use serde::{Serialize, de::DeserializeOwned};
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use uuid::Uuid;
@@ -14,7 +14,6 @@ use uuid::Uuid;
 use crate::{
     DomainError,
     entity::{enrollment, exam as exam_table, runtime},
-    migration::Migrator,
 };
 
 pub(crate) use crate::entity::{exam::Model as StoredExam, runtime::Model as Runtime};

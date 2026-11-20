@@ -303,6 +303,26 @@ async fn participant_import_counts_only_new_enrollments() {
     for user in [USER, USER + 1, USER + 2] {
         f.service.check_enrollment(f.exam, user).await.unwrap();
     }
+    let rows = audit::Entity::find()
+        .all(&f.service.admin().0.database)
+        .await
+        .unwrap();
+    let operations = rows
+        .iter()
+        .map(|row| db::decode::<serde_json::Value>(&row.operation).unwrap());
+    assert_eq!(
+        operations
+            .filter(|op| op["operation"] == "participants_import")
+            .collect::<Vec<_>>(),
+        vec![
+            serde_json::json!({
+                "operation": "participants_import",
+                "exam_id": f.exam,
+                "oj_user_ids": [USER + 1, USER, USER + 1, USER + 2]
+            });
+            2
+        ]
+    );
 }
 
 #[tokio::test]
@@ -855,8 +875,40 @@ async fn failed_runtime_update_rolls_back_end_command_result() {
 }
 
 #[tokio::test]
+async fn migration_strips_only_historical_audit_change_counts() {
+    use migration::{Migrator, MigratorTrait};
+
+    let f = Fixture::memory().await;
+    let database = f.service.admin().0.database;
+    Migrator::down(&database, Some(1)).await.unwrap();
+    let mut operation = serde_json::json!({
+        "operation": "participants_import",
+        "exam_id": f.exam,
+        "oj_user_ids": [USER],
+    });
+    let expected = operation.to_string();
+    operation["change_count"] = 1.into();
+    let stored = audit::Entity::insert(audit::ActiveModel {
+        actor: Set("tester".into()),
+        operation: Set(operation.to_string()),
+        occurred_at: Set(db::stored_time(time(START)).unwrap()),
+        ..Default::default()
+    })
+    .exec(&database)
+    .await
+    .unwrap();
+    Migrator::up(&database, None).await.unwrap();
+    let restored = audit::Entity::find_by_id(stored.last_insert_id)
+        .one(&database)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.operation, expected);
+}
+
+#[tokio::test]
 async fn initial_migration_rolls_back_database_with_evidence() {
-    use sea_orm_migration::MigratorTrait;
+    use migration::{Migrator, MigratorTrait};
 
     let f = Fixture::memory().await;
     f.connect(ready()).await;
@@ -868,12 +920,8 @@ async fn initial_migration_rolls_back_database_with_evidence() {
         .await
         .unwrap();
     let service = f.service.admin();
-    crate::migration::Migrator::down(&service.0.database, None)
-        .await
-        .unwrap();
-    crate::migration::Migrator::up(&service.0.database, None)
-        .await
-        .unwrap();
+    Migrator::down(&service.0.database, None).await.unwrap();
+    Migrator::up(&service.0.database, None).await.unwrap();
     assert!(matches!(
         f.service.check_enrollment(f.exam, USER).await,
         Err(DomainError::NotFound)
@@ -882,9 +930,9 @@ async fn initial_migration_rolls_back_database_with_evidence() {
 
 #[tokio::test]
 async fn upgrades_existing_evidence_with_integer_event_sequences() {
-    use sea_orm_migration::MigratorTrait;
+    use migration::{Migrator, MigratorTrait};
 
-    use crate::{entity::event, migration::Migrator};
+    use crate::entity::event;
 
     let f = Fixture::memory().await;
     f.set(END);
@@ -934,7 +982,7 @@ async fn upgrades_existing_evidence_with_integer_event_sequences() {
     };
     let incidents = incident_ids(f.incidents().await);
 
-    Migrator::down(&database, Some(1)).await.unwrap();
+    Migrator::down(&database, Some(2)).await.unwrap();
     Migrator::up(&database, None).await.unwrap();
     assert_eq!(
         stored_command::Entity::find_by_id(command_id.to_string())
