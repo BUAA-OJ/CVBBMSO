@@ -715,6 +715,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cvbbmso-network"
+version = "0.1.0"
+dependencies = [
+ "core-foundation",
+ "libc",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "system-configuration",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+ "windows-sys 0.61.2",
+ "wiremock",
+]
+
+[[package]]
 name = "cvbbmso-protocol"
 version = "0.1.0"
 dependencies = [
@@ -3890,6 +3908,27 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "system-configuration"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "501336eb7ba9e417300a6a0fa985721065467aa83a6dcf0422a8e43e4c0328fa"
+dependencies = [
+ "bitflags 2.13.2",
+ "core-foundation",
+ "system-configuration-sys",
+]
+
+[[package]]
+name = "system-configuration-sys"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
 ]
 
 [[package]]
