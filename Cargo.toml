@@ -22,9 +22,17 @@ cvbbmso-accoding = { version = "0.1.0", path = "crates/cvbbmso-accoding" }
 cvbbmso-exam = { version = "0.1.0", path = "crates/cvbbmso-exam" }
 cvbbmso-protocol = { version = "0.1.0", path = "crates/cvbbmso-protocol" }
 cvbbmso-recorder = { version = "0.1.0", path = "crates/cvbbmso-recorder" }
+dispatch2 = { version = "0.3", default-features = false, features = ["objc2", "std"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 http = "1.0"
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSDate", "NSHTTPCookie", "NSString"] }
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFCGTypes", "CFDictionary", "CFNumber", "CFString", "objc2", "std"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGDirectDisplay", "objc2", "std"] }
+objc2-core-media = { version = "0.3", default-features = false, features = ["CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2", "objc2-core-video", "std"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn", "objc2", "std"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSDate", "NSHTTPCookie", "NSError", "NSString"] }
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["SCShareableContent", "SCStream", "block2", "dispatch2", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-media", "std"] }
+objc2-video-toolbox = { version = "0.3", default-features = false, features = ["VTCompressionProperties", "VTCompressionSession", "VTErrors", "VTSession", "objc2", "objc2-core-media", "objc2-core-video", "std"] }
 objc2-web-kit = { version = "0.3", default-features = false, features = ["WKWebView", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKHTTPCookieStore", "block2"] }
 insta = { version = "1.43", features = ["json"] }
 proptest = "1.7"

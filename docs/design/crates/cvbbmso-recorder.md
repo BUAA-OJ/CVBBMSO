@@ -180,3 +180,20 @@ Windows 的 `set_color_attributes` 设置 `MF_MT_YUV_MATRIX = BT709`、`MF_MT_VI
 - `finish` 在 `spawn_blocking` 中完成解析、哈希、写盘与最终文件哈希，避免在 Tokio worker 上执行长磁盘操作；成功后将 manifest 缓存，后续调用返回同一摘要。合并产生的临时文件不进入 manifest。
 - 合并任务由 `Recorder` 的 `Finalizing` 状态持有。取消 `finish` 的等待只取消当前等待，不丢弃任务或结果；后续 `finish` 等待同一个任务，成功后返回缓存摘要，失败被观察并进入 `Failed` 后才允许新一轮尝试。`stop` 不丢弃进行中的合并，因此不会因等待超时或重试产生两个同时写入同一临时文件的合并。调用方须在完成收尾前保留同一个 `Recorder`；直接销毁 recorder 不能强制终止已经运行的 blocking I/O。
 - 恢复旧分片时，合并输出同时为 `avcC` 与样本内 SPS 补齐居中色度 VUI。样本大小表和实际 `mdat` 使用同一修补规则；原 MKV/JSON 字节及封存哈希不变。缺少色度 VUI 的旧分片可合并；畸形或不支持的 SPS、错误的 NAL 长度前缀返回 `Merge`，不能发布色度位置不明确的最终文件。
+
+## M7 macOS 采集与编码
+
+macOS 后端与 Windows 共享同一组私有接缝：`capture::Desktop`（主显示器采集）和 `encode::Encoder`（H.264）。两者都在采样线程内创建、使用和销毁，平台类型与框架句柄不出现在公开 API 中；依赖使用 `objc2` 0.6 及 `objc2-screen-capture-kit`、`objc2-video-toolbox`、`objc2-core-media`、`objc2-core-video` 0.3，且只在 `target_os = "macos"` 下声明。
+
+- 采集使用 ScreenCaptureKit。`Desktop::open(fps)` 通过 `CGMainDisplayID` 选中主显示器，按其 `CGDisplayPixelsWide/High` 像素尺寸建立 `SCContentFilter` 和 `SCStreamConfiguration`：`kCVPixelFormatType_32BGRA`、隐藏光标、关闭音频、最小帧间隔 `1/fps`。ScreenCaptureKit 队列沿用系统默认深度 3 帧。应用侧另有一个只保留最新图像的单槽。`fps` 只决定系统产出图像的频率；采样节奏仍由 `capture::run` 的绝对采样点决定，Windows 后端接受该参数但不使用它。
+- 回调在专用串行 dispatch queue 上检查像素缓冲区为非平面的 BGRA，锁定期间验证基地址、行间距和可读范围，只复制每行的可见像素以构建紧密排列的 BGRA `Frame`，随后写入应用侧单槽：采样器未消费的旧帧会被新帧覆盖，因此慢消费者不会在画面变化后继续录制旧内容，静止桌面也不会把最后一次变化挡在旧帧后面。槽位同时记录流停止原因，`next_frame` 先交付已捕获的图像再报告错误。超时内没有新图像时返回 `None`，静止桌面与 Windows 一样属于正常等待。
+- 屏幕录制权限被撤销或系统停止流时，`SCStreamDelegate` 记录 `NSError`，之后每次 `next_frame` 都返回带 source 的 `RecordingError::Platform`，不会退化成“静止画面”。权限探测与申请仍由客户端负责，本 crate 只把运行中的中断表现为采集故障。
+- 编码使用 VideoToolbox。`Encoder::open(width, height, fps, bitrate)` 创建 `VTCompressionSession`：输入为 NV12 `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange`（BT.709 limited range，与 `Nv12Frame` 的 CPU 转换一致）、关闭帧重排（无 B 帧，输出按显示顺序单调递增）、`RealTime`、目标码率、`MaxKeyFrameInterval = 2 * fps`。分片轮转通过 `kVTEncodeFrameOptionKey_ForceKeyFrame` 让下一帧成为 IDR，不依赖固定 GOP。
+- VideoToolbox 只在第一帧输出后给出 SPS/PPS，因此 `open` 先编码一帧 limited-range 黑色图并立即 flush，丢弃该样本并缓存参数集，使 `config()` 在第一个真实帧之前就可用；随后第一个真实帧被强制为 IDR。呈现时间戳以微秒为 timescale 严格递增，回调把 `PTS / timescale` 换算成毫秒。
+- 输出是四字节长度前缀的 AVCC 访问单元；`Sample::from_access_unit` 校验分帧、从 IDR NAL 识别关键帧，并把样本内 SPS 修补为居中色度，与 MKV/MP4 的 `AvcConfig` 一致。输出异步到达：`encode` 返回当前已完成的样本；`flush` 在独立线程上调用 `VTCompressionSessionCompleteFrames` 并等待全部已提交帧完成，十秒上限覆盖阻塞调用本身和它触发的回调。排空超时后编码器进入 detached 状态，会话与回调状态由该线程持有到阻塞调用返回，后续 `encode`/`flush` 返回 `Encoder` 错误。
+- 回调收到非零 `OSStatus` 时保存原始状态码并作为编码故障上报，不会被当作丢帧而静默成功；首个失败保留到下一次 `encode`/`flush` 返回。
+- 硬件验收测试默认忽略：`writes_sampled_frames_from_the_primary_display` 需要屏幕录制权限与显示器，`encodes_frames_into_an_elementary_stream` 需要 VideoToolbox。在 macOS 桌面上运行：
+
+  ```sh
+  cargo test -p cvbbmso-recorder --locked -- --ignored
+  ```

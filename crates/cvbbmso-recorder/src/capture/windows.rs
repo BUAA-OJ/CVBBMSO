@@ -42,12 +42,14 @@ impl Desktop {
     /// Opens the primary display for duplication.
     ///
     /// The backend must stay on the thread that created it: it holds the COM
-    /// apartment initialised by [`Desktop::open`].
+    /// apartment initialised by [`Desktop::open`]. `fps` is accepted for the
+    /// platform-neutral constructor contract; Desktop Duplication is pull-based
+    /// and needs no frame-rate configuration.
     ///
     /// # Errors
     ///
     /// Returns [`RecordingError::Platform`] when the display cannot be duplicated.
-    pub(crate) fn open() -> Result<Self, RecordingError> {
+    pub(crate) fn open(_fps: u32) -> Result<Self, RecordingError> {
         Self::open_inner().map_err(failure)
     }
 

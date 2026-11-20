@@ -57,7 +57,7 @@ pub(crate) fn run(
     if stopped.load(Ordering::Acquire) {
         return Ok(());
     }
-    let mut desktop = Desktop::open()?;
+    let mut desktop = Desktop::open(fps.get())?;
     let mut clock = MonotonicClock(Instant::now());
     sample(&mut desktop, &mut clock, fps, stopped, sink)
 }

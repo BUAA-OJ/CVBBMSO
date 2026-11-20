@@ -176,6 +176,33 @@ pub(crate) fn length_prefixed(units: &[&[u8]]) -> Result<Vec<u8>, ContainerError
     Ok(framed)
 }
 
+/// Splits a four-byte length-prefixed NAL stream into its units.
+///
+/// Truncated framing and empty units are rejected because a valid access unit
+/// cannot contain either; the caller decides what to do with the units.
+///
+/// # Errors
+///
+/// Returns [`ContainerError::InvalidContainer`] for a truncated length prefix or
+/// unit, and [`ContainerError::Unsupported`] when a length cannot be indexed.
+pub(crate) fn length_prefixed_nals(data: &[u8]) -> Result<Vec<&[u8]>, ContainerError> {
+    let mut units = Vec::new();
+    let mut input = data;
+    while !input.is_empty() {
+        let prefix = input.get(..4).ok_or(ContainerError::InvalidContainer)?;
+        let length = u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]);
+        let length = usize::try_from(length).map_err(|_| ContainerError::Unsupported)?;
+        input = &input[4..];
+        let unit = input
+            .get(..length)
+            .filter(|unit| !unit.is_empty())
+            .ok_or(ContainerError::InvalidContainer)?;
+        units.push(unit);
+        input = &input[length..];
+    }
+    Ok(units)
+}
+
 /// Updates in-band SPS units as well as the out-of-band configuration record.
 ///
 /// An old SPS in `mdat` can supersede `avcC` at the first keyframe, so both must
@@ -186,27 +213,18 @@ pub(crate) fn length_prefixed(units: &[&[u8]]) -> Result<Vec<u8>, ContainerError
 /// Rejects truncated NAL framing, malformed parameter sets and SPS features
 /// outside the recorder's supported 4:2:0 syntax with a container error.
 pub(crate) fn with_centered_chroma(data: &[u8]) -> Result<Vec<u8>, ContainerError> {
-    let mut input = data;
     let mut output = Vec::with_capacity(data.len());
-    while !input.is_empty() {
-        let prefix = input.get(..4).ok_or(ContainerError::InvalidContainer)?;
-        let length = u32::from_be_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]);
-        let length = usize::try_from(length).map_err(|_| ContainerError::Unsupported)?;
-        input = &input[4..];
-        let unit = input
-            .get(..length)
-            .filter(|unit| !unit.is_empty())
-            .ok_or(ContainerError::InvalidContainer)?;
+    for unit in length_prefixed_nals(data)? {
         if nal_type(unit) == 7 {
             let sequence = vui::centered_chroma(unit)?;
             let length = u32::try_from(sequence.len()).map_err(|_| ContainerError::Unsupported)?;
             output.extend_from_slice(&length.to_be_bytes());
             output.extend_from_slice(&sequence);
         } else {
-            output.extend_from_slice(prefix);
+            let length = u32::try_from(unit.len()).map_err(|_| ContainerError::Unsupported)?;
+            output.extend_from_slice(&length.to_be_bytes());
             output.extend_from_slice(unit);
         }
-        input = &input[length..];
     }
     Ok(output)
 }
