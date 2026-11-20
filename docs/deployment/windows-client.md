@@ -4,7 +4,7 @@
 
 使用 x64 Windows、PowerShell 7、Node.js 22 和带 Windows SDK 的 Visual Studio C++ Build Tools。Rust 使用原生 `x86_64-pc-windows-msvc` 工具链。Tauri CLI 由脚本按固定版本下载，WiX 由 Tauri 管理。生成安装包的主机需要能访问 npm、Cargo 和 GitHub 工具下载源。[Tauri 构建依赖](https://v2.tauri.app/start/prerequisites/)
 
-在仓库根目录运行以下命令。将示例域名替换为部署监考服务的 HTTPS Origin。客户端从 Windows 证书信任库验证监考服务证书，部署前应按考场组织的流程安装所需的根证书。
+在干净的 Git 工作树根目录运行以下命令，并清除本地 `TAURI_CONFIG` 覆盖。将示例域名替换为部署监考服务的 HTTPS Origin。客户端从 Windows 证书信任库验证监考服务证书，部署前应按考场组织的流程安装所需的根证书。
 
 ```powershell
 pwsh -File ./scripts/windows/build-candidate.ps1 `

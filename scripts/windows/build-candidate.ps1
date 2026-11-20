@@ -18,6 +18,12 @@ if (-not $IsWindows -or (rustc -Vv) -notcontains "host: $target") {
 }
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
+$commit = git -C $repo rev-parse HEAD
+if ($LASTEXITCODE -ne 0) { throw 'Cannot identify the source commit.' }
+$changes = git -C $repo status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0 -or $changes -or $env:TAURI_CONFIG) {
+    throw 'Build from a clean Git checkout with no TAURI_CONFIG override so candidate.json identifies the exact source.'
+}
 $output = (New-Item -ItemType Directory -Force -Path $OutputDirectory).FullName
 $metadata = cargo metadata --locked --no-deps --format-version 1 --manifest-path (Join-Path $repo 'Cargo.toml')
 if ($LASTEXITCODE -ne 0) { throw 'Cargo metadata failed.' }
@@ -32,6 +38,10 @@ try {
 } finally {
     Pop-Location
 }
+$currentCommit = git -C $repo rev-parse HEAD
+if ($LASTEXITCODE -ne 0 -or $currentCommit -ne $commit) { throw 'The source commit changed during the build.' }
+$changes = git -C $repo status --porcelain --untracked-files=all
+if ($LASTEXITCODE -ne 0 -or $changes) { throw 'The source checkout changed during the build.' }
 
 $version = ($metadata | ConvertFrom-Json).packages.Where({ $_.name -eq 'cvbbmso-client' })[0].version
 $name = "CVBBMSO_${version}_x64_en-US.msi"
@@ -42,7 +52,7 @@ Copy-Item -LiteralPath $built -Destination $installer
 $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash.ToLowerInvariant()
 $signature = (Get-AuthenticodeSignature -LiteralPath $installer).Status.ToString()
 [ordered]@{
-    commit = (git -C $repo rev-parse HEAD)
+    commit = $commit
     version = $version
     target = $target
     tauri_cli = $tauriCli
