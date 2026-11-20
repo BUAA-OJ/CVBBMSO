@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, feat/network]
   push:
     branches: [main]
   workflow_dispatch:
@@ -61,6 +61,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
+      - name: Test Windows filter plans without installing WFP rules
+        if: matrix.os == 'windows-latest'
+        run: cargo test --locked -p cvbbmso-network --lib egress::backend::windows
+      - name: Test macOS egress with substitutes and PF syntax checks
+        if: matrix.os == 'macos-latest'
+        run: cargo test --locked -p cvbbmso-network --lib egress::
 
   deny:
     name: Dependency policy

@@ -10,7 +10,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -106,14 +106,28 @@ pub(crate) fn lock() -> Result<File, NetworkError> {
         .open(LOCK)
         .map_err(|_| NetworkError::Io)?;
     check_protected(Path::new(LOCK), false)?;
+    lock_exclusive(&file, Duration::from_secs(15))?;
+    Ok(file)
+}
+
+pub(super) fn lock_exclusive(file: &File, timeout: Duration) -> Result<(), NetworkError> {
+    let deadline = Instant::now() + timeout;
     // SAFETY: file owns an open descriptor. Closing it releases the lock once
     // all children that inherited the same open file description have exited.
-    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if !matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINTR | libc::EWOULDBLOCK)
+        ) {
             return Err(NetworkError::Io);
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(NetworkError::Io);
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(20)));
     }
-    Ok(file)
+    Ok(())
 }
 
 pub(crate) fn check_protected(path: &Path, directory: bool) -> Result<(), NetworkError> {

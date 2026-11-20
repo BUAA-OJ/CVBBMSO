@@ -143,12 +143,7 @@ pub(crate) fn watchdog_entry() -> ExitCode {
         [flag, parent] if flag == "--watch" => parent
             .parse::<u32>()
             .map_err(|_| NetworkError::Policy)
-            .and_then(|parent| {
-                while !recovery_tick(Some(parent))? {
-                    std::thread::sleep(Duration::from_secs(1));
-                }
-                Ok(())
-            }),
+            .map(watch_until_recovered),
         _ => Err(NetworkError::Policy),
     };
     if let Err(error) = result {
@@ -156,6 +151,22 @@ pub(crate) fn watchdog_entry() -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+fn watch_until_recovered(parent: u32) {
+    let mut reported = false;
+    loop {
+        match recovery_tick(Some(parent)) {
+            Ok(true) => return,
+            Ok(false) => reported = false,
+            Err(error) if !reported => {
+                eprintln!("watchdog recovery will retry: {error}");
+                reported = true;
+            }
+            Err(_) => {}
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
 
