@@ -173,6 +173,23 @@ fn load_anchor(commands: &dyn Commands) -> Result<(), NetworkError> {
     commands.run(PFCTL, &["-a", ANCHOR, "-o", "none", "-f", RULES])
 }
 
+fn first_filter_line(stdout: &str) -> Option<&str> {
+    // pfctl can print packet-normalization rules ahead of the filter rules.
+    // Keep unrecognized lines so the anchor check fails closed.
+    stdout.lines().map(str::trim).find(|line| {
+        if *line == "FILTER RULES:" {
+            return false;
+        }
+        let mut words = line.split_ascii_whitespace();
+        !matches!(
+            (words.next(), words.next(), words.next()),
+            (None, _, _)
+                | (Some("scrub" | "scrub-anchor"), Some(_), _)
+                | (Some("no"), Some("scrub"), Some(_))
+        )
+    })
+}
+
 fn verify_deployment(commands: &dyn Commands) -> Result<(), NetworkError> {
     let root = commands.output(PFCTL, &["-s", "rules"])?;
     let interfaces = commands.output(PFCTL, &["-vv", "-s", "Interfaces"])?;
@@ -190,7 +207,7 @@ fn verify_deployment(commands: &dyn Commands) -> Result<(), NetworkError> {
     });
     // Translation rules using 'pass' can terminate processing before the
     // filter stage, even when the guard is the first filter rule.
-    if root.lines().next().map(str::trim) != Some(ROOT_RULE) || skipped || skips_filtering {
+    if first_filter_line(&root) != Some(ROOT_RULE) || skipped || skips_filtering {
         return Err(NetworkError::Platform);
     }
     Ok(())
@@ -348,6 +365,7 @@ mod tests {
     const PF_CONF: &str = "/etc/pf.conf";
     const BASE: &str = "# on-disk PF configuration\nanchor \"com.cvbbmso.egress\" out\n";
     const LIVE_ROOT: &str = concat!(
+        "scrub-anchor \"com.apple/*\" all fragment reassemble\n",
         "anchor \"com.cvbbmso.egress\" out all\n",
         "anchor \"system.keep/*\" all\n",
         "block drop out quick inet proto tcp from any to 203.0.113.10 port = 443\n",
@@ -586,7 +604,7 @@ mod tests {
 
         let root_path = directory.path().join("pf.conf");
         let host_policy = format!(
-            "{BASE}block drop out quick proto tcp from any to 203.0.113.10 port 443\npass out quick all\n"
+            "scrub in all fragment reassemble\nno scrub out all\n{BASE}block drop out quick proto tcp from any to 203.0.113.10 port 443\npass out quick all\n"
         );
         std::fs::write(root_path.as_path(), host_policy).unwrap();
         let root = std::process::Command::new(PFCTL)
@@ -600,7 +618,8 @@ mod tests {
             String::from_utf8_lossy(&root.stderr)
         );
         let live_root = String::from_utf8(root.stdout).unwrap();
-        assert_eq!(live_root.lines().next(), Some(ROOT_RULE));
+        assert!(live_root.starts_with("scrub in all"));
+        assert_eq!(first_filter_line(&live_root), Some(ROOT_RULE));
         assert!(
             live_root.contains(
                 "block drop out quick inet proto tcp from any to 203.0.113.10 port = 443"
@@ -638,6 +657,49 @@ mod tests {
                 .iter()
                 .all(|call| matches!(call, Call::Output(..)))
         );
+    }
+
+    #[test]
+    fn deployment_accepts_a_filter_header_and_normalization_rules() {
+        let recorder = Recorder::default();
+        let live = format!(
+            " \nFILTER RULES:\n\nscrub in all fragment reassemble\nno scrub out all\n{LIVE_ROOT}"
+        );
+        recorder.reply(ROOT, Ok(&live));
+
+        assert_eq!(verify_deployment(&recorder), Ok(()));
+    }
+
+    #[test]
+    fn deployment_rejects_any_other_line_before_the_guard_filter() {
+        for line in [
+            "pass out quick all",
+            "block drop out quick all",
+            "match out all",
+            "anchor \"system.keep/*\" all",
+            "scrub-anchor-unknown \"system.keep/*\" all",
+            "no nat on en0 all",
+            "UNKNOWN HEADER:",
+        ] {
+            let recorder = Recorder::with_file(PF_CONF, BASE);
+            let live =
+                format!("FILTER RULES:\nscrub in all fragment reassemble\n{line}\n{LIVE_ROOT}");
+            recorder.reply(ROOT, Ok(&live));
+
+            assert_eq!(
+                install_with(&recorder, &plan(), &[]).err(),
+                Some(NetworkError::Platform),
+                "{line}",
+            );
+            assert!(recorder.contents(RULES).is_none(), "{line}");
+            assert!(
+                recorder
+                    .calls()
+                    .iter()
+                    .all(|call| matches!(call, Call::Output(..))),
+                "{line}",
+            );
+        }
     }
 
     #[test]
