@@ -128,18 +128,16 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
                         return check_exit_during_install(&app, &ui, &admission).await;
                     }
                     if let Some(connections) = exam_connections {
-                        let closed = if matches!(case, Case::Recording | Case::RestoredRecording) {
-                            exams::recording::exercise(
-                                &app,
-                                &ui,
-                                connections,
-                                case == Case::Recording,
-                            )
-                            .await?
-                        } else {
-                            exams::exercise(&app, &ui, connections, foreign, &hits, &mut decisions)
-                                .await?
-                        };
+                        let closed = exams::exercise(
+                            case,
+                            &app,
+                            &ui,
+                            connections,
+                            foreign,
+                            &hits,
+                            &mut decisions,
+                        )
+                        .await?;
                         assert_eq!(admission.installs(), 1);
                         assert_eq!(admission.shutdowns(), 0);
                         if case == Case::GuardLoss {

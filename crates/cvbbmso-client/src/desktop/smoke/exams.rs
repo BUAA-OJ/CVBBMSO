@@ -1,6 +1,6 @@
 //! Drives the desktop and the real exam runtime against a loopback monitor.
 
-pub(super) mod recording;
+mod recording;
 
 use std::{
     fs,
@@ -354,6 +354,7 @@ async fn open_enrolled_fixture(
 }
 
 pub(super) async fn exercise(
+    case: super::Case,
     app: &AppHandle,
     ui: &WebviewWindow,
     mut fixture: Fixture,
@@ -361,6 +362,12 @@ pub(super) async fn exercise(
     hits: &AtomicUsize,
     decisions: &mut mpsc::UnboundedReceiver<(&'static str, Url)>,
 ) -> Result<oneshot::Receiver<()>, Error> {
+    if matches!(
+        case,
+        super::Case::Recording | super::Case::RestoredRecording
+    ) {
+        return recording::exercise(app, ui, fixture, case == super::Case::Recording).await;
+    }
     let oj = open_enrolled_fixture(app, ui).await?;
 
     let initial_hello = check_pending_open(ui, &mut fixture.incoming).await?;

@@ -18,7 +18,7 @@ use super::{
 };
 use crate::desktop::{Desktop, smoke::FIXTURE_USER_ID};
 
-pub(in crate::desktop::smoke) async fn exercise(
+pub(super) async fn exercise(
     app: &AppHandle,
     ui: &WebviewWindow,
     mut fixture: Fixture,
