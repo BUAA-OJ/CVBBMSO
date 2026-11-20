@@ -185,7 +185,7 @@ pub enum ClientMessage {
     Hello(ClientHello),
     Heartbeat,
     Status { state: ClientState },
-    Event { seq: u64, event: ExamEvent },
+    Event { seq: i64, event: ExamEvent },
     CommandResult {
         command_id: Uuid,
         status: CommandStatus,
@@ -202,7 +202,7 @@ pub enum ServerMessage {
         start_at: OffsetDateTime,
         end_at: OffsetDateTime,
         recording_policy: RecordingPolicy,
-        ack_event_through: u64,
+        ack_event_through: i64,
     },
     Command {
         command_id: Uuid,
@@ -227,7 +227,7 @@ pub enum ServerMessage {
 | C→S | `hello` | `device_id`, `instance_id`, `platform`, `state` | 新连接恢复身份绑定与执行状态 |
 | C→S | `heartbeat` | 无 | 心跳，默认 5 秒一次 |
 | C→S | `status` | `state: ClientState` | 客户端当前状态快照 |
-| C→S | `event` | `seq: u64`, `event: ExamEvent` | 可靠、顺序上报的业务事件 |
+| C→S | `event` | `seq: i64`, `event: ExamEvent` | 可靠、顺序上报的业务事件 |
 | C→S | `command_result` | `command_id: uuid`, `status`, `error_code?` | 当前服务端指令的执行终态 |
 | S→C | `sync` | `server_time`, `phase`, `start_at`, `end_at`, `recording_policy`, `ack_event_through` | 服务器权威快照及已确认事件序号 |
 | S→C | `command` | `command_id`, `name`, `effective_at` | 开始或结束指令；每次生成新 ID |
@@ -284,10 +284,10 @@ pub enum ServerMessage {
 
 ## 顺序、去重与时序约定
 
-- 可靠 `event.seq` 从每个 `(exam_id, oj_user_id)` 的 `1` 开始，持久化后递增；服务端以该联合标识加 `seq` 去重。
-- 事件确认通过 `sync.ack_event_through` 返回；客户端重连后补发 `seq > ack_event_through` 的事件。正常结束收到 `CommandAck` 后，客户端可以清理本场事件。
+- 可靠 `event.seq` 从每个 `(exam_id, oj_user_id)` 的 `1` 开始，持久化后递增至 `i64::MAX`；服务端以该联合标识加 `seq` 去重。
+- 事件确认通过 `sync.ack_event_through` 返回，取值 `0` 至 `i64::MAX`，`0` 表示尚无连续事件。客户端重连后补发 `seq > ack_event_through` 的事件。收到当前 `end_exam` 的 `CommandAck` 后，客户端才可清理本场事件。
 - `Recorder::open` 恢复的已封存分片会全部重新发出 `SegmentFinalized`；运行时为每个分片复用已持久化的原 `seq`，没有原 `seq` 的才分配新序号。服务端按 `seq` 幂等去重。同一 `seq` 重复且内容相同则忽略；内容不同按 `PROTOCOL_ERROR` 处理。
 - `command_id` 标识一次具体命令下发；每个命令 ID 唯一。服务端按 `hello.state` 与 `phase` 生成新命令；客户端记录处理结果并回复终态。
 - 考试开始与结束均以 `command` 为触发源；`sync.phase` 用于状态对齐及决定应生成什么命令。`status` 用于状态对齐；结束由 `command_result` 与 `CommandAck` 完成。
-- 正常结束时，客户端发送 `recording_finalized`（成功时）和 `command_result`，等待 `CommandAck` 后关闭连接；服务端将执行状态置为 `finished` 并跳过 `connection_lost`。连接在 `finished` 之前关闭、心跳超时或被替换时按连接丢失处理。
+- `end_exam` 得出成功或失败结果后，客户端先按序补齐本场可靠事件，成功时包括 `recording_finalized`，再在同一连接发送 `command_result` 并等待 `CommandAck`；服务端将执行状态置为 `finished` 并跳过 `connection_lost`。连接在 `finished` 之前关闭、心跳超时或被替换时按连接丢失处理。
 - 客户端与服务端同版本部署，协议在两端同步升级。

@@ -341,7 +341,7 @@ struct Runtime<C> {
     /// Retries a failed journal save even if no further events arrive.
     storage_retry_at: Option<Instant>,
     /// Highest event sequence queued to the current session.
-    sent_through: u64,
+    sent_through: i64,
 }
 
 impl<C: Capture> Runtime<C> {
