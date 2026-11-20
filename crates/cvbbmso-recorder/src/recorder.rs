@@ -134,7 +134,8 @@ impl Recorder {
                 State::Complete(manifest) => return Ok(manifest.clone()),
                 State::Finalizing(task) => {
                     // Await by reference so cancelling the caller cannot detach
-                    // the task or allow another writer of final.mp4.tmp.
+                    // the task or allow another writer of the merge temporary
+                    // file.
                     let merged = task.await;
                     return match merged {
                         Ok(Ok(manifest)) => {

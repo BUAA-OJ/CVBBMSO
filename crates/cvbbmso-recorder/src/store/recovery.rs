@@ -8,7 +8,10 @@ use std::{
 
 use cvbbmso_protocol::SegmentMeta;
 
-use super::{META_EXTENSION, ORDINAL_WIDTH, VIDEO_EXTENSION, file_name, hash_file, invalid_input};
+use super::{
+    META_EXTENSION, ORDINAL_WIDTH, VIDEO_EXTENSION, file_name, hash_file, invalid_input,
+    read_bounded,
+};
 use crate::RecordingError;
 
 /// Restores the sealed segments of `segments_dir`.
@@ -24,7 +27,13 @@ use crate::RecordingError;
 /// be recorded again. The digest is recomputed for every restored segment,
 /// because the metadata only proves what the video looked like when it was
 /// written, not that it is intact now.
-pub(super) fn recover(segments_dir: &Path) -> Result<BTreeMap<u32, SegmentMeta>, RecordingError> {
+///
+/// Metadata larger than `metadata_limit` bytes fails recovery instead of being
+/// buffered; the file is left unchanged.
+pub(super) fn recover(
+    segments_dir: &Path,
+    metadata_limit: u64,
+) -> Result<BTreeMap<u32, SegmentMeta>, RecordingError> {
     let mut videos = BTreeSet::new();
     let mut metas = BTreeSet::new();
     for entry in fs::read_dir(segments_dir)? {
@@ -61,7 +70,7 @@ pub(super) fn recover(segments_dir: &Path) -> Result<BTreeMap<u32, SegmentMeta>,
         }
 
         let meta_path = segments_dir.join(file_name(*index, META_EXTENSION));
-        let meta = parse_meta(&meta_path, *index)?;
+        let meta = parse_meta(&meta_path, *index, metadata_limit)?;
 
         let video_path = segments_dir.join(file_name(*index, VIDEO_EXTENSION));
         if hash_file(&video_path)? != meta.sha256 {
@@ -77,8 +86,9 @@ pub(super) fn recover(segments_dir: &Path) -> Result<BTreeMap<u32, SegmentMeta>,
 }
 
 /// Reads and validates the metadata file of `index`.
-fn parse_meta(path: &Path, index: u32) -> Result<SegmentMeta, RecordingError> {
-    let bytes = fs::read(path)?;
+fn parse_meta(path: &Path, index: u32, limit: u64) -> Result<SegmentMeta, RecordingError> {
+    let bytes = read_bounded(path, limit)
+        .map_err(|error| invalid_input(format!("segment {index} metadata: {error}")))?;
     let meta = serde_json::from_slice::<SegmentMeta>(&bytes)
         .map_err(|error| invalid_input(format!("segment {index} metadata: {error}")))?;
     if meta.index == index {

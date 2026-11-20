@@ -8,6 +8,7 @@ use time::OffsetDateTime;
 use super::SegmentStore;
 use crate::RecordingError;
 use crate::container::{AvcConfig, MkvWriter, Sample};
+use crate::store::ReadLimits;
 
 const SEQUENCE: [u8; 24] = [
     0x67, 0x4D, 0x40, 0x15, 0x95, 0xA0, 0x50, 0x7E, 0x84, 0, 0, 3, 0, 4, 0, 0, 3, 0, 0x78, 0x36,
@@ -44,6 +45,10 @@ fn segment(timestamps: &[u64], byte: u8) -> Vec<u8> {
 
 fn store(directory: &TempDir) -> SegmentStore {
     SegmentStore::open(directory.path()).expect("store")
+}
+
+fn store_with_limits(directory: &TempDir, limits: ReadLimits) -> SegmentStore {
+    SegmentStore::open_with_limits(directory.path(), limits).expect("store")
 }
 
 fn seal(store: &mut SegmentStore, index: u32, seconds: i64, bytes: &[u8]) {
@@ -334,13 +339,77 @@ fn reports_no_segments_for_an_empty_store() {
 }
 
 #[test]
-fn removes_a_stale_final_temporary_file_on_open() {
+fn opening_leaves_temporary_files_from_an_earlier_attempt_untouched() {
     let directory = TempDir::new().expect("temp dir");
     let opened = store(&directory);
-    fs::write(opened.final_temporary_path(), b"half written").expect("stale temporary");
+    let stale = opened.final_temporary_path();
+    fs::write(&stale, b"half written").expect("stale temporary");
     drop(opened);
 
     let reopened = store(&directory);
 
-    assert!(!reopened.final_temporary_path().exists());
+    assert_ne!(reopened.final_temporary_path(), stale);
+    assert_eq!(fs::read(&stale).expect("stale temporary"), b"half written");
+}
+
+#[test]
+fn segment_read_limit_admits_a_segment_of_exactly_the_limit() {
+    let directory = TempDir::new().expect("temp dir");
+    let bytes = segment(&[0, 66], 1);
+    let mut store = store(&directory);
+    seal(&mut store, 1, 0, &bytes);
+    drop(store);
+
+    let limited = store_with_limits(
+        &directory,
+        ReadLimits::new(u64::try_from(bytes.len()).expect("length"), 1024),
+    );
+
+    limited.merge().expect("merge at the exact limit");
+    assert!(limited.final_path().exists());
+}
+
+#[test]
+fn a_segment_over_the_read_limit_fails_without_touching_the_evidence() {
+    let directory = TempDir::new().expect("temp dir");
+    let bytes = segment(&[0, 66], 1);
+    let mut store = store(&directory);
+    seal(&mut store, 1, 0, &bytes);
+    drop(store);
+
+    let limit = u64::try_from(bytes.len()).expect("length") - 1;
+    let limited = store_with_limits(&directory, ReadLimits::new(limit, 1024));
+
+    assert!(matches!(limited.merge(), Err(RecordingError::Merge(_))));
+    assert_eq!(
+        fs::read(limited.video_path(1)).expect("sealed video"),
+        bytes
+    );
+    assert!(!limited.final_path().exists());
+}
+
+#[test]
+fn refuses_to_overwrite_an_existing_temporary_file() {
+    let directory = TempDir::new().expect("temp dir");
+    let mut store = store(&directory);
+    seal(&mut store, 1, 0, &segment(&[0, 66], 1));
+    let temporary = store.final_temporary_path();
+    fs::write(&temporary, b"another writer").expect("existing temporary");
+
+    assert!(matches!(store.merge(), Err(RecordingError::Merge(_))));
+    assert_eq!(fs::read(&temporary).expect("temporary"), b"another writer");
+    assert!(!store.final_path().exists());
+}
+
+#[test]
+fn removes_its_own_temporary_when_publishing_fails() {
+    let directory = TempDir::new().expect("temp dir");
+    let mut store = store(&directory);
+    seal(&mut store, 1, 0, &segment(&[0, 66], 1));
+    fs::create_dir(store.final_path()).expect("block the final path");
+    let temporary = store.final_temporary_path();
+
+    assert!(matches!(store.merge(), Err(RecordingError::Merge(_))));
+    assert!(!temporary.exists());
+    assert!(store.final_path().is_dir());
 }

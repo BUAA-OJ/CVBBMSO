@@ -4,7 +4,7 @@ use cvbbmso_protocol::{SegmentMeta, Sha256Digest};
 use tempfile::TempDir;
 use time::OffsetDateTime;
 
-use super::SegmentStore;
+use super::{ReadLimits, SegmentStore};
 use crate::RecordingError;
 
 /// SHA-256 of an empty file.
@@ -204,4 +204,46 @@ fn manifest_lists_segments_in_ascending_order() {
     assert_eq!(manifest.segments[0].index, 1);
     assert_eq!(manifest.segments[1].index, 2);
     assert_eq!(manifest.merged_sha256.as_str(), EMPTY_DIGEST);
+}
+
+#[test]
+fn metadata_read_limit_admits_metadata_of_exactly_the_limit() {
+    let directory = TempDir::new().expect("temp dir");
+    let mut store = store(&directory);
+    write_video(&store, 1, b"abc");
+    store.seal(1, timestamp(0), timestamp(30)).expect("seal");
+    let metadata = fs::read(segments_dir(&directory).join("000001.json")).expect("metadata");
+    drop(store);
+
+    let reopened = SegmentStore::open_with_limits(
+        directory.path(),
+        ReadLimits::new(1024, u64::try_from(metadata.len()).expect("length")),
+    )
+    .expect("reopen at the exact limit");
+
+    assert_eq!(reopened.segments().len(), 1);
+}
+
+#[test]
+fn metadata_over_the_read_limit_fails_and_keeps_the_evidence() {
+    let directory = TempDir::new().expect("temp dir");
+    let mut store = store(&directory);
+    write_video(&store, 1, b"abc");
+    store.seal(1, timestamp(0), timestamp(30)).expect("seal");
+    let metadata = fs::read(segments_dir(&directory).join("000001.json")).expect("metadata");
+    let video = fs::read(store.video_path(1)).expect("video");
+    drop(store);
+
+    let limit = u64::try_from(metadata.len()).expect("length") - 1;
+    let reopened = SegmentStore::open_with_limits(directory.path(), ReadLimits::new(1024, limit));
+
+    assert!(reopened.is_err());
+    assert_eq!(
+        fs::read(segments_dir(&directory).join("000001.json")).expect("metadata"),
+        metadata
+    );
+    assert_eq!(
+        fs::read(segments_dir(&directory).join("000001.mkv")).expect("video"),
+        video
+    );
 }

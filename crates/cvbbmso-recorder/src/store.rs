@@ -12,6 +12,7 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use cvbbmso_protocol::{ProtocolError, RecordingManifest, SegmentMeta, Sha256Digest};
@@ -26,44 +27,106 @@ const RECORDING_DIR: &str = "recording";
 const SEGMENTS_DIR: &str = "segments";
 /// Name of the merged recording.
 const FINAL_NAME: &str = "final.mp4";
-/// Temporary name used while the merged recording is written.
-const FINAL_TEMP_NAME: &str = "final.mp4.tmp";
 /// Extension of a sealed segment video.
 const VIDEO_EXTENSION: &str = "mkv";
 /// Extension of the metadata file of a sealed segment.
 const META_EXTENSION: &str = "json";
-/// Extension of the temporary file used to publish metadata atomically.
+/// Extension of temporary files used for atomic publication.
 const TEMP_EXTENSION: &str = "tmp";
 /// Number of digits of the zero-padded segment ordinal in file names.
 const ORDINAL_WIDTH: usize = 6;
 /// Buffer used to hash a segment without loading it whole.
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
+/// Upper bound on the bytes read into memory for one sealed segment video.
+///
+/// Segments rotate at the policy duration and the encoder targets 4 Mbit/s, so
+/// a normal segment is only a few megabytes. This bound leaves ample room for
+/// hardware encoders that overshoot the target or for longer rotations while
+/// keeping the whole-file parse from buffering an arbitrary artifact.
+const MAX_SEGMENT_BYTES: u64 = 512 * 1024 * 1024;
+/// Upper bound on the bytes read into memory for one segment metadata file.
+///
+/// `SegmentMeta` is a fixed record of about 150 serialized bytes. 64 KiB leaves
+/// room for whitespace and future fields while still bounding a file crafted to
+/// exhaust memory during recovery.
+const MAX_SEGMENT_METADATA_BYTES: u64 = 64 * 1024;
+/// Distinguishes the temporary files created by this process.
+static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Upper bounds on the bytes read into memory for one recording artifact.
+#[derive(Clone, Copy)]
+pub(crate) struct ReadLimits {
+    /// Limit for one sealed segment video.
+    pub(crate) segment_video: u64,
+    /// Limit for one segment metadata file.
+    pub(crate) segment_metadata: u64,
+}
+
+impl ReadLimits {
+    /// Bounds applied to every real recording.
+    pub(crate) const DEFAULT: Self = Self {
+        segment_video: MAX_SEGMENT_BYTES,
+        segment_metadata: MAX_SEGMENT_METADATA_BYTES,
+    };
+
+    /// Builds small bounds for tests that verify the exact boundary.
+    #[cfg(test)]
+    pub(crate) const fn new(segment_video: u64, segment_metadata: u64) -> Self {
+        Self {
+            segment_video,
+            segment_metadata,
+        }
+    }
+}
 
 /// Sealed segments of one candidate, ordered by their one-based index.
 #[derive(Clone)]
 pub(crate) struct SegmentStore {
     recording_dir: PathBuf,
     segments: BTreeMap<u32, SegmentMeta>,
+    limits: ReadLimits,
+    temporary: PathBuf,
 }
 
 impl SegmentStore {
     /// Opens `<candidate_dir>/recording`, creating it when missing, and restores
     /// the segments sealed by an earlier session.
     pub(crate) fn open(candidate_dir: &Path) -> Result<Self, RecordingError> {
+        Self::open_with_limits(candidate_dir, ReadLimits::DEFAULT)
+    }
+
+    /// Opens the recording directory with explicit read bounds.
+    ///
+    /// Tests use smaller bounds to verify the boundary without writing
+    /// production-sized artifacts; production callers use [`ReadLimits::DEFAULT`].
+    pub(crate) fn open_with_limits(
+        candidate_dir: &Path,
+        limits: ReadLimits,
+    ) -> Result<Self, RecordingError> {
         let recording_dir = candidate_dir.join(RECORDING_DIR);
         let segments_dir = recording_dir.join(SEGMENTS_DIR);
         fs::create_dir_all(&segments_dir)?;
-        // A previous finish may have stopped between writing and publishing the
-        // merged file; the next finish rebuilds it from the sealed segments.
-        match fs::remove_file(recording_dir.join(FINAL_TEMP_NAME)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        let segments = recovery::recover(&segments_dir)?;
+        // Temporary files are not removed here. A merge task may still be
+        // writing one, and an interrupted attempt's file must never be adopted
+        // or truncated by recovery.
+        let segments = recovery::recover(&segments_dir, limits.segment_metadata)?;
+        // A crashed process can leave its temporary file behind. Skip any name
+        // this process would reuse so the stale file never blocks a merge.
+        let temporary = loop {
+            let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let candidate = recording_dir.join(format!(
+                "{FINAL_NAME}.{}.{sequence}.{TEMP_EXTENSION}",
+                std::process::id()
+            ));
+            if !candidate.exists() {
+                break candidate;
+            }
+        };
         Ok(Self {
             recording_dir,
             segments,
+            limits,
+            temporary,
         })
     }
 
@@ -79,10 +142,10 @@ impl SegmentStore {
         self.recording_dir.join(FINAL_NAME)
     }
 
-    /// Path used while the merged recording is being written.
+    /// Path this store's merge attempt must create exclusively.
     #[must_use]
     pub(crate) fn final_temporary_path(&self) -> PathBuf {
-        self.recording_dir.join(FINAL_TEMP_NAME)
+        self.temporary.clone()
     }
 
     /// Index the next sealed segment must use.
@@ -167,6 +230,24 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), RecordingError> {
     drop(file);
     fs::rename(&temporary, path)?;
     Ok(())
+}
+
+/// Reads `path` into memory, failing when it holds more than `limit` bytes.
+///
+/// The limit is enforced on the bytes actually read rather than on the file's
+/// reported length, so a growing file cannot exceed the buffer. A file of
+/// exactly `limit` bytes is accepted.
+fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let mut reader = File::open(path)?.take(limit.saturating_add(1));
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} exceeds the {limit}-byte read limit", path.display()),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Streams `path` through SHA-256.

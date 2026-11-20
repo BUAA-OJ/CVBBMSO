@@ -94,7 +94,7 @@ Windows 后端将原始 `windows::core::Error` 对象放入 `std::io::Error`，�
 }
 ```
 
-`final.mp4` 在 `finish` 过程中生成，失败时可能留下半成品。重新 `finish` 或下次 `open` 会清理或重建该文件，以完整文件作为合法 manifest 的产物。
+`final.mp4` 在 `finish` 过程中生成，失败时可能留下半成品。下次 `finish` 会用完整文件重建并原子替换它；完整的 `final.mp4` 才是合法 manifest 的产物。
 
 ## 录像生命周期
 
@@ -171,11 +171,12 @@ Windows 的 `set_color_attributes` 设置 `MF_MT_YUV_MATRIX = BT709`、`MF_MT_VI
 
 `finish` 按 `index` 升序读取已封存分片，合并为单视频轨 MP4：
 
-- 每个分片在读取时和复制样本时都重新计算 SHA-256 并与 `SegmentMeta.sha256` 比对；分片缺失、摘要不符、容器不可读，或各分片的分辨率、AVC 配置不一致时返回 `Merge`，已封存分片保持不变。
+- 每个分片在读取时和复制样本时都重新计算 SHA-256 并与 `SegmentMeta.sha256` 比对；分片缺失、摘要不符、超过读取上限、容器不可读，或各分片的分辨率、AVC 配置不一致时返回 `Merge`，已封存分片保持不变。
+- 单个 MKV 分片整段读入内存前应用 512 MiB 上限，单个分片 JSON 应用 64 KiB 上限；上限按实际读取的字节数判断，而不是文件报告的长度。超过上限时合并返回 `Merge`、恢复返回 `Io`，原文件、已封存分片和已有结果保持不变。512 MiB 远高于 4 Mbit/s 目标码率下正常轮转的分片，64 KiB 远高于约 150 字节的 `SegmentMeta` 序列化结果。
 - 样本按媒体顺序拼接：每段先以该段首帧时间戳为零点归一化，下一分片的首帧紧接上一分片末帧之后，缺口不会在最终视频中形成冻结画面，非零起点也不会产生额外停顿。实际 UTC 起止时间仍由分片元信息承担证据职责。
 - 最后一段的尾帧时长显式传给 MP4 写入器：取该段最后两个样本的间隔，单帧分片取 1 ms；`stts`、`mdhd`、`mvhd` 共用同一时长。
 - MP4 由私有写入器直接生成：`ftyp`、`moov`（`mvhd`、单 `trak`、`avc1` + `avcC` + `colr`、`stts`、`stsc`、`stsz`、`stss`，偏移表按大小选择 `stco` 或 `co64`）与 `mdat`。`colr` 使用 BT.709 limited-range 的 `nclx`；样本沿用四字节长度前缀，正好匹配 `avcC` 的 `lengthSizeMinusOne = 3`。MKV 分片的视频轨同样写 `Colour`，其中包含矩阵、范围、原色和居中色度位置。
-- 先写入同目录的 `final.mp4.tmp`，同步后再重命名为 `final.mp4`；失败不会把半成品发布为最终文件。`open` 清理残留的 `final.mp4.tmp`，再次 `finish` 覆盖重建。分片清单为空时仍由 `finish` 返回 `NoSegments`。
+- 每次 `open` 为后续合并生成独有的同目录临时文件名 `final.mp4.<pid>.<sequence>.tmp`；合并用 `create_new` 独占创建该文件，绝不截断或覆盖已有文件，写入并同步后再重命名为 `final.mp4`。本次尝试失败时只删除它自己创建的文件，不把半成品发布为最终文件；`open` 不清理临时文件，避免删除仍在写入的文件，崩溃遗留的临时文件不进入 manifest，下次合并使用新的文件名。跨进程互斥、父目录权限和完整文件系统防护留待 M5 接线时评估。分片清单为空时仍由 `finish` 返回 `NoSegments`。
 - `finish` 在 `spawn_blocking` 中完成解析、哈希、写盘与最终文件哈希，避免在 Tokio worker 上执行长磁盘操作；成功后将 manifest 缓存，后续调用返回同一摘要。合并产生的临时文件不进入 manifest。
-- 合并任务由 `Recorder` 的 `Finalizing` 状态持有。取消 `finish` 的等待只取消当前等待，不丢弃任务或结果；后续 `finish` 等待同一个任务，成功后返回缓存摘要，失败被观察并进入 `Failed` 后才允许新一轮尝试。`stop` 不丢弃进行中的合并，因此不会因等待超时或重试产生两个 `final.mp4.tmp` 写入者。调用方须在完成收尾前保留同一个 `Recorder`；直接销毁 recorder 不能强制终止已经运行的 blocking I/O。
+- 合并任务由 `Recorder` 的 `Finalizing` 状态持有。取消 `finish` 的等待只取消当前等待，不丢弃任务或结果；后续 `finish` 等待同一个任务，成功后返回缓存摘要，失败被观察并进入 `Failed` 后才允许新一轮尝试。`stop` 不丢弃进行中的合并，因此不会因等待超时或重试产生两个同时写入同一临时文件的合并。调用方须在完成收尾前保留同一个 `Recorder`；直接销毁 recorder 不能强制终止已经运行的 blocking I/O。
 - 恢复旧分片时，合并输出同时为 `avcC` 与样本内 SPS 补齐居中色度 VUI。样本大小表和实际 `mdat` 使用同一修补规则；原 MKV/JSON 字节及封存哈希不变。缺少色度 VUI 的旧分片可合并；畸形或不支持的 SPS、错误的 NAL 长度前缀返回 `Merge`，不能发布色度位置不明确的最终文件。
