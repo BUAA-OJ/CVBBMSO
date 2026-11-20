@@ -8,13 +8,14 @@ use cvbbmso_protocol::{
     ExamPhase, ExecutionState, IncidentCode, Platform, RecordingManifest, RecordingPolicy,
     RecordingState, SegmentMeta, ServerMessage, Sha256Digest, error_code,
 };
-use sea_orm::ConnectionTrait;
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
 use time::{Duration, OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
 use crate::{
     AdminOperation, AdminOutput, AdminService, ConnectOutcome, DisconnectReason, DomainError,
     ExamService, IncidentRecord, StudentRuntime, db,
+    entity::{audit, command as stored_command, exam as stored_exam},
 };
 
 const USER: i64 = 7;
@@ -266,6 +267,35 @@ async fn enrollment_is_rechecked_and_removal_preserves_prior_evidence() {
     })
     .await;
     sync(&f.connect(hello).await, ExamPhase::Scheduled, 2);
+}
+
+#[tokio::test]
+async fn participant_import_counts_only_new_enrollments() {
+    let f = Fixture::memory().await;
+    let duplicate = AdminOperation::ParticipantsAdd {
+        exam_id: f.exam,
+        oj_user_id: USER,
+    };
+    assert!(matches!(
+        f.service.admin().execute("tester".into(), duplicate).await,
+        Err(DomainError::Conflict)
+    ));
+
+    let import = AdminOperation::ParticipantsImport {
+        exam_id: f.exam,
+        oj_user_ids: vec![USER + 1, USER, USER + 1, USER + 2],
+    };
+    assert!(matches!(
+        f.admin(import.clone()).await,
+        AdminOutput::ParticipantsImported { count: 2 }
+    ));
+    assert!(matches!(
+        f.admin(import).await,
+        AdminOutput::ParticipantsImported { count: 0 }
+    ));
+    for user in [USER, USER + 1, USER + 2] {
+        f.service.check_enrollment(f.exam, user).await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -539,11 +569,13 @@ async fn failed_audit_rolls_back_enrollment() {
     f.sql("DROP TRIGGER fail_audit").await;
     f.admin(op).await;
     f.service.check_enrollment(f.exam, USER + 1).await.unwrap();
-    let row = f.service.admin().0.database.query_one_raw(db::sql!(
-        "SELECT COUNT(*) AS count FROM admin_audit WHERE operation = 'participants_add' AND target_users = ?",
-        format!("[{}]", USER + 1),
-    )).await.unwrap().unwrap();
-    assert_eq!(row.try_get::<i64>("", "count").unwrap(), 1);
+    let count = audit::Entity::find()
+        .filter(audit::Column::Operation.eq("participants_add"))
+        .filter(audit::Column::TargetUsers.eq(format!("[{}]", USER + 1)))
+        .count(&f.service.admin().0.database)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
 }
 
 #[tokio::test]
@@ -640,21 +672,14 @@ async fn failed_runtime_update_rolls_back_command_result_and_ack() {
         [ServerMessage::CommandAck { command_id }]
     );
     assert_eq!(f.runtime().await.execution, ExecutionState::Recording);
-    let row = f
-        .service
-        .admin()
-        .0
-        .database
-        .query_one_raw(db::sql!(
-            "SELECT result_error_code FROM commands WHERE command_id = ?",
-            command_id.to_string(),
-        ))
+    let row = stored_command::Entity::find_by_id(command_id.to_string())
+        .one(&f.service.admin().0.database)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
-        row.try_get::<String>("", "result_error_code").unwrap(),
-        error_code::INTERNAL_ERROR
+        row.result_error_code.as_deref(),
+        Some(error_code::INTERNAL_ERROR)
     );
 }
 
@@ -715,10 +740,12 @@ async fn stale_write_snapshot_rechecks_enrollment_after_concurrent_cli_commit() 
                     .await
                     .unwrap();
             }
-            tx.execute_raw(db::sql!(
-                "UPDATE exams SET title = 'stale write' WHERE exam_id = ?",
-                key.exam,
-            ))
+            stored_exam::Entity::update(stored_exam::ActiveModel {
+                exam_id: Set(key.exam),
+                title: Set("stale write".into()),
+                ..Default::default()
+            })
+            .exec_without_returning(tx)
             .await?;
             Ok(())
         })

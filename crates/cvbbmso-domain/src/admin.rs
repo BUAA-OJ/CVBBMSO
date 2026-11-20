@@ -3,14 +3,17 @@ use std::collections::BTreeSet;
 use cvbbmso_protocol::{
     ExamEvent, ExamSummary, ExecutionState, RecordingManifest, RecordingPolicy, RecordingState,
 };
-use sea_orm::{ConnectionTrait, DatabaseTransaction, DbBackend, FromQueryResult, Statement, Value};
+use sea_orm::{
+    ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QueryTrait, Set,
+};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
     DomainError, Service,
-    db::{self, Runtime, StudentKey, sql},
+    db::{self, Runtime, StudentKey},
+    entity::{audit as stored_audit, enrollment, event, exam, incident, manifest, runtime},
 };
 
 /// A management operation to perform against the shared exam database.
@@ -239,16 +242,15 @@ async fn mutate(
             }
             let exam_id = Uuid::new_v4();
             let id = exam_id.to_string();
-            tx.execute_raw(sql!(
-                "INSERT INTO exams (exam_id, title, start_at, end_at, segment_duration_secs, fps)
-                 VALUES (?, ?, ?, ?, ?, ?)",
-                id.as_str(),
-                title.as_str(),
-                db::input_time(start_at)?,
-                db::input_time(end_at)?,
-                i64::from(policy.segment_duration_secs),
-                i64::from(policy.fps),
-            ))
+            exam::Entity::insert(exam::ActiveModel {
+                exam_id: Set(id.clone()),
+                title: Set(title.clone()),
+                start_at: Set(db::input_time(start_at)?),
+                end_at: Set(db::input_time(end_at)?),
+                segment_duration_secs: Set(i64::from(policy.segment_duration_secs)),
+                fps: Set(i64::from(policy.fps)),
+            })
+            .exec_without_returning(tx)
             .await?;
             audit(tx, actor, &id, "exams_create", None, 1, now).await?;
             Ok(AdminOutput::ExamCreated { exam_id })
@@ -280,14 +282,8 @@ async fn mutate(
         } => {
             let key = StudentKey::new(exam_id, oj_user_id)?;
             db::exam(tx, &key.exam).await?;
-            let deleted = tx
-                .execute_raw(sql!(
-                    "DELETE FROM enrollments WHERE exam_id = ? AND oj_user_id = ?",
-                    key.exam.as_str(),
-                    key.user,
-                ))
-                .await?;
-            if deleted.rows_affected() == 0 {
+            let deleted = enrollment::Entity::delete_by_id(key.id()).exec(tx).await?;
+            if deleted.rows_affected == 0 {
                 return Err(DomainError::NotFound);
             }
             audit(
@@ -346,15 +342,17 @@ async fn add_participant(
     exam: &str,
     user: i64,
 ) -> Result<usize, DomainError> {
-    let execution = tx
-        .execute_raw(sql!(
-            "INSERT INTO enrollments (exam_id, oj_user_id) VALUES (?, ?)
-         ON CONFLICT (exam_id, oj_user_id) DO NOTHING",
-            exam,
-            user,
-        ))
-        .await?;
-    usize::try_from(execution.rows_affected()).map_err(DomainError::storage)
+    let inserted = enrollment::Entity::insert(enrollment::ActiveModel {
+        exam_id: Set(exam.into()),
+        oj_user_id: Set(user),
+    })
+    .on_conflict_do_nothing()
+    .exec_without_returning(tx)
+    .await?;
+    Ok(usize::from(matches!(
+        inserted,
+        sea_orm::TryInsertResult::Inserted(1)
+    )))
 }
 
 async fn audit(
@@ -366,13 +364,17 @@ async fn audit(
     count: usize,
     now: OffsetDateTime,
 ) -> Result<(), DomainError> {
-    let target_users = target_users.map(|users| db::encode(&users)).transpose()?;
-    tx.execute_raw(sql!(
-        "INSERT INTO admin_audit (audit_id, actor, operation, exam_id, target_users, change_count, occurred_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-        Uuid::new_v4().to_string(), actor, operation, exam, target_users,
-        i64::try_from(count).map_err(DomainError::storage)?, db::stored_time(now)?,
-    )).await?;
+    stored_audit::Entity::insert(stored_audit::ActiveModel {
+        audit_id: Set(Uuid::new_v4().to_string()),
+        actor: Set(actor.into()),
+        operation: Set(operation.into()),
+        exam_id: Set(exam.into()),
+        target_users: Set(target_users.map(|users| db::encode(&users)).transpose()?),
+        change_count: Set(i64::try_from(count).map_err(DomainError::storage)?),
+        occurred_at: Set(db::stored_time(now)?),
+    })
+    .exec_without_returning(tx)
+    .await?;
     Ok(())
 }
 
@@ -426,13 +428,11 @@ async fn query(
             .await
         }
         AdminOperation::IncidentsShow { incident_id } => {
-            let incident = StoredIncident::find_by_statement(sql!(
-                "SELECT * FROM incidents WHERE incident_id = ?",
-                incident_id.to_string(),
-            ))
-            .one(tx)
-            .await?
-            .ok_or(DomainError::NotFound)?;
+            let incident = incident::Entity::find()
+                .filter(incident::Column::IncidentId.eq(incident_id.to_string()))
+                .one(tx)
+                .await?
+                .ok_or(DomainError::NotFound)?;
             Ok(AdminOutput::Incident(incident.try_into()?))
         }
         AdminOperation::RecordingsShow {
@@ -446,41 +446,34 @@ async fn query(
     }
 }
 
-#[derive(FromQueryResult)]
-struct Participant {
-    oj_user_id: i64,
-}
-
 async fn participants(tx: &DatabaseTransaction, exam_id: Uuid) -> Result<AdminOutput, DomainError> {
     let id = exam_id.to_string();
     db::exam(tx, &id).await?;
-    let participants = Participant::find_by_statement(sql!(
-        "SELECT oj_user_id FROM enrollments WHERE exam_id = ? ORDER BY oj_user_id",
-        id,
-    ))
-    .all(tx)
-    .await?
-    .into_iter()
-    .map(|p| ParticipantRecord {
-        exam_id,
-        oj_user_id: p.oj_user_id,
-    })
-    .collect();
+    let participants = enrollment::Entity::find()
+        .filter(enrollment::Column::ExamId.eq(id))
+        .order_by_asc(enrollment::Column::OjUserId)
+        .all(tx)
+        .await?
+        .into_iter()
+        .map(|p| ParticipantRecord {
+            exam_id,
+            oj_user_id: p.oj_user_id,
+        })
+        .collect();
     Ok(AdminOutput::Participants(participants))
 }
 
 async fn students(tx: &DatabaseTransaction, exam_id: Uuid) -> Result<AdminOutput, DomainError> {
     let id = exam_id.to_string();
     db::exam(tx, &id).await?;
-    let students = Runtime::find_by_statement(sql!(
-        "SELECT * FROM student_runtimes WHERE exam_id = ? ORDER BY oj_user_id",
-        id,
-    ))
-    .all(tx)
-    .await?
-    .into_iter()
-    .map(StudentRuntime::try_from)
-    .collect::<Result<_, _>>()?;
+    let students = runtime::Entity::find()
+        .filter(runtime::Column::ExamId.eq(id))
+        .order_by_asc(runtime::Column::OjUserId)
+        .all(tx)
+        .await?
+        .into_iter()
+        .map(StudentRuntime::try_from)
+        .collect::<Result<_, _>>()?;
     Ok(AdminOutput::Students(students))
 }
 
@@ -498,50 +491,32 @@ impl TryFrom<Runtime> for StudentRuntime {
     }
 }
 
-#[derive(FromQueryResult)]
-struct StoredEvent {
-    seq: Vec<u8>,
-    event: String,
-    received_at: String,
-}
-
 async fn events(tx: &DatabaseTransaction, key: &StudentKey) -> Result<AdminOutput, DomainError> {
     Runtime::get(tx, key).await?;
-    let events = StoredEvent::find_by_statement(sql!(
-        "SELECT seq, event, received_at FROM events WHERE exam_id = ? AND oj_user_id = ? ORDER BY seq",
-        key.exam.as_str(), key.user,
-    ))
-    .all(tx)
-    .await?
-    .into_iter()
-    .map(|row| -> Result<_, DomainError> {
-        Ok(EventRecord {
-            exam_id: key.exam_id(),
-            oj_user_id: key.user,
-            seq: db::decode_seq(&row.seq)?,
-            event: db::decode(&row.event)?,
-            received_at: db::parse_time(&row.received_at)?,
+    let events = event::Entity::find()
+        .filter(event::Column::ExamId.eq(key.exam.as_str()))
+        .filter(event::Column::OjUserId.eq(key.user))
+        .order_by_asc(event::Column::Seq)
+        .all(tx)
+        .await?
+        .into_iter()
+        .map(|row| -> Result<_, DomainError> {
+            Ok(EventRecord {
+                exam_id: key.exam_id(),
+                oj_user_id: key.user,
+                seq: db::decode_seq(&row.seq)?,
+                event: db::decode(&row.event)?,
+                received_at: db::parse_time(&row.received_at)?,
+            })
         })
-    })
-    .collect::<Result<_, _>>()?;
+        .collect::<Result<_, _>>()?;
     Ok(AdminOutput::Events(events))
 }
 
-#[derive(FromQueryResult)]
-struct StoredIncident {
-    incident_id: String,
-    exam_id: String,
-    oj_user_id: i64,
-    source: String,
-    kind: String,
-    occurred_at: String,
-    detail: Option<String>,
-}
-
-impl TryFrom<StoredIncident> for IncidentRecord {
+impl TryFrom<incident::Model> for IncidentRecord {
     type Error = DomainError;
 
-    fn try_from(value: StoredIncident) -> Result<Self, Self::Error> {
+    fn try_from(value: incident::Model) -> Result<Self, Self::Error> {
         Ok(Self {
             id: db::parse_uuid(&value.incident_id)?,
             exam_id: db::parse_uuid(&value.exam_id)?,
@@ -564,6 +539,8 @@ struct IncidentFilter {
 
 impl IncidentFilter {
     async fn list(self, tx: &DatabaseTransaction) -> Result<AdminOutput, DomainError> {
+        use incident::Column;
+
         let exam_id = self.exam_id.to_string();
         if let Some(user) = self.oj_user_id {
             db::validate_user(user)?;
@@ -579,30 +556,25 @@ impl IncidentFilter {
         let until = self.until.map(db::input_time).transpose()?;
         db::exam(tx, &exam_id).await?;
 
-        let mut query = String::from("SELECT * FROM incidents WHERE exam_id = ?");
-        let mut args: Vec<Value> = vec![exam_id.into()];
-        for (fragment, value) in [
-            (" AND oj_user_id = ?", self.oj_user_id.map(Value::from)),
-            (" AND kind = ?", self.kind.map(Value::from)),
-            (" AND occurred_at >= ?", since.map(Value::from)),
-            (" AND occurred_at <= ?", until.map(Value::from)),
-        ] {
-            if let Some(value) = value {
-                query.push_str(fragment);
-                args.push(value);
-            }
-        }
-        query.push_str(" ORDER BY occurred_at, ordinal");
-        let incidents = StoredIncident::find_by_statement(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            query,
-            args,
-        ))
-        .all(tx)
-        .await?
-        .into_iter()
-        .map(IncidentRecord::try_from)
-        .collect::<Result<_, _>>()?;
+        let incidents = incident::Entity::find()
+            .filter(Column::ExamId.eq(exam_id))
+            .apply_if(self.oj_user_id, |query, user| {
+                query.filter(Column::OjUserId.eq(user))
+            })
+            .apply_if(self.kind, |query, kind| query.filter(Column::Kind.eq(kind)))
+            .apply_if(since, |query, since| {
+                query.filter(Column::OccurredAt.gte(since))
+            })
+            .apply_if(until, |query, until| {
+                query.filter(Column::OccurredAt.lte(until))
+            })
+            .order_by_asc(Column::OccurredAt)
+            .order_by_asc(Column::Ordinal)
+            .all(tx)
+            .await?
+            .into_iter()
+            .map(IncidentRecord::try_from)
+            .collect::<Result<_, _>>()?;
         Ok(AdminOutput::Incidents(incidents))
     }
 }
@@ -617,14 +589,9 @@ async fn recording(tx: &DatabaseTransaction, key: &StudentKey) -> Result<AdminOu
     {
         return Err(DomainError::NotFound);
     }
-    let manifest = tx
-        .query_one_raw(sql!(
-            "SELECT manifest FROM recording_manifests WHERE exam_id = ? AND oj_user_id = ?",
-            key.exam.as_str(),
-            key.user,
-        ))
+    let manifest = manifest::Entity::find_by_id(key.id())
+        .one(tx)
         .await?
         .ok_or(DomainError::NotFound)?;
-    let json: String = manifest.try_get("", "manifest")?;
-    Ok(AdminOutput::Recording(db::decode(&json)?))
+    Ok(AdminOutput::Recording(db::decode(&manifest.manifest)?))
 }

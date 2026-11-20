@@ -3,26 +3,22 @@ use std::{future::Future, pin::Pin, time::Duration};
 use cvbbmso_protocol::{ClientState, ExamPhase, ExamSummary, RecordingPolicy};
 use sea_orm::sqlx::ConnectOptions as _;
 use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, DbErr, FromQueryResult,
-    RuntimeErr, Statement, TransactionTrait, sqlx,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait,
+    JoinType, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait, RuntimeErr,
+    TransactionTrait, sqlx,
 };
 use sea_orm_migration::MigratorTrait;
 use serde::{Serialize, de::DeserializeOwned};
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-use crate::{DomainError, migration::Migrator};
+use crate::{
+    DomainError,
+    entity::{enrollment, exam as exam_table, runtime},
+    migration::Migrator,
+};
 
-macro_rules! sql {
-    ($query:expr $(, $arg:expr)* $(,)?) => {
-        sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            $query,
-            [$(sea_orm::Value::from($arg)),*],
-        )
-    };
-}
-pub(crate) use sql;
+pub(crate) use crate::entity::{exam::Model as StoredExam, runtime::Model as Runtime};
 
 pub(crate) async fn open(url: &str) -> Result<DatabaseConnection, DomainError> {
     if !url.starts_with("sqlite:") {
@@ -176,6 +172,10 @@ impl StudentKey {
     pub(crate) fn exam_id(&self) -> Uuid {
         self.exam_id
     }
+
+    pub(crate) fn id(&self) -> (String, i64) {
+        (self.exam.clone(), self.user)
+    }
 }
 
 pub(crate) fn validate_user(id: i64) -> Result<(), DomainError> {
@@ -183,16 +183,6 @@ pub(crate) fn validate_user(id: i64) -> Result<(), DomainError> {
         return Err(DomainError::InvalidInput);
     }
     Ok(())
-}
-
-#[derive(FromQueryResult)]
-pub(crate) struct StoredExam {
-    exam_id: String,
-    title: String,
-    start_at: String,
-    end_at: String,
-    segment_duration_secs: i64,
-    fps: i64,
 }
 
 impl StoredExam {
@@ -221,7 +211,7 @@ impl StoredExam {
 }
 
 pub(crate) async fn exam(db: &impl ConnectionTrait, exam: &str) -> Result<StoredExam, DomainError> {
-    StoredExam::find_by_statement(sql!("SELECT * FROM exams WHERE exam_id = ?", exam))
+    exam_table::Entity::find_by_id(exam)
         .one(db)
         .await?
         .ok_or(DomainError::NotFound)
@@ -232,18 +222,14 @@ pub(crate) async fn exams(
     user: Option<i64>,
     now: OffsetDateTime,
 ) -> Result<Vec<ExamSummary>, DomainError> {
-    let statement = match user {
-        Some(user) => sql!(
-            "SELECT e.* FROM enrollments AS p JOIN exams AS e USING (exam_id)
-             WHERE p.oj_user_id = ? ORDER BY e.start_at, e.exam_id",
-            user,
-        ),
-        None => Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT * FROM exams ORDER BY start_at, exam_id",
-        ),
-    };
-    StoredExam::find_by_statement(statement)
+    exam_table::Entity::find()
+        .apply_if(user, |query, user| {
+            query
+                .join(JoinType::InnerJoin, enrollment::Relation::Exam.def().rev())
+                .filter(enrollment::Column::OjUserId.eq(user))
+        })
+        .order_by_asc(exam_table::Column::StartAt)
+        .order_by_asc(exam_table::Column::ExamId)
         .all(db)
         .await?
         .into_iter()
@@ -256,12 +242,8 @@ pub(crate) async fn enrollment(
     key: &StudentKey,
 ) -> Result<StoredExam, DomainError> {
     let exam = exam(db, &key.exam).await?;
-    if db
-        .query_one_raw(sql!(
-            "SELECT 1 FROM enrollments WHERE exam_id = ? AND oj_user_id = ?",
-            key.exam.as_str(),
-            key.user,
-        ))
+    if enrollment::Entity::find_by_id(key.id())
+        .one(db)
         .await?
         .is_none()
     {
@@ -284,32 +266,12 @@ pub(crate) fn phase(
     }
 }
 
-#[derive(FromQueryResult)]
-pub(crate) struct Runtime {
-    pub(crate) exam_id: String,
-    pub(crate) oj_user_id: i64,
-    pub(crate) instance_id: String,
-    pub(crate) connection_id: String,
-    pub(crate) connected: bool,
-    pub(crate) execution: String,
-    pub(crate) recording: String,
-    pub(crate) last_seen_at: String,
-    pub(crate) ack_event_through: Vec<u8>,
-    pub(crate) lost_incident_id: Option<String>,
-}
-
 impl Runtime {
     pub(crate) async fn find(
         db: &impl ConnectionTrait,
         key: &StudentKey,
     ) -> Result<Option<Self>, DomainError> {
-        Ok(Self::find_by_statement(sql!(
-            "SELECT * FROM student_runtimes WHERE exam_id = ? AND oj_user_id = ?",
-            key.exam.as_str(),
-            key.user,
-        ))
-        .one(db)
-        .await?)
+        Ok(runtime::Entity::find_by_id(key.id()).one(db).await?)
     }
 
     pub(crate) async fn get(
@@ -320,11 +282,12 @@ impl Runtime {
     }
 
     pub(crate) async fn online(db: &impl ConnectionTrait) -> Result<Vec<Self>, DomainError> {
-        Ok(Self::find_by_statement(sql!(
-            "SELECT * FROM student_runtimes WHERE connected = 1 ORDER BY exam_id, oj_user_id"
-        ))
-        .all(db)
-        .await?)
+        Ok(runtime::Entity::find()
+            .filter(runtime::Column::Connected.eq(true))
+            .order_by_asc(runtime::Column::ExamId)
+            .order_by_asc(runtime::Column::OjUserId)
+            .all(db)
+            .await?)
     }
 
     pub(crate) fn key(&self) -> Result<StudentKey, DomainError> {

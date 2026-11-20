@@ -7,6 +7,7 @@
 mod admin;
 mod commands;
 mod db;
+mod entity;
 mod events;
 mod exam;
 mod migration;

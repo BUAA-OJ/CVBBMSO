@@ -2,13 +2,14 @@ use cvbbmso_protocol::{
     ClientHello, ClientMessage, ClientState, ExamSummary, ExecutionState, RecordingState,
     ServerMessage,
 };
-use sea_orm::{ConnectionTrait, DatabaseTransaction};
+use sea_orm::{DatabaseTransaction, EntityTrait, Set, sea_query::OnConflict};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
     AdminService, DomainError, Service, commands,
-    db::{self, Runtime, StudentKey, sql},
+    db::{self, Runtime, StudentKey},
+    entity::runtime,
     events,
 };
 
@@ -221,6 +222,8 @@ async fn connect(
     hello: &ClientHello,
     now: OffsetDateTime,
 ) -> Result<ConnectOutcome, DomainError> {
+    use runtime::Column;
+
     let exam = db::enrollment(tx, key).await?;
     let mut ack_event_through = 0;
     if let Some(old) = Runtime::find(tx, key).await? {
@@ -229,28 +232,36 @@ async fn connect(
     }
 
     let connection_id = Uuid::new_v4().to_string();
-    let instance_id = hello.instance_id.to_string();
-    tx.execute_raw(sql!(
-        "INSERT INTO student_runtimes (
-             exam_id, oj_user_id, device_id, instance_id, platform, connection_id,
-             connected, execution, recording, last_seen_at, ack_event_through
-         ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
-         ON CONFLICT(exam_id, oj_user_id) DO UPDATE SET
-             device_id = excluded.device_id, instance_id = excluded.instance_id,
-             platform = excluded.platform, connection_id = excluded.connection_id,
-             connected = 1, execution = excluded.execution, recording = excluded.recording,
-             last_seen_at = excluded.last_seen_at, lost_incident_id = NULL",
-        key.exam.as_str(),
-        key.user,
-        hello.device_id.to_string(),
-        instance_id,
-        db::enum_name(hello.platform)?,
-        connection_id.as_str(),
-        db::enum_name(hello.state.execution)?,
-        db::enum_name(hello.state.recording)?,
-        db::stored_time(now)?,
-        db::encode_seq(ack_event_through),
-    ))
+    runtime::Entity::insert(runtime::ActiveModel {
+        exam_id: Set(key.exam.clone()),
+        oj_user_id: Set(key.user),
+        device_id: Set(hello.device_id.to_string()),
+        instance_id: Set(hello.instance_id.to_string()),
+        platform: Set(db::enum_name(hello.platform)?),
+        connection_id: Set(connection_id.clone()),
+        connected: Set(true),
+        execution: Set(db::enum_name(hello.state.execution)?),
+        recording: Set(db::enum_name(hello.state.recording)?),
+        last_seen_at: Set(db::stored_time(now)?),
+        ack_event_through: Set(db::encode_seq(ack_event_through)),
+        lost_incident_id: Set(None),
+    })
+    .on_conflict(
+        OnConflict::columns([Column::ExamId, Column::OjUserId])
+            .update_columns([
+                Column::DeviceId,
+                Column::InstanceId,
+                Column::Platform,
+                Column::ConnectionId,
+                Column::Connected,
+                Column::Execution,
+                Column::Recording,
+                Column::LastSeenAt,
+                Column::LostIncidentId,
+            ])
+            .to_owned(),
+    )
+    .exec_without_returning(tx)
     .await?;
 
     let (start_at, end_at) = exam.times()?;
@@ -329,12 +340,13 @@ async fn receive(
     }
     match message {
         ClientMessage::Heartbeat => {
-            tx.execute_raw(sql!(
-                "UPDATE student_runtimes SET last_seen_at = ? WHERE exam_id = ? AND oj_user_id = ?",
-                db::stored_time(now)?,
-                key.exam.as_str(),
-                key.user,
-            ))
+            runtime::Entity::update(runtime::ActiveModel {
+                exam_id: Set(key.exam.clone()),
+                oj_user_id: Set(key.user),
+                last_seen_at: Set(db::stored_time(now)?),
+                ..Default::default()
+            })
+            .exec_without_returning(tx)
             .await?;
         }
         ClientMessage::Status { state } => {
@@ -358,10 +370,14 @@ pub(crate) async fn update_state(
     key: &StudentKey,
     state: ClientState,
 ) -> Result<(), DomainError> {
-    tx.execute_raw(sql!(
-        "UPDATE student_runtimes SET execution = ?, recording = ? WHERE exam_id = ? AND oj_user_id = ?",
-        db::enum_name(state.execution)?, db::enum_name(state.recording)?, key.exam.as_str(), key.user,
-    ))
+    runtime::Entity::update(runtime::ActiveModel {
+        exam_id: Set(key.exam.clone()),
+        oj_user_id: Set(key.user),
+        execution: Set(db::enum_name(state.execution)?),
+        recording: Set(db::enum_name(state.recording)?),
+        ..Default::default()
+    })
+    .exec_without_returning(tx)
     .await?;
     Ok(())
 }
@@ -384,13 +400,14 @@ async fn disconnect(
                 .await?,
         )
     };
-    tx.execute_raw(sql!(
-        "UPDATE student_runtimes SET connected = 0, lost_incident_id = ?
-         WHERE exam_id = ? AND oj_user_id = ?",
-        lost_id,
-        key.exam.as_str(),
-        key.user,
-    ))
+    runtime::Entity::update(runtime::ActiveModel {
+        exam_id: Set(key.exam.clone()),
+        oj_user_id: Set(key.user),
+        connected: Set(false),
+        lost_incident_id: Set(lost_id),
+        ..Default::default()
+    })
+    .exec_without_returning(tx)
     .await?;
     Ok(())
 }

@@ -2,13 +2,17 @@ use cvbbmso_protocol::{
     ClientState, CommandName, CommandStatus, ExamPhase, ExecutionState, RecordingState,
     ServerMessage, error_code,
 };
-use sea_orm::{ConnectionTrait, DatabaseTransaction, FromQueryResult};
+use sea_orm::{
+    ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, Set,
+    sea_query::{Expr, ExprTrait, OnConflict},
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
     DomainError,
-    db::{self, Runtime, StoredExam, StudentKey, sql},
+    db::{self, Runtime, StoredExam, StudentKey},
+    entity::command::{ActiveModel, Column, Entity},
     exam::update_state,
 };
 
@@ -29,24 +33,36 @@ pub(crate) async fn issue(
         _ => return Ok(None),
     };
     let command_id = Uuid::new_v4();
-    let inserted = tx
-        .execute_raw(sql!(
-            "INSERT INTO commands (
-                 command_id, exam_id, oj_user_id, connection_id, name, effective_at, created_at, lifecycle
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-             ON CONFLICT(exam_id, oj_user_id, connection_id, name) WHERE lifecycle = 'pending'
-             DO NOTHING",
-            command_id.to_string(), key.exam.as_str(), key.user, connection_id, db::enum_name(name)?,
-            db::stored_time(effective_at)?, db::stored_time(now)?,
-        ))
-        .await?;
-    Ok(
-        (inserted.rows_affected() != 0).then_some(ServerMessage::Command {
-            command_id,
-            name,
-            effective_at,
-        }),
+    let inserted = Entity::insert(ActiveModel {
+        command_id: Set(command_id.to_string()),
+        exam_id: Set(key.exam.clone()),
+        oj_user_id: Set(key.user),
+        connection_id: Set(connection_id.into()),
+        name: Set(db::enum_name(name)?),
+        effective_at: Set(db::stored_time(effective_at)?),
+        created_at: Set(db::stored_time(now)?),
+        lifecycle: Set("pending".into()),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::columns([
+            Column::ExamId,
+            Column::OjUserId,
+            Column::ConnectionId,
+            Column::Name,
+        ])
+        // SQLite matches the conflict target to the partial index before binding values.
+        .target_and_where(Expr::col(Column::Lifecycle).eq(Expr::Constant("pending".into())))
+        .do_nothing()
+        .to_owned(),
     )
+    .exec_without_returning(tx)
+    .await?;
+    Ok((inserted != 0).then_some(ServerMessage::Command {
+        command_id,
+        name,
+        effective_at,
+    }))
 }
 
 pub(crate) async fn retire_pending(
@@ -60,29 +76,25 @@ pub(crate) async fn retire_pending(
         ExecutionState::Recording | ExecutionState::Finalizing
     ) || state.execution == ExecutionState::Finished;
     let ended = state.execution == ExecutionState::Finished;
-    tx.execute_raw(sql!(
-        "UPDATE commands SET lifecycle = CASE
-             WHEN (name = 'start_exam' AND ?) OR (name = 'end_exam' AND ?) THEN 'inferred'
-             ELSE 'superseded'
-         END WHERE exam_id = ? AND oj_user_id = ? AND lifecycle = 'pending'",
-        started,
-        ended,
-        key.exam.as_str(),
-        key.user,
-    ))
-    .await?;
+    let inferred = Column::Name
+        .eq(db::enum_name(CommandName::StartExam)?)
+        .and(Expr::val(started))
+        .or(Column::Name
+            .eq(db::enum_name(CommandName::EndExam)?)
+            .and(Expr::val(ended)));
+    Entity::update_many()
+        .col_expr(
+            Column::Lifecycle,
+            Expr::case(inferred, "inferred")
+                .finally("superseded")
+                .into(),
+        )
+        .filter(Column::ExamId.eq(key.exam.as_str()))
+        .filter(Column::OjUserId.eq(key.user))
+        .filter(Column::Lifecycle.eq("pending"))
+        .exec(tx)
+        .await?;
     Ok(())
-}
-
-#[derive(FromQueryResult)]
-struct Command {
-    exam_id: String,
-    oj_user_id: i64,
-    connection_id: String,
-    name: String,
-    lifecycle: String,
-    result_status: Option<String>,
-    result_error_code: Option<String>,
 }
 
 pub(crate) async fn result(
@@ -92,15 +104,11 @@ pub(crate) async fn result(
     status: CommandStatus,
     error_code: Option<String>,
 ) -> Result<ServerMessage, DomainError> {
-    let id = command_id.to_string();
-    let command = Command::find_by_statement(sql!(
-        "SELECT * FROM commands WHERE command_id = ?",
-        id.as_str(),
-    ))
-    .one(tx)
-    .await?
-    .filter(|command| command.exam_id == key.exam && command.oj_user_id == key.user)
-    .ok_or(DomainError::Conflict)?;
+    let command = Entity::find_by_id(command_id.to_string())
+        .one(tx)
+        .await?
+        .filter(|command| command.exam_id == key.exam && command.oj_user_id == key.user)
+        .ok_or(DomainError::Conflict)?;
 
     if !valid_result(status, error_code.as_deref()) {
         return Err(DomainError::Conflict);
@@ -122,13 +130,14 @@ pub(crate) async fn result(
         return Err(DomainError::Conflict);
     }
 
-    tx.execute_raw(sql!(
-        "UPDATE commands SET lifecycle = 'reported', result_status = ?, result_error_code = ?
-         WHERE command_id = ?",
-        status_name,
-        error_code,
-        id,
-    ))
+    Entity::update(ActiveModel {
+        command_id: Set(command.command_id),
+        lifecycle: Set("reported".into()),
+        result_status: Set(Some(status_name)),
+        result_error_code: Set(error_code),
+        ..Default::default()
+    })
+    .exec_without_returning(tx)
     .await?;
     if let Some(state) = resulting_state(db::parse_enum(&command.name)?, status, runtime.state()?) {
         update_state(tx, key, state).await?;
