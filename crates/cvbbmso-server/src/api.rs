@@ -141,6 +141,8 @@ async fn upgrade(
     let request_span = Span::current();
     let failure_span = request_span.clone();
     Ok(upgrade
+        .max_frame_size(socket::MAX_MESSAGE_BYTES)
+        .max_message_size(socket::MAX_MESSAGE_BYTES)
         .on_failed_upgrade(move |_| {
             failure_span.in_scope(|| tracing::warn!("WebSocket upgrade failed"));
         })

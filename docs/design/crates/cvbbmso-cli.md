@@ -57,7 +57,8 @@ cvbbmso-cli recordings show --exam <exam-id> --oj-user-id 12345
 - `--segment-duration` 单位为秒，和 `--fps` 一样必须大于零。
 - `participants import` 的 CSV 读取 `oj_user_id` 列；CLI 解析后以 `Vec<i64>` 传给领域层，重复 ID 由领域层去重。
 - 所有查询命令支持 `--format text|json`，默认 `text`。`--format` 是全局参数，可放在子命令前后。
-- `incidents list` 支持 `--exam`、`--oj-user-id`、`--kind`、`--since`、`--until` 组合筛选，结果按 `occurred_at` 升序排列。
+- `participants remove` 只能在考试开始前执行。
+- `incidents list` 支持 `--exam`、`--oj-user-id`、`--kind`、`--since`、`--until` 组合筛选，结果按 `occurred_at`、`incident_id` 升序排列。
 
 ## AdminOperation 映射
 
@@ -111,4 +112,4 @@ cvbbmso-cli incidents list --exam <exam-id> --kind connection_lost --format json
 ]
 ```
 
-`incidents list` 的 `--kind` 支持 `connection_lost`、`connection_restored`、`process_restarted`、`recording_failed`、`recording_recovered`、`navigation_denied`。`connection_lost` 与 `connection_restored` 是两条独立记录，CLI 按 `occurred_at` 排序展示；客户端保持离线时，CLI 仍能查询到服务端记录的 `connection_lost`。
+`incidents list` 的 `--kind` 支持 `connection_lost`、`connection_restored`、`process_restarted`、`recording_failed`、`recording_recovered`、`navigation_denied`。`connection_lost` 与 `connection_restored` 是两条独立记录；客户端保持离线时，CLI 仍能查询到服务端记录的 `connection_lost`。

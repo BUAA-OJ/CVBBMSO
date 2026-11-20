@@ -114,7 +114,7 @@ async fn serve(config: ServerConfig) -> Result<(), ServerError> {
     tracing::info!(listen_addr = %listener.local_addr()?, "server listening");
     tokio::select! {
         result = axum::serve(listener, router) => result.map_err(ServerError::Io),
-        result = manager.run() => result.map_err(ServerError::Database),
-        () = hub.schedule() => Err(ServerError::Io(io::Error::other("connection manager stopped"))),
+        () = manager.run() => Err(ServerError::Io(io::Error::other("connection manager stopped"))),
+        () = hub.schedule() => Err(ServerError::Io(io::Error::other("command scheduler stopped"))),
     }
 }

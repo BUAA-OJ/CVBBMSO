@@ -1,16 +1,20 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use cvbbmso_domain::{DisconnectReason, DomainError, ExamService};
-use cvbbmso_protocol::{ClientHello, ClientMessage, ServerMessage, error_code};
+use cvbbmso_protocol::{
+    ClientHello, ClientMessage, CommandName, CommandStatus, ServerMessage, error_code,
+};
+use time::OffsetDateTime;
 use tokio::{
     sync::{mpsc, oneshot},
-    time::{self, Instant, MissedTickBehavior},
+    time::{Instant, MissedTickBehavior, interval},
 };
 use uuid::Uuid;
 
 const INBOUND_CAPACITY: usize = 256;
 pub(crate) const OUTBOUND_CAPACITY: usize = 32;
 const SCHEDULE_INTERVAL: Duration = Duration::from_secs(1);
+const DISCONNECT_RETRY_BATCH: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct StudentKey {
@@ -44,6 +48,7 @@ enum Request {
         connection: Connection,
         message: ClientMessage,
         received_at: Instant,
+        processed: oneshot::Sender<()>,
     },
     End {
         connection: Connection,
@@ -78,14 +83,18 @@ impl Hub {
         message: ClientMessage,
         received_at: Instant,
     ) -> bool {
+        // Let each reader contribute at most one application message to the shared queue.
+        let (processed, completion) = oneshot::channel();
         self.0
             .send(Request::Receive {
                 connection,
                 message,
                 received_at,
+                processed,
             })
             .await
             .is_ok()
+            && completion.await.is_ok()
     }
 
     pub(crate) async fn end(
@@ -117,7 +126,7 @@ impl Hub {
     }
 
     pub(crate) async fn schedule(self) {
-        let mut ticks = time::interval(SCHEDULE_INTERVAL);
+        let mut ticks = interval(SCHEDULE_INTERVAL);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             ticks.tick().await;
@@ -133,12 +142,99 @@ struct Current {
     deadline: Instant,
     frames: mpsc::Sender<ServerMessage>,
     close: oneshot::Sender<Option<SocketError>>,
+    start: Option<Command>,
+    end: Option<Command>,
+}
+
+struct Command {
+    id: Uuid,
+    name: CommandName,
+    result: Option<(CommandStatus, Option<String>)>,
+}
+
+impl Current {
+    fn send(&mut self, frame: ServerMessage) -> bool {
+        if let ServerMessage::Command {
+            command_id, name, ..
+        } = frame
+        {
+            let slot = match name {
+                CommandName::StartExam => &mut self.start,
+                CommandName::EndExam => &mut self.end,
+                _ => return false,
+            };
+            if slot.is_some() {
+                return true;
+            }
+            *slot = Some(Command {
+                id: command_id,
+                name,
+                result: None,
+            });
+        }
+        self.frames.try_send(frame).is_ok()
+    }
+
+    async fn receive(
+        &mut self,
+        exam: &ExamService,
+        message: ClientMessage,
+    ) -> Result<bool, DomainError> {
+        let StudentKey {
+            exam_id,
+            oj_user_id,
+        } = self.connection.student;
+        let ClientMessage::CommandResult {
+            command_id,
+            status,
+            error_code,
+        } = message
+        else {
+            exam.receive(exam_id, oj_user_id, message).await?;
+            return Ok(true);
+        };
+
+        let command = [&mut self.start, &mut self.end]
+            .into_iter()
+            .filter_map(Option::as_mut)
+            .find(|command| command.id == command_id)
+            .ok_or(DomainError::Conflict)?;
+        let result = (status, error_code);
+        match &command.result {
+            Some(previous) if previous != &result => return Err(DomainError::Conflict),
+            Some(_) => {}
+            None => {
+                exam.record_command_result(
+                    exam_id,
+                    oj_user_id,
+                    command_id,
+                    command.name,
+                    status,
+                    result.1.clone(),
+                )
+                .await?;
+                command.result = Some(result);
+            }
+        }
+        Ok(self
+            .frames
+            .try_send(ServerMessage::CommandAck { command_id })
+            .is_ok())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LostConnection {
+    connection: Connection,
+    reason: DisconnectReason,
+    observed_at: OffsetDateTime,
 }
 
 pub(crate) struct Manager {
     exam: Arc<ExamService>,
     requests: mpsc::Receiver<Request>,
     current: HashMap<StudentKey, Current>,
+    lost: HashMap<StudentKey, LostConnection>,
     timeout: Duration,
 }
 
@@ -151,12 +247,13 @@ impl Manager {
                 exam,
                 requests,
                 current: HashMap::new(),
+                lost: HashMap::new(),
                 timeout,
             },
         )
     }
 
-    pub(crate) async fn run(mut self) -> Result<(), DomainError> {
+    pub(crate) async fn run(mut self) {
         while let Some(request) = self.requests.recv().await {
             match request {
                 Request::Connect {
@@ -164,38 +261,47 @@ impl Manager {
                     hello,
                     peer,
                 } => {
-                    self.connect(connection, hello, peer).await?;
+                    self.connect(connection, hello, peer).await;
                 }
                 Request::Receive {
                     connection,
                     message,
                     received_at,
+                    processed,
                 } => {
-                    self.receive(connection, message, received_at).await?;
+                    self.receive(connection, message, received_at).await;
+                    let _ = processed.send(());
                 }
                 Request::End {
                     connection,
                     reason,
                     error,
                 } => {
-                    self.end(connection, reason, error).await?;
+                    self.end(connection, reason, error).await;
                 }
-                Request::Schedule => self.dispatch().await?,
+                Request::Schedule => {
+                    self.dispatch().await;
+                    self.retry_lost().await;
+                }
                 #[cfg(test)]
                 Request::Barrier(done) => {
                     let _ = done.send(());
                 }
             }
         }
-        Ok(())
     }
 
-    async fn connect(
-        &mut self,
-        connection: Connection,
-        hello: ClientHello,
-        peer: Peer,
-    ) -> Result<(), DomainError> {
+    async fn connect(&mut self, connection: Connection, hello: ClientHello, peer: Peer) {
+        // Commit the previous socket's loss before marking this student connected again.
+        if let Some(lost) = self.lost.get(&connection.student).copied()
+            && !self.record_lost(lost).await
+        {
+            connection
+                .span()
+                .in_scope(|| tracing::warn!("WebSocket admission deferred while SQLite is busy"));
+            let _ = peer.close.send(Some(SocketError::INTERNAL_ERROR));
+            return;
+        }
         let StudentKey {
             exam_id,
             oj_user_id,
@@ -207,29 +313,29 @@ impl Manager {
                 let error = SocketError::domain(&error);
                 span.in_scope(|| tracing::warn!(code = error.code, "WebSocket admission rejected"));
                 let _ = peer.close.send(Some(error));
-                return Ok(());
+                return;
             }
         };
 
         let deadline = Instant::now() + self.timeout;
-        let current = Current {
+        let mut current = Current {
             connection,
             deadline,
             frames: peer.frames,
             close: peer.close,
+            start: None,
+            end: None,
         };
+        let delivered = std::iter::once(outcome.sync)
+            .chain(outcome.commands)
+            .all(|frame| current.send(frame));
         if let Some(previous) = self.current.insert(connection.student, current) {
             let _ = previous.close.send(None);
         }
         span.in_scope(|| tracing::info!("WebSocket admitted"));
-        if !self.enqueue(
-            connection.student,
-            std::iter::once(outcome.sync).chain(outcome.commands),
-        ) || peer.admitted.send(deadline).is_err()
-        {
-            self.end(connection, DisconnectReason::Closed, None).await?;
+        if !delivered || peer.admitted.send(deadline).is_err() {
+            self.end(connection, DisconnectReason::Closed, None).await;
         }
-        Ok(())
     }
 
     async fn receive(
@@ -237,40 +343,33 @@ impl Manager {
         connection: Connection,
         message: ClientMessage,
         received_at: Instant,
-    ) -> Result<(), DomainError> {
+    ) {
         let Some(current) = self.current.get_mut(&connection.student) else {
-            return Ok(());
+            return;
         };
         if current.connection.id != connection.id {
-            return Ok(());
+            return;
         }
         if received_at >= current.deadline {
-            return self
-                .end(connection, DisconnectReason::HeartbeatTimeout, None)
+            self.end(connection, DisconnectReason::HeartbeatTimeout, None)
                 .await;
+            return;
         }
         let heartbeat = matches!(message, ClientMessage::Heartbeat);
-        let StudentKey {
-            exam_id,
-            oj_user_id,
-        } = connection.student;
-        match self.exam.receive(exam_id, oj_user_id, message).await {
-            Ok(replies) => {
+        match current.receive(&self.exam, message).await {
+            Ok(true) => {
                 if heartbeat {
                     current.deadline = received_at + self.timeout;
                 }
-                if !self.enqueue(connection.student, replies) {
-                    self.end(connection, DisconnectReason::Closed, None).await?;
-                }
-                Ok(())
             }
+            Ok(false) => self.end(connection, DisconnectReason::Closed, None).await,
             Err(error) => {
                 self.end(
                     connection,
                     DisconnectReason::Closed,
                     Some(SocketError::domain(&error)),
                 )
-                .await
+                .await;
             }
         }
     }
@@ -280,21 +379,27 @@ impl Manager {
         connection: Connection,
         reason: DisconnectReason,
         error: Option<SocketError>,
-    ) -> Result<(), DomainError> {
+    ) {
         let Some(current) = self.current.get(&connection.student) else {
-            return Ok(());
+            return;
         };
         if current.connection.id != connection.id
             || (matches!(reason, DisconnectReason::HeartbeatTimeout)
                 && Instant::now() < current.deadline)
         {
-            return Ok(());
+            return;
         }
-        let StudentKey {
-            exam_id,
-            oj_user_id,
-        } = connection.student;
-        self.exam.disconnect(exam_id, oj_user_id, reason).await?;
+        let lost = LostConnection {
+            connection,
+            reason,
+            observed_at: self.exam.now(),
+        };
+        if !self.record_lost(lost).await {
+            connection
+                .span()
+                .in_scope(|| tracing::warn!("SQLite is busy; deferring disconnect record"));
+            self.lost.insert(connection.student, lost);
+        }
         if let Some(current) = self.current.remove(&connection.student) {
             connection.span().in_scope(|| {
                 if let Some(error) = error {
@@ -304,15 +409,47 @@ impl Manager {
             });
             let _ = current.close.send(error);
         }
-        Ok(())
     }
 
-    async fn dispatch(&mut self) -> Result<(), DomainError> {
+    async fn record_lost(&mut self, lost: LostConnection) -> bool {
+        let StudentKey {
+            exam_id,
+            oj_user_id,
+        } = lost.connection.student;
+        match self
+            .exam
+            .disconnect_at(exam_id, oj_user_id, lost.reason, lost.observed_at)
+            .await
+        {
+            Err(error) if error.is_storage_busy() => return false,
+            Err(error) => lost
+                .connection
+                .span()
+                .in_scope(|| tracing::error!(?error, "could not record WebSocket disconnect")),
+            Ok(()) => {}
+        }
+        self.lost.remove(&lost.connection.student);
+        true
+    }
+
+    async fn retry_lost(&mut self) {
+        for _ in 0..DISCONNECT_RETRY_BATCH {
+            let Some(lost) = self.lost.values().next().copied() else {
+                break;
+            };
+            if !self.record_lost(lost).await {
+                // A locked database applies to all pending disconnects.
+                break;
+            }
+        }
+    }
+
+    async fn dispatch(&mut self) {
         let commands = match self.exam.due_commands().await {
             Ok(commands) => commands,
             Err(error) => {
                 tracing::warn!(%error, "command scheduling failed");
-                return Ok(());
+                return;
             }
         };
         for command in commands {
@@ -320,23 +457,14 @@ impl Manager {
                 exam_id: command.exam_id,
                 oj_user_id: command.oj_user_id,
             };
-            let Some(current) = self.current.get(&student) else {
+            let Some(current) = self.current.get_mut(&student) else {
                 continue;
             };
             let connection = current.connection;
-            if !self.enqueue(student, [command.command]) {
-                self.end(connection, DisconnectReason::Closed, None).await?;
+            if !current.send(command.command) {
+                self.end(connection, DisconnectReason::Closed, None).await;
             }
         }
-        Ok(())
-    }
-
-    fn enqueue(&self, key: StudentKey, messages: impl IntoIterator<Item = ServerMessage>) -> bool {
-        self.current.get(&key).is_some_and(|current| {
-            messages
-                .into_iter()
-                .all(|message| current.frames.try_send(message).is_ok())
-        })
     }
 }
 
@@ -361,6 +489,10 @@ impl SocketError {
         code: error_code::PROTOCOL_ERROR,
         message: "hello must be the first message",
     };
+    const INTERNAL_ERROR: Self = Self {
+        code: error_code::INTERNAL_ERROR,
+        message: "Internal server error",
+    };
 
     fn domain(error: &DomainError) -> Self {
         match error {
@@ -373,10 +505,7 @@ impl SocketError {
                 code: error_code::COMMAND_STATE_CONFLICT,
                 message: "Command result conflicts with command state",
             },
-            _ => Self {
-                code: error_code::INTERNAL_ERROR,
-                message: "Internal server error",
-            },
+            _ => Self::INTERNAL_ERROR,
         }
     }
 

@@ -50,6 +50,12 @@ pub enum DomainError {
 }
 
 impl DomainError {
+    /// Returns whether a temporary SQLite lock prevented the operation.
+    #[must_use]
+    pub fn is_storage_busy(&self) -> bool {
+        db::busy(self)
+    }
+
     fn storage(source: impl Error + Send + Sync + 'static) -> Self {
         Self::Storage {
             source: Box::new(source),

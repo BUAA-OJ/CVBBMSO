@@ -8,7 +8,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub oj_user_id: i64,
     #[sea_orm(primary_key, auto_increment = false)]
-    pub seq: Vec<u8>,
+    pub seq: i64,
     pub event: String,
     pub received_at: String,
 }

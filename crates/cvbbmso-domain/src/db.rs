@@ -1,11 +1,10 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
 use cvbbmso_protocol::{ClientState, ExamPhase, ExamSummary, RecordingPolicy};
-use sea_orm::sqlx::ConnectOptions as _;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait,
-    JoinType, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait, RuntimeErr,
-    TransactionTrait, sqlx,
+    ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
+    DatabaseTransaction, DbErr, EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect,
+    QueryTrait, RelationTrait, RuntimeErr, TransactionTrait, sqlx,
 };
 use sea_orm_migration::MigratorTrait;
 use serde::{Serialize, de::DeserializeOwned};
@@ -24,22 +23,20 @@ pub(crate) async fn open(url: &str) -> Result<DatabaseConnection, DomainError> {
     if !url.starts_with("sqlite:") {
         return Err(DomainError::InvalidInput);
     }
-    let options = url
-        .parse::<sqlx::sqlite::SqliteConnectOptions>()
-        .map_err(DomainError::storage)?
-        .foreign_keys(true)
-        .busy_timeout(Duration::from_millis(250))
-        .disable_statement_logging();
+    let mut options = ConnectOptions::new(url);
     // A memory database shares the lifetime of its single pooled connection.
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+    options
         .max_connections(1)
         .min_connections(1)
         .idle_timeout(None)
         .max_lifetime(None)
-        .connect_with(options)
-        .await
-        .map_err(DomainError::storage)?;
-    let db = DatabaseConnection::from(pool);
+        .sqlx_logging(false)
+        .map_sqlx_sqlite_opts(|options| {
+            options
+                .foreign_keys(true)
+                .busy_timeout(Duration::from_millis(250))
+        });
+    let db = Database::connect(options).await?;
     write(&db, |transaction| {
         Box::pin(async move {
             Migrator::up(transaction, None).await?;
@@ -85,7 +82,7 @@ pub(crate) async fn transaction<T>(
     }
 }
 
-fn busy(error: &DomainError) -> bool {
+pub(crate) fn busy(error: &DomainError) -> bool {
     let DomainError::Storage { source } = error else {
         return false;
     };
@@ -139,17 +136,6 @@ pub(crate) fn encode(value: &impl Serialize) -> Result<String, DomainError> {
 
 pub(crate) fn decode<T: DeserializeOwned>(value: &str) -> Result<T, DomainError> {
     serde_json::from_str(value).map_err(DomainError::storage)
-}
-
-pub(crate) fn encode_seq(value: u64) -> Vec<u8> {
-    value.to_be_bytes().to_vec()
-}
-
-pub(crate) fn decode_seq(value: &[u8]) -> Result<u64, DomainError> {
-    value
-        .try_into()
-        .map(u64::from_be_bytes)
-        .map_err(DomainError::storage)
 }
 
 #[derive(Clone, Debug)]

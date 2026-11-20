@@ -1,7 +1,8 @@
 use cvbbmso_protocol::{ExamEvent, RecordingManifest, SegmentMeta};
 use sea_orm::{
-    ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
-    sea_query::OnConflict,
+    ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Select,
+    Set,
+    sea_query::{Expr, ExprTrait, Func},
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -9,26 +10,24 @@ use uuid::Uuid;
 use crate::{
     DomainError,
     db::{self, Runtime, StudentKey},
-    entity::{event as stored_event, incident, manifest as stored_manifest, runtime},
+    entity::{event as stored_event, incident, runtime},
 };
 
 pub(crate) async fn receive(
     tx: &DatabaseTransaction,
     key: &StudentKey,
     runtime: &Runtime,
-    seq: u64,
+    seq: i64,
     event: ExamEvent,
     now: OffsetDateTime,
 ) -> Result<(), DomainError> {
-    if seq == 0 {
+    if seq <= 0 {
         return Err(DomainError::InvalidInput);
     }
     let event = validated(event)?;
-    let encoded_seq = db::encode_seq(seq);
-    if let Some(existing) =
-        stored_event::Entity::find_by_id((key.exam.clone(), key.user, encoded_seq.clone()))
-            .one(tx)
-            .await?
+    if let Some(existing) = stored_event::Entity::find_by_id((key.exam.clone(), key.user, seq))
+        .one(tx)
+        .await?
     {
         let existing: ExamEvent = db::decode(&existing.event)?;
         return if existing == event {
@@ -38,55 +37,99 @@ pub(crate) async fn receive(
         };
     }
 
+    if let ExamEvent::RecordingFinalized(ref manifest) = event
+        && recording(tx, key)
+            .await
+            .map_err(|error| match error {
+                DomainError::Conflict => DomainError::InvalidInput,
+                error => error,
+            })?
+            .is_some_and(|(_, existing)| &existing != manifest)
+    {
+        return Err(DomainError::InvalidInput);
+    }
+
     stored_event::Entity::insert(stored_event::ActiveModel {
         exam_id: Set(key.exam.clone()),
         oj_user_id: Set(key.user),
-        seq: Set(encoded_seq.clone()),
+        seq: Set(seq),
         event: Set(db::encode(&event)?),
         received_at: Set(db::stored_time(now)?),
     })
     .exec_without_returning(tx)
     .await?;
-    match event {
-        ExamEvent::Incident(incident) => {
-            save_incident(
-                tx,
-                key,
-                Evidence {
-                    source: "client",
-                    kind: &db::enum_name(incident.code)?,
-                    occurred_at: db::input_time(incident.occurred_at)?,
-                    detail: incident.detail.as_deref(),
-                    seq: Some(encoded_seq),
-                },
-            )
-            .await?;
-        }
-        ExamEvent::RecordingFinalized(manifest) => {
-            use stored_manifest::Column;
-            stored_manifest::Entity::insert(stored_manifest::ActiveModel {
-                exam_id: Set(key.exam.clone()),
-                oj_user_id: Set(key.user),
-                source_seq: Set(encoded_seq.clone()),
-                manifest: Set(db::encode(&manifest)?),
-            })
-            .on_conflict(
-                OnConflict::columns([Column::ExamId, Column::OjUserId])
-                    .update_columns([Column::SourceSeq, Column::Manifest])
-                    .action_and_where(Column::SourceSeq.lt(encoded_seq))
-                    .to_owned(),
-            )
-            .exec_without_returning(tx)
-            .await?;
-        }
-        _ => {}
+    if let ExamEvent::Incident(incident) = event {
+        save_incident(
+            tx,
+            key,
+            &db::enum_name(incident.code)?,
+            db::input_time(incident.occurred_at)?,
+            incident.detail,
+        )
+        .await?;
     }
 
-    let acknowledged = db::decode_seq(&runtime.ack_event_through)?;
-    if acknowledged.checked_add(1) == Some(seq) {
+    if runtime.ack_event_through.checked_add(1) == Some(seq) {
         advance_ack(tx, key, seq).await?;
     }
     Ok(())
+}
+
+fn student_events(key: &StudentKey) -> Select<stored_event::Entity> {
+    use stored_event::Column;
+    stored_event::Entity::find()
+        .filter(Column::ExamId.eq(key.exam.as_str()))
+        .filter(Column::OjUserId.eq(key.user))
+}
+
+pub(crate) async fn has_gap(
+    tx: &DatabaseTransaction,
+    key: &StudentKey,
+    ack_event_through: i64,
+) -> Result<bool, DomainError> {
+    use stored_event::Column;
+    Ok(student_events(key)
+        .select_only()
+        .column(Column::Seq)
+        .filter(Column::Seq.gt(ack_event_through))
+        .into_tuple::<i64>()
+        .one(tx)
+        .await?
+        .is_some())
+}
+
+pub(crate) async fn recording(
+    tx: &DatabaseTransaction,
+    key: &StudentKey,
+) -> Result<Option<(i64, RecordingManifest)>, DomainError> {
+    use stored_event::Column;
+    // Older versions allowed different manifests. Preserve the events and
+    // surface the ambiguity instead of returning one as the exam's recording.
+    let manifests = student_events(key)
+        .filter(
+            Expr::from(
+                Func::cust("json_extract")
+                    .arg(Expr::col(Column::Event))
+                    .arg("$.kind"),
+            )
+            .eq("recording_finalized"),
+        )
+        .select_only()
+        .expr(Func::min(Expr::col(Column::Seq)))
+        .column(Column::Event)
+        .group_by(Column::Event)
+        .limit(2)
+        .into_tuple::<(i64, String)>()
+        .all(tx)
+        .await?;
+    match manifests.as_slice() {
+        [] => Ok(None),
+        [(seq, event)] => match db::decode(event)? {
+            ExamEvent::RecordingFinalized(manifest) => Ok(Some((*seq, manifest))),
+            _ => Err(DomainError::InvalidInput),
+        },
+        _ => Err(DomainError::Conflict),
+    }
 }
 
 fn validated(event: ExamEvent) -> Result<ExamEvent, DomainError> {
@@ -127,41 +170,38 @@ fn validate_segment(segment: SegmentMeta) -> Result<SegmentMeta, DomainError> {
 async fn advance_ack(
     tx: &DatabaseTransaction,
     key: &StudentKey,
-    mut count: u64,
+    mut count: i64,
 ) -> Result<(), DomainError> {
     // Scan bounded batches so a large out-of-order backlog does not load full events
-    // or allocate unbounded memory. The BLOB ordering preserves the unsigned order.
+    // or allocate unbounded memory.
     loop {
         use stored_event::Column;
-        let sequences = stored_event::Entity::find()
+        let sequences = student_events(key)
             .select_only()
             .column(Column::Seq)
-            .filter(Column::ExamId.eq(key.exam.as_str()))
-            .filter(Column::OjUserId.eq(key.user))
-            .filter(Column::Seq.gt(db::encode_seq(count)))
+            .filter(Column::Seq.gt(count))
             .order_by_asc(Column::Seq)
             .limit(256)
-            .into_tuple::<Vec<u8>>()
+            .into_tuple::<i64>()
             .all(tx)
             .await?;
         let full_batch = sequences.len() == 256;
         let mut continuous = true;
-        for seq in sequences {
-            let next = db::decode_seq(&seq)?;
+        for next in sequences {
             if count.checked_add(1) != Some(next) {
                 continuous = false;
                 break;
             }
             count = next;
         }
-        if !full_batch || !continuous || count == u64::MAX {
+        if !full_batch || !continuous || count == i64::MAX {
             break;
         }
     }
     runtime::Entity::update(runtime::ActiveModel {
         exam_id: Set(key.exam.clone()),
         oj_user_id: Set(key.user),
-        ack_event_through: Set(db::encode_seq(count)),
+        ack_event_through: Set(count),
         ..Default::default()
     })
     .exec_without_returning(tx)
@@ -175,47 +215,33 @@ pub(crate) async fn save_server_incident(
     kind: &str,
     now: OffsetDateTime,
     detail: Option<&str>,
-) -> Result<String, DomainError> {
+) -> Result<(), DomainError> {
     save_incident(
         tx,
         key,
-        Evidence {
-            source: "server",
-            kind,
-            occurred_at: db::stored_time(now)?,
-            detail,
-            seq: None,
-        },
+        kind,
+        db::stored_time(now)?,
+        detail.map(String::from),
     )
     .await
-}
-
-struct Evidence<'a> {
-    source: &'static str,
-    kind: &'a str,
-    occurred_at: String,
-    detail: Option<&'a str>,
-    seq: Option<Vec<u8>>,
 }
 
 async fn save_incident(
     tx: &DatabaseTransaction,
     key: &StudentKey,
-    evidence: Evidence<'_>,
-) -> Result<String, DomainError> {
-    let id = Uuid::new_v4().to_string();
+    kind: &str,
+    occurred_at: String,
+    detail: Option<String>,
+) -> Result<(), DomainError> {
     incident::Entity::insert(incident::ActiveModel {
-        incident_id: Set(id.clone()),
+        incident_id: Set(Uuid::new_v4().to_string()),
         exam_id: Set(key.exam.clone()),
         oj_user_id: Set(key.user),
-        source: Set(evidence.source.into()),
-        kind: Set(evidence.kind.into()),
-        occurred_at: Set(evidence.occurred_at),
-        detail: Set(evidence.detail.map(String::from)),
-        event_seq: Set(evidence.seq),
-        ..Default::default()
+        kind: Set(kind.into()),
+        occurred_at: Set(occurred_at),
+        detail: Set(detail),
     })
     .exec_without_returning(tx)
     .await?;
-    Ok(id)
+    Ok(())
 }

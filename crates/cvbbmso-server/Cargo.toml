@@ -15,6 +15,7 @@ cvbbmso-protocol.workspace = true
 futures-util = { workspace = true, features = ["sink"] }
 serde_json.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite.workspace = true
 tracing.workspace = true
@@ -23,7 +24,6 @@ uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 tempfile.workspace = true
-time.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { workspace = true, features = ["handshake"] }
 tower = { workspace = true, features = ["util"] }

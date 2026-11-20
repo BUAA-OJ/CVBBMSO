@@ -23,7 +23,14 @@ use tokio::{
 };
 use tokio_tungstenite::{
     WebSocketStream, client_async,
-    tungstenite::{Error as ClientError, Message, client::IntoClientRequest},
+    tungstenite::{
+        Error as ClientError, Message,
+        client::IntoClientRequest,
+        protocol::frame::{
+            Frame,
+            coding::{Data, OpCode},
+        },
+    },
 };
 use tower::ServiceExt;
 
@@ -128,7 +135,7 @@ impl Fixture {
         let (clients, connections) = mpsc::unbounded_channel();
         let app = router(state.clone());
         let tasks = vec![
-            tokio::spawn(async move { manager.run().await.unwrap() }),
+            tokio::spawn(manager.run()),
             tokio::spawn(
                 async move { axum::serve(MemoryListener(connections), app).await.unwrap() },
             ),
@@ -391,6 +398,27 @@ async fn validates_first_message_and_rechecks_enrollment_after_upgrade() {
     assert!(students.is_empty());
 }
 
+#[tokio::test]
+async fn limits_the_total_size_of_a_fragmented_message() {
+    let fixture = Fixture::new().await;
+    let mut socket = fixture.upgrade(&fixture.path(), COOKIE).await.unwrap();
+    for (opcode, final_frame) in [(Data::Text, false), (Data::Continue, true)] {
+        let bytes = vec![b' '; socket::MAX_MESSAGE_BYTES / 2 + 1];
+        socket
+            .send(Message::Frame(Frame::message(
+                bytes,
+                OpCode::Data(opcode),
+                final_frame,
+            )))
+            .await
+            .unwrap();
+    }
+    socket_error(&mut socket, error_code::PROTOCOL_ERROR).await;
+    let state = hello(ExecutionState::Ready, RecordingState::Idle);
+    let mut socket = open_socket(&fixture, &state, 0).await;
+    close_socket(&fixture, &mut socket).await;
+}
+
 async fn confirm(socket: &mut TestSocket, command_id: Uuid) {
     send(
         socket,
@@ -487,6 +515,7 @@ async fn starts_schedules_and_finishes_an_exam_over_websocket() {
     fixture.state.hub.barrier().await;
 
     assert_finished_recording(&fixture, &manifest).await;
+    assert!(incidents(&fixture).await.is_empty());
 }
 
 async fn assert_finished_recording(fixture: &Fixture, manifest: &RecordingManifest) {
@@ -524,19 +553,6 @@ async fn assert_finished_recording(fixture: &Fixture, manifest: &RecordingManife
         panic!("expected recording");
     };
     assert_eq!(&recording, manifest);
-    let AdminOutput::Incidents(incidents) = fixture
-        .admin(AdminOperation::IncidentsList {
-            exam_id: fixture.exam_id,
-            oj_user_id: Some(STUDENT),
-            kind: None,
-            since: None,
-            until: None,
-        })
-        .await
-    else {
-        panic!("expected incident list");
-    };
-    assert!(incidents.is_empty());
 }
 
 async fn events(fixture: &Fixture) -> Vec<cvbbmso_domain::EventRecord> {
@@ -568,7 +584,7 @@ async fn incidents(fixture: &Fixture) -> Vec<cvbbmso_domain::IncidentRecord> {
     incidents
 }
 
-fn navigation(seq: u64, detail: &str) -> ClientMessage {
+fn navigation(seq: i64, detail: &str) -> ClientMessage {
     ClientMessage::Event {
         seq,
         event: ExamEvent::Incident(cvbbmso_protocol::ClientIncident {
@@ -582,7 +598,7 @@ fn navigation(seq: u64, detail: &str) -> ClientMessage {
 async fn open_socket(
     fixture: &Fixture,
     state: &ClientMessage,
-    ack_event_through: u64,
+    ack_event_through: i64,
 ) -> TestSocket {
     let mut socket = fixture.upgrade(&fixture.path(), COOKIE).await.unwrap();
     send(&mut socket, state).await;
@@ -669,17 +685,56 @@ async fn replays_end_handshake_after_ack_loss() {
     let current = command(&mut resumed, CommandName::EndExam, END).await;
     assert_ne!(previous, current);
     send(&mut resumed, &finalized).await;
-    send(&mut resumed, &result).await;
-    assert_eq!(
-        message(&mut resumed).await,
-        ServerMessage::CommandAck {
-            command_id: previous
-        }
-    );
     confirm(&mut resumed, current).await;
-    close_socket(&fixture, &mut resumed).await;
+    confirm(&mut resumed, current).await;
+    send(&mut resumed, &result).await;
+    socket_error(&mut resumed, error_code::COMMAND_STATE_CONFLICT).await;
     assert!(incidents(&fixture).await.is_empty());
     assert_eq!(events(&fixture).await.len(), 1);
+}
+
+#[tokio::test]
+async fn successful_end_waits_for_a_contiguous_manifest() {
+    let fixture = Fixture::new().await;
+    fixture.clock.store(END, Ordering::Relaxed);
+    let state = hello(ExecutionState::Finalizing, RecordingState::Complete);
+    let mut socket = open_socket(&fixture, &state, 0).await;
+    let end = command(&mut socket, CommandName::EndExam, END).await;
+    let digest = Sha256Digest::parse(&"b".repeat(64)).unwrap();
+    let segment = SegmentMeta::new(1, instant(START), instant(END), digest.clone()).unwrap();
+    let manifest = RecordingManifest::new(vec![segment.clone()], digest).unwrap();
+    send(
+        &mut socket,
+        &ClientMessage::Event {
+            seq: 2,
+            event: ExamEvent::RecordingFinalized(manifest.clone()),
+        },
+    )
+    .await;
+    send(
+        &mut socket,
+        &ClientMessage::CommandResult {
+            command_id: end,
+            status: CommandStatus::Completed,
+            error_code: None,
+        },
+    )
+    .await;
+    socket_error(&mut socket, error_code::COMMAND_STATE_CONFLICT).await;
+
+    let mut socket = open_socket(&fixture, &state, 0).await;
+    let end = command(&mut socket, CommandName::EndExam, END).await;
+    send(
+        &mut socket,
+        &ClientMessage::Event {
+            seq: 1,
+            event: ExamEvent::SegmentFinalized(segment),
+        },
+    )
+    .await;
+    confirm(&mut socket, end).await;
+    close_socket(&fixture, &mut socket).await;
+    assert_finished_recording(&fixture, &manifest).await;
 }
 
 #[tokio::test]
@@ -749,7 +804,8 @@ async fn replacement_ignores_old_close_timeout_and_event_notices() {
     );
     fixture.state.hub.barrier().await;
     assert!(events(&fixture).await.is_empty());
-    let incidents = incidents(&fixture).await;
+    let mut incidents = incidents(&fixture).await;
+    incidents.sort_by(|left, right| left.kind.cmp(&right.kind));
     assert_eq!(
         incidents
             .iter()
@@ -892,6 +948,10 @@ async fn recovers_online_state_after_restart_and_reissues_pending_command() {
     let incidents_before_connect = incidents(&fixture).await;
     assert_eq!(incidents_before_connect.len(), 1);
     assert_eq!(incidents_before_connect[0].kind, "connection_lost");
+    assert_eq!(
+        incidents_before_connect[0].detail.as_deref(),
+        Some("server_restart")
+    );
     let ClientMessage::Hello(hello) = hello else {
         unreachable!();
     };

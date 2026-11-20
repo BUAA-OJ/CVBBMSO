@@ -8,7 +8,7 @@ use cvbbmso_protocol::{
     ExamPhase, ExecutionState, IncidentCode, Platform, RecordingManifest, RecordingPolicy,
     RecordingState, SegmentMeta, ServerMessage, Sha256Digest, error_code,
 };
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
+use sea_orm::{ConnectionTrait, EntityTrait, PaginatorTrait, Set};
 use time::{Duration, OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
@@ -86,11 +86,30 @@ impl Fixture {
         self.service.connect(self.exam, USER, hello).await.unwrap()
     }
 
-    async fn receive(&self, message: ClientMessage) -> Vec<ServerMessage> {
+    async fn receive(&self, message: ClientMessage) {
         self.service
             .receive(self.exam, USER, message)
             .await
-            .unwrap()
+            .unwrap();
+    }
+
+    async fn report(
+        &self,
+        command_id: Uuid,
+        name: CommandName,
+        status: CommandStatus,
+        error_code: Option<&str>,
+    ) -> Result<(), DomainError> {
+        self.service
+            .record_command_result(
+                self.exam,
+                USER,
+                command_id,
+                name,
+                status,
+                error_code.map(str::to_owned),
+            )
+            .await
     }
 
     async fn runtime(&self) -> StudentRuntime {
@@ -122,7 +141,9 @@ impl Fixture {
         incidents
     }
 
-    async fn sql(&self, sql: &str) {
+    // SeaQuery does not build SQLite triggers. These inject database failures
+    // at specific writes so the tests can check transaction rollback.
+    async fn trigger_ddl(&self, sql: &str) {
         self.service
             .admin()
             .0
@@ -171,7 +192,7 @@ fn command(message: &ServerMessage, expected_name: CommandName, expected_time: i
     command_id
 }
 
-fn sync(outcome: &ConnectOutcome, expected_phase: ExamPhase, expected_ack: u64) {
+fn sync(outcome: &ConnectOutcome, expected_phase: ExamPhase, expected_ack: i64) {
     let ServerMessage::Sync {
         phase,
         ack_event_through,
@@ -184,23 +205,7 @@ fn sync(outcome: &ConnectOutcome, expected_phase: ExamPhase, expected_ack: u64) 
     assert_eq!(ack_event_through, expected_ack);
 }
 
-fn completed(command_id: Uuid) -> ClientMessage {
-    ClientMessage::CommandResult {
-        command_id,
-        status: CommandStatus::Completed,
-        error_code: None,
-    }
-}
-
-fn failed(command_id: Uuid) -> ClientMessage {
-    ClientMessage::CommandResult {
-        command_id,
-        status: CommandStatus::Failed,
-        error_code: Some(error_code::INTERNAL_ERROR.to_owned()),
-    }
-}
-
-fn incident_event(seq: u64, timestamp: OffsetDateTime) -> ClientMessage {
+fn incident_event(seq: i64, timestamp: OffsetDateTime) -> ClientMessage {
     ClientMessage::Event {
         seq,
         event: ExamEvent::Incident(ClientIncident {
@@ -211,7 +216,7 @@ fn incident_event(seq: u64, timestamp: OffsetDateTime) -> ClientMessage {
     }
 }
 
-fn recording_event(seq: u64, hash: char) -> (ClientMessage, RecordingManifest) {
+fn recording_event(seq: i64, hash: char) -> (ClientMessage, RecordingManifest) {
     let segment = SegmentMeta::new(
         1,
         time(START),
@@ -261,12 +266,14 @@ async fn enrollment_is_rechecked_and_removal_preserves_prior_evidence() {
     assert!(f.runtime().await.connected);
     f.receive(incident_event(2, time(START - 1))).await;
     assert_eq!(f.incidents().await.len(), 2);
+    f.set(START);
+    assert!(f.service.due_commands().await.unwrap().is_empty());
     f.admin(AdminOperation::ParticipantsAdd {
         exam_id: f.exam,
         oj_user_id: USER,
     })
     .await;
-    sync(&f.connect(hello).await, ExamPhase::Scheduled, 2);
+    sync(&f.connect(hello).await, ExamPhase::Running, 2);
 }
 
 #[tokio::test]
@@ -299,7 +306,24 @@ async fn participant_import_counts_only_new_enrollments() {
 }
 
 #[tokio::test]
-async fn time_boundaries_schedule_each_pending_command_once() {
+async fn enrollment_removal_is_rejected_at_and_after_start() {
+    let f = Fixture::memory().await;
+    let op = AdminOperation::ParticipantsRemove {
+        exam_id: f.exam,
+        oj_user_id: USER,
+    };
+    for now in [START, START + 1, END] {
+        f.set(now);
+        assert!(matches!(
+            f.service.admin().execute("tester".into(), op.clone()).await,
+            Err(DomainError::Conflict)
+        ));
+        f.service.check_enrollment(f.exam, USER).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn time_boundaries_determine_command_candidates() {
     let f = Fixture::memory().await;
     let hello = ready();
     let outcome = f.connect(hello).await;
@@ -320,16 +344,26 @@ async fn time_boundaries_schedule_each_pending_command_once() {
             START => {
                 assert_eq!(commands.len(), 1);
                 let command_id = command(&commands[0].command, CommandName::StartExam, START);
-                assert!(f.service.due_commands().await.unwrap().is_empty());
                 assert_eq!(
-                    f.receive(completed(command_id)).await,
-                    [ServerMessage::CommandAck { command_id }]
+                    stored_command::Entity::find()
+                        .count(&f.service.admin().0.database)
+                        .await
+                        .unwrap(),
+                    0
                 );
+                f.report(
+                    command_id,
+                    CommandName::StartExam,
+                    CommandStatus::Completed,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(f.service.due_commands().await.unwrap().is_empty());
             }
             END => {
                 assert_eq!(commands.len(), 1);
                 command(&commands[0].command, CommandName::EndExam, END);
-                assert!(f.service.due_commands().await.unwrap().is_empty());
             }
             _ => assert!(commands.is_empty()),
         }
@@ -337,14 +371,19 @@ async fn time_boundaries_schedule_each_pending_command_once() {
 }
 
 #[tokio::test]
-async fn out_of_order_events_preserve_ack_evidence_and_latest_manifest() {
+async fn out_of_order_events_preserve_ack_and_reject_conflicting_manifests() {
     let f = Fixture::memory().await;
     let hello = ready();
     f.connect(hello.clone()).await;
-    let (third, latest) = recording_event(3, 'c');
+    let (third, manifest) = recording_event(3, 'c');
     f.receive(third).await;
     sync(&f.connect(hello.clone()).await, ExamPhase::Scheduled, 0);
     let (first, _) = recording_event(1, 'b');
+    assert!(matches!(
+        f.service.receive(f.exam, USER, first).await,
+        Err(DomainError::InvalidInput)
+    ));
+    let (first, _) = recording_event(1, 'c');
     f.receive(first).await;
     sync(&f.connect(hello.clone()).await, ExamPhase::Scheduled, 1);
     let occurred_at = time(START - 8);
@@ -392,9 +431,9 @@ async fn out_of_order_events_preserve_ack_evidence_and_latest_manifest() {
     else {
         panic!("expected recording")
     };
-    assert_eq!(recording, latest);
+    assert_eq!(recording, manifest);
 
-    f.receive(incident_event(u64::MAX, occurred_at)).await;
+    f.receive(incident_event(i64::MAX, occurred_at)).await;
     let AdminOutput::Events(events) = f
         .admin(AdminOperation::EventsList {
             exam_id: f.exam,
@@ -406,12 +445,12 @@ async fn out_of_order_events_preserve_ack_evidence_and_latest_manifest() {
     };
     assert_eq!(
         events.iter().map(|event| event.seq).collect::<Vec<_>>(),
-        [1, 2, 3, u64::MAX]
+        [1, 2, 3, i64::MAX]
     );
 }
 
 #[tokio::test]
-async fn replacement_retires_unreported_commands_and_keeps_incident_order() {
+async fn replacement_issues_a_fresh_command_and_records_incidents() {
     let f = Fixture::memory().await;
     f.set(START);
     let old = f.connect(ready()).await;
@@ -423,16 +462,15 @@ async fn replacement_retires_unreported_commands_and_keeps_incident_order() {
     let new = f.connect(ready()).await;
     let new_id = command(&new.commands[0], CommandName::StartExam, START);
     assert_ne!(new_id, old_id);
-    assert!(matches!(
-        f.service.receive(f.exam, USER, completed(old_id)).await,
-        Err(DomainError::Conflict)
-    ));
     let incidents = f.incidents().await;
+    assert!(incidents.windows(2).all(|pair| pair[0].id < pair[1].id));
+    let mut kinds = incidents
+        .iter()
+        .map(|item| item.kind.as_str())
+        .collect::<Vec<_>>();
+    kinds.sort_unstable();
     assert_eq!(
-        incidents
-            .iter()
-            .map(|item| item.kind.as_str())
-            .collect::<Vec<_>>(),
+        kinds,
         [
             "connection_lost",
             "connection_restored",
@@ -440,74 +478,100 @@ async fn replacement_retires_unreported_commands_and_keeps_incident_order() {
         ]
     );
     assert!(incidents.iter().all(|item| item.occurred_at == time(START)));
-    assert_eq!(incidents[0].detail.as_deref(), Some("replaced"));
+    assert_eq!(
+        incidents
+            .iter()
+            .find(|incident| incident.kind == "connection_lost")
+            .unwrap()
+            .detail
+            .as_deref(),
+        Some("replaced")
+    );
 }
 
 #[tokio::test]
-async fn command_replays_and_lost_end_ack_are_idempotent() {
+async fn end_success_requires_the_contiguous_manifest() {
     let f = Fixture::memory().await;
-    f.set(START);
-    let outcome = f.connect(ready()).await;
-    let start = command(&outcome.commands[0], CommandName::StartExam, START);
-    let start_ack = ServerMessage::CommandAck { command_id: start };
-    assert_eq!(
-        f.receive(completed(start)).await,
-        std::slice::from_ref(&start_ack)
-    );
-    assert_eq!(f.receive(completed(start)).await, [start_ack]);
-    assert!(matches!(
-        f.service.receive(f.exam, USER + 1, completed(start)).await,
-        Err(DomainError::Conflict)
-    ));
-    assert!(matches!(
-        f.service.receive(f.exam, USER, failed(start)).await,
-        Err(DomainError::Conflict)
-    ));
-    assert!(matches!(
-        f.service
-            .receive(f.exam, USER, completed(Uuid::nil()))
-            .await,
-        Err(DomainError::Conflict)
-    ));
-
     f.set(END);
-    let due = f.service.due_commands().await.unwrap();
-    let end = command(&due[0].command, CommandName::EndExam, END);
-    let (finalized, _) = recording_event(1, 'b');
-    f.receive(finalized.clone()).await;
-    let end_ack = ServerMessage::CommandAck { command_id: end };
-    assert_eq!(
-        f.receive(completed(end)).await,
-        std::slice::from_ref(&end_ack)
+    let outcome = f
+        .connect(hello(ExecutionState::Finalizing, RecordingState::Complete))
+        .await;
+    let end = command(&outcome.commands[0], CommandName::EndExam, END);
+    let report = || f.report(end, CommandName::EndExam, CommandStatus::Completed, None);
+    assert!(matches!(report().await, Err(DomainError::Conflict)));
+    let (finalized, _) = recording_event(2, 'b');
+    f.receive(finalized).await;
+    assert!(matches!(report().await, Err(DomainError::Conflict)));
+    assert_eq!(f.runtime().await.execution, ExecutionState::Finalizing);
+    assert!(
+        stored_command::Entity::find_by_id(end.to_string())
+            .one(&f.service.admin().0.database)
+            .await
+            .unwrap()
+            .is_none()
     );
+    assert!(matches!(
+        f.report(
+            end,
+            CommandName::EndExam,
+            CommandStatus::Failed,
+            Some(error_code::RECORDING_FINISH_FAILED)
+        )
+        .await,
+        Err(DomainError::Conflict)
+    ));
+    f.receive(incident_event(1, time(END))).await;
+    report().await.unwrap();
+    assert_eq!(f.runtime().await.execution, ExecutionState::Finished);
     f.service
         .disconnect(f.exam, USER, DisconnectReason::Closed)
         .await
         .unwrap();
     assert!(!f.runtime().await.connected);
-    assert!(f.incidents().await.is_empty());
+    assert_eq!(f.incidents().await.len(), 1);
+}
 
-    let outcome = f
-        .connect(hello(ExecutionState::Finalizing, RecordingState::Complete))
-        .await;
-    sync(&outcome, ExamPhase::Ended, 1);
-    let reopened = command(&outcome.commands[0], CommandName::EndExam, END);
-    assert_ne!(reopened, end);
-    assert_eq!(f.receive(completed(end)).await, [end_ack]);
-    assert_eq!(f.runtime().await.execution, ExecutionState::Finalizing);
-    f.receive(finalized).await;
-    assert_eq!(
-        f.receive(completed(reopened)).await,
-        [ServerMessage::CommandAck {
-            command_id: reopened
-        }]
+#[tokio::test]
+async fn command_failure_codes_are_specific_to_the_command() {
+    let f = Fixture::memory().await;
+    f.set(START);
+    let start = command(
+        &f.connect(ready()).await.commands[0],
+        CommandName::StartExam,
+        START,
     );
-    f.service
-        .disconnect(f.exam, USER, DisconnectReason::Closed)
-        .await
-        .unwrap();
+    assert!(matches!(
+        f.report(
+            start,
+            CommandName::StartExam,
+            CommandStatus::Failed,
+            Some(error_code::RECORDING_FINISH_FAILED)
+        )
+        .await,
+        Err(DomainError::Conflict)
+    ));
+    f.report(
+        start,
+        CommandName::StartExam,
+        CommandStatus::Failed,
+        Some(error_code::RECORDING_START_FAILED),
+    )
+    .await
+    .unwrap();
+    f.set(END);
+    let end = command(
+        &f.service.due_commands().await.unwrap()[0].command,
+        CommandName::EndExam,
+        END,
+    );
+    let report = |code| f.report(end, CommandName::EndExam, CommandStatus::Failed, Some(code));
+    assert!(matches!(
+        report(error_code::RECORDING_START_FAILED).await,
+        Err(DomainError::Conflict)
+    ));
+    f.receive(incident_event(1, time(END))).await;
+    report(error_code::RECORDING_FINISH_FAILED).await.unwrap();
     assert_eq!(f.runtime().await.execution, ExecutionState::Finished);
-    assert!(f.incidents().await.is_empty());
 }
 
 #[tokio::test]
@@ -542,14 +606,14 @@ async fn server_startup_cleans_stale_connections_but_admin_open_leaves_them_onli
     let incidents = f.incidents().await;
     assert_eq!(incidents.len(), 1);
     assert_eq!(incidents[0].kind, "connection_lost");
-    assert_eq!(incidents[0].detail.as_deref(), Some("closed"));
+    assert_eq!(incidents[0].detail.as_deref(), Some("server_restart"));
     assert_eq!(incidents[0].occurred_at, time(START));
 }
 
 #[tokio::test]
 async fn failed_audit_rolls_back_enrollment() {
     let f = Fixture::memory().await;
-    f.sql(
+    f.trigger_ddl(
         "CREATE TRIGGER fail_audit BEFORE INSERT ON admin_audit
            BEGIN SELECT RAISE(ABORT, 'test storage failure'); END",
     )
@@ -566,16 +630,28 @@ async fn failed_audit_rolls_back_enrollment() {
         f.service.check_enrollment(f.exam, USER + 1).await,
         Err(DomainError::NotEnrolled)
     ));
-    f.sql("DROP TRIGGER fail_audit").await;
+    f.trigger_ddl("DROP TRIGGER fail_audit").await;
     f.admin(op).await;
     f.service.check_enrollment(f.exam, USER + 1).await.unwrap();
-    let count = audit::Entity::find()
-        .filter(audit::Column::Operation.eq("participants_add"))
-        .filter(audit::Column::TargetUsers.eq(format!("[{}]", USER + 1)))
-        .count(&f.service.admin().0.database)
+    let audits = audit::Entity::find()
+        .all(&f.service.admin().0.database)
         .await
         .unwrap();
-    assert_eq!(count, 1);
+    let operations = audits
+        .iter()
+        .map(|row| db::decode::<serde_json::Value>(&row.operation).unwrap())
+        .collect::<Vec<_>>();
+    assert!(operations.contains(&serde_json::json!({
+        "operation": "participants_add",
+        "exam_id": f.exam,
+        "oj_user_id": USER + 1,
+    })));
+    assert!(
+        operations
+            .iter()
+            .any(|operation| operation["operation"] == "exams_create"
+                && operation["exam_id"] == f.exam.to_string())
+    );
 }
 
 #[tokio::test]
@@ -584,7 +660,7 @@ async fn failed_recovery_incident_rolls_back_connection_replacement() {
     f.set(START);
     let outcome = f.connect(ready()).await;
     let command_id = command(&outcome.commands[0], CommandName::StartExam, START);
-    f.sql(
+    f.trigger_ddl(
         "CREATE TRIGGER fail_restore BEFORE INSERT ON incidents
            WHEN NEW.kind = 'connection_restored'
            BEGIN SELECT RAISE(ABORT, 'test storage failure'); END",
@@ -599,14 +675,96 @@ async fn failed_recovery_incident_rolls_back_connection_replacement() {
     assert!(runtime.connected);
     assert_eq!(runtime.execution, ExecutionState::Ready);
     assert!(f.incidents().await.is_empty());
-    assert_eq!(
-        f.receive(completed(command_id)).await,
-        [ServerMessage::CommandAck { command_id }]
-    );
+    f.report(
+        command_id,
+        CommandName::StartExam,
+        CommandStatus::Completed,
+        None,
+    )
+    .await
+    .unwrap();
 
-    f.sql("DROP TRIGGER fail_restore").await;
+    f.trigger_ddl("DROP TRIGGER fail_restore").await;
     f.connect(replacement).await;
     assert_eq!(f.incidents().await.len(), 3);
+}
+
+#[tokio::test]
+async fn failed_disconnect_keeps_the_runtime_online_and_rolls_back_incident() {
+    let f = Fixture::memory().await;
+    f.connect(ready()).await;
+    f.trigger_ddl(
+        "CREATE TRIGGER fail_offline BEFORE UPDATE OF connected ON student_runtimes
+           BEGIN SELECT RAISE(ABORT, 'test storage failure'); END",
+    )
+    .await;
+    let observed_at = time(START);
+    let disconnect = || {
+        f.service
+            .disconnect_at(f.exam, USER, DisconnectReason::Closed, observed_at)
+    };
+    assert!(matches!(
+        disconnect().await,
+        Err(DomainError::Storage { .. })
+    ));
+    assert!(f.runtime().await.connected);
+    assert!(f.incidents().await.is_empty());
+
+    f.set(END);
+    f.trigger_ddl("DROP TRIGGER fail_offline").await;
+    disconnect().await.unwrap();
+    disconnect().await.unwrap();
+    assert!(!f.runtime().await.connected);
+    let incidents = f.incidents().await;
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].kind, "connection_lost");
+    assert_eq!(incidents[0].occurred_at, observed_at);
+}
+
+#[tokio::test]
+async fn a_locked_disconnect_can_be_retried_at_the_original_time() {
+    use sea_orm::TransactionTrait;
+
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("exam.sqlite").display()
+    );
+    let f = Fixture::open(&url).await;
+    f.connect(ready()).await;
+
+    let writer = sea_orm::Database::connect(&url).await.unwrap();
+    let transaction = writer.begin().await.unwrap();
+    stored_exam::Entity::update(stored_exam::ActiveModel {
+        exam_id: Set(f.exam.to_string()),
+        title: Set("Holding the write lock".into()),
+        ..Default::default()
+    })
+    .exec_without_returning(&transaction)
+    .await
+    .unwrap();
+
+    let disconnect = || {
+        f.service.disconnect_at(
+            f.exam,
+            USER,
+            DisconnectReason::HeartbeatTimeout,
+            time(START),
+        )
+    };
+    assert!(disconnect().await.unwrap_err().is_storage_busy());
+    transaction.rollback().await.unwrap();
+    assert!(f.runtime().await.connected);
+    assert!(f.incidents().await.is_empty());
+
+    f.set(END);
+    disconnect().await.unwrap();
+    disconnect().await.unwrap();
+    assert!(!f.runtime().await.connected);
+    let incidents = f.incidents().await;
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].kind, "connection_lost");
+    assert_eq!(incidents[0].occurred_at, time(START));
 }
 
 #[tokio::test]
@@ -614,7 +772,7 @@ async fn failed_ack_update_rolls_back_event_and_derived_incident() {
     let f = Fixture::memory().await;
     let hello = ready();
     f.connect(hello.clone()).await;
-    f.sql(
+    f.trigger_ddl(
         "CREATE TRIGGER fail_ack BEFORE UPDATE OF ack_event_through ON student_runtimes
            BEGIN SELECT RAISE(ABORT, 'test storage failure'); END",
     )
@@ -635,7 +793,7 @@ async fn failed_ack_update_rolls_back_event_and_derived_incident() {
         panic!("expected events")
     };
     assert!(events.is_empty());
-    f.sql("DROP TRIGGER fail_ack").await;
+    f.trigger_ddl("DROP TRIGGER fail_ack").await;
     sync(&f.connect(hello.clone()).await, ExamPhase::Scheduled, 0);
     f.receive(event.clone()).await;
     f.receive(event).await;
@@ -651,35 +809,48 @@ async fn failed_ack_update_rolls_back_event_and_derived_incident() {
 }
 
 #[tokio::test]
-async fn failed_runtime_update_rolls_back_command_result_and_ack() {
+async fn failed_runtime_update_rolls_back_end_command_result() {
     let f = Fixture::memory().await;
-    f.set(START);
-    let outcome = f.connect(ready()).await;
-    let command_id = command(&outcome.commands[0], CommandName::StartExam, START);
-    f.sql(
+    f.set(END);
+    let outcome = f
+        .connect(hello(ExecutionState::Finalizing, RecordingState::Complete))
+        .await;
+    let command_id = command(&outcome.commands[0], CommandName::EndExam, END);
+    f.receive(recording_event(1, 'b').0).await;
+    f.trigger_ddl(
         "CREATE TRIGGER fail_result BEFORE UPDATE OF execution ON student_runtimes
            BEGIN SELECT RAISE(ABORT, 'test storage failure'); END",
     )
     .await;
     assert!(matches!(
-        f.service.receive(f.exam, USER, completed(command_id)).await,
+        f.report(
+            command_id,
+            CommandName::EndExam,
+            CommandStatus::Completed,
+            None
+        )
+        .await,
         Err(DomainError::Storage { .. })
     ));
-    assert_eq!(f.runtime().await.execution, ExecutionState::Ready);
-    f.sql("DROP TRIGGER fail_result").await;
-    assert_eq!(
-        f.receive(failed(command_id)).await,
-        [ServerMessage::CommandAck { command_id }]
-    );
-    assert_eq!(f.runtime().await.execution, ExecutionState::Recording);
+    assert_eq!(f.runtime().await.execution, ExecutionState::Finalizing);
+    f.trigger_ddl("DROP TRIGGER fail_result").await;
+    f.report(
+        command_id,
+        CommandName::EndExam,
+        CommandStatus::Failed,
+        Some(error_code::INTERNAL_ERROR),
+    )
+    .await
+    .unwrap();
+    assert_eq!(f.runtime().await.execution, ExecutionState::Finished);
     let row = stored_command::Entity::find_by_id(command_id.to_string())
         .one(&f.service.admin().0.database)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
-        row.result_error_code.as_deref(),
-        Some(error_code::INTERNAL_ERROR)
+        db::decode::<serde_json::Value>(&row.result).unwrap(),
+        serde_json::json!({"status": "failed", "error_code": error_code::INTERNAL_ERROR})
     );
 }
 
@@ -710,15 +881,113 @@ async fn initial_migration_rolls_back_database_with_evidence() {
 }
 
 #[tokio::test]
+async fn upgrades_existing_evidence_with_integer_event_sequences() {
+    use sea_orm_migration::MigratorTrait;
+
+    use crate::{entity::event, migration::Migrator};
+
+    let f = Fixture::memory().await;
+    f.set(END);
+    let outcome = f
+        .connect(hello(ExecutionState::Finalizing, RecordingState::Complete))
+        .await;
+    let command_id = command(&outcome.commands[0], CommandName::EndExam, END);
+    let (finalized, manifest) = recording_event(1, 'b');
+    f.receive(finalized).await;
+    f.receive(incident_event(2, time(END))).await;
+    f.report(
+        command_id,
+        CommandName::EndExam,
+        CommandStatus::Completed,
+        None,
+    )
+    .await
+    .unwrap();
+    f.receive(incident_event(i64::MAX, time(END))).await;
+    let database = f.service.admin().0.database;
+    let audit_rows = || async {
+        audit::Entity::find()
+            .all(&database)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.actor,
+                    row.occurred_at,
+                    db::decode::<serde_json::Value>(&row.operation).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let audits = audit_rows().await;
+    let result = stored_command::Entity::find_by_id(command_id.to_string())
+        .one(&database)
+        .await
+        .unwrap()
+        .unwrap();
+    let incident_ids = |incidents: Vec<IncidentRecord>| {
+        incidents
+            .into_iter()
+            .map(|record| record.id)
+            .collect::<Vec<_>>()
+    };
+    let incidents = incident_ids(f.incidents().await);
+
+    Migrator::down(&database, Some(1)).await.unwrap();
+    Migrator::up(&database, None).await.unwrap();
+    assert_eq!(
+        stored_command::Entity::find_by_id(command_id.to_string())
+            .one(&database)
+            .await
+            .unwrap(),
+        Some(result)
+    );
+    let restored_audits = audit_rows().await;
+    assert_eq!(restored_audits.len(), audits.len());
+    assert!(audits.iter().all(|row| restored_audits.contains(row)));
+    assert_eq!(incident_ids(f.incidents().await), incidents);
+    assert!(matches!(
+        f.admin(AdminOperation::RecordingsShow { exam_id: f.exam, oj_user_id: USER })
+            .await,
+        AdminOutput::Recording(stored) if stored == manifest
+    ));
+    assert!(
+        event::Entity::find_by_id((f.exam.to_string(), USER, i64::MAX))
+            .one(&database)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let outcome = f
+        .connect(hello(ExecutionState::Finished, RecordingState::Complete))
+        .await;
+    sync(&outcome, ExamPhase::Ended, 2);
+}
+
+#[tokio::test]
 async fn stale_write_snapshot_rechecks_enrollment_after_concurrent_cli_commit() {
+    use sea_orm::{ConnectOptions, Database, sqlx::sqlite::SqliteJournalMode};
+
     let directory = tempfile::tempdir().unwrap();
     let url = format!(
         "sqlite://{}?mode=rwc",
         directory.path().join("exam.sqlite").display()
     );
+    // WAL persists in the file after closing this setup connection.
+    let mut options = ConnectOptions::new(&url);
+    options.map_sqlx_sqlite_opts(|opts| opts.journal_mode(SqliteJournalMode::Wal));
+    Database::connect(options)
+        .await
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
     let f = Fixture::open(&url).await;
-    f.sql("PRAGMA journal_mode = WAL").await;
-    let admin = AdminService::open(&url).await.unwrap();
+    let admin = ExamService::open_with_clock(&url, || time(START - 1))
+        .await
+        .unwrap()
+        .admin();
     let database = f.service.admin().0.database;
     let key = db::StudentKey::new(f.exam, USER).unwrap();
     let mut attempts = 0;

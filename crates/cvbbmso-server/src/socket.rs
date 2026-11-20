@@ -14,6 +14,8 @@ use uuid::Uuid;
 
 use crate::hub::{Connection, Hub, OUTBOUND_CAPACITY, Peer, SocketError, StudentKey};
 
+pub(crate) const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+
 pub(crate) async fn run(
     socket: WebSocket,
     hub: Hub,

@@ -1,6 +1,6 @@
 use cvbbmso_protocol::{
-    ClientHello, ClientMessage, ClientState, ExamSummary, ExecutionState, RecordingState,
-    ServerMessage,
+    ClientHello, ClientMessage, ClientState, CommandName, CommandStatus, ExamSummary,
+    ExecutionState, RecordingState, ServerMessage,
 };
 use sea_orm::{DatabaseTransaction, EntityTrait, Set, sea_query::OnConflict};
 use time::OffsetDateTime;
@@ -13,7 +13,7 @@ use crate::{
     events,
 };
 
-/// A committed connection snapshot and the commands issued on that connection.
+/// A committed connection snapshot and the commands due on that connection.
 #[derive(Debug)]
 pub struct ConnectOutcome {
     /// The authoritative `ServerMessage::Sync` snapshot.
@@ -22,7 +22,7 @@ pub struct ConnectOutcome {
     pub commands: Vec<ServerMessage>,
 }
 
-/// A committed command and the student to whom it must be delivered.
+/// A due command and the student to whom it would be delivered.
 #[derive(Debug)]
 pub struct DirectedCommand {
     /// The exam that issued the command.
@@ -37,12 +37,14 @@ pub struct DirectedCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DisconnectReason {
-    /// The transport closed or a service restart discovered a stale connection.
+    /// The transport closed.
     Closed,
     /// No application heartbeat arrived by the deadline.
     HeartbeatTimeout,
     /// A newer connection took over the same exam and student.
     Replaced,
+    /// A previous server left the connection marked online.
+    ServerRestart,
 }
 
 impl DisconnectReason {
@@ -51,6 +53,7 @@ impl DisconnectReason {
             Self::Closed => "closed",
             Self::HeartbeatTimeout => "heartbeat_timeout",
             Self::Replaced => "replaced",
+            Self::ServerRestart => "server_restart",
         }
     }
 }
@@ -87,6 +90,12 @@ impl ExamService {
         AdminService(self.0.clone())
     }
 
+    /// Returns the service's current UTC time for observing connection loss.
+    #[must_use]
+    pub fn now(&self) -> OffsetDateTime {
+        self.0.now()
+    }
+
     /// Transitions connections left online by a previous server to offline.
     ///
     /// Call once before accepting connections after server startup.
@@ -99,7 +108,7 @@ impl ExamService {
         db::write(&self.0.database, |tx| {
             Box::pin(async move {
                 for runtime in Runtime::online(tx).await? {
-                    disconnect(tx, &runtime, DisconnectReason::Closed, now).await?;
+                    disconnect(tx, &runtime, DisconnectReason::ServerRestart, now).await?;
                 }
                 Ok(())
             })
@@ -159,24 +168,56 @@ impl ExamService {
         .await
     }
 
-    /// Commits an application message from the current connection.
+    /// Commits a heartbeat, state update, or event from the current connection.
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid input, a missing runtime, a command conflict,
-    /// or a failed database transaction.
+    /// Returns an error for invalid input, a missing runtime, or failed storage.
     pub async fn receive(
         &self,
         exam_id: Uuid,
         oj_user_id: i64,
         message: ClientMessage,
-    ) -> Result<Vec<ServerMessage>, DomainError> {
+    ) -> Result<(), DomainError> {
         let key = StudentKey::new(exam_id, oj_user_id)?;
         let now = self.0.now();
         db::write(&self.0.database, |tx| {
             let key = key.clone();
             let message = message.clone();
             Box::pin(async move { receive(tx, &key, message, now).await })
+        })
+        .await
+    }
+
+    /// Archives a terminal command result from the current connection.
+    ///
+    /// The caller must resolve the command ID in that connection's session
+    /// and handle duplicate acknowledgements there. A successful end requires
+    /// a manifest within the student's contiguous reliable event history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid student ID, a command result conflict,
+    /// or failed storage. Archive and state changes commit together.
+    pub async fn record_command_result(
+        &self,
+        exam_id: Uuid,
+        oj_user_id: i64,
+        command_id: Uuid,
+        name: CommandName,
+        status: CommandStatus,
+        error_code: Option<String>,
+    ) -> Result<(), DomainError> {
+        let key = StudentKey::new(exam_id, oj_user_id)?;
+        db::write(&self.0.database, |tx| {
+            Box::pin(commands::record(
+                tx,
+                key.clone(),
+                command_id,
+                name,
+                status,
+                error_code.clone(),
+            ))
         })
         .await
     }
@@ -193,26 +234,45 @@ impl ExamService {
         oj_user_id: i64,
         reason: DisconnectReason,
     ) -> Result<(), DomainError> {
+        self.disconnect_at(exam_id, oj_user_id, reason, self.now())
+            .await
+    }
+
+    /// Turns the current connection offline using the original observation time.
+    ///
+    /// Use the same time when retrying the same loss after temporary contention.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid user ID, a missing runtime, or failed storage.
+    pub async fn disconnect_at(
+        &self,
+        exam_id: Uuid,
+        oj_user_id: i64,
+        reason: DisconnectReason,
+        observed_at: OffsetDateTime,
+    ) -> Result<(), DomainError> {
         let key = StudentKey::new(exam_id, oj_user_id)?;
-        let now = self.0.now();
-        db::write(&self.0.database, |tx| {
-            let key = key.clone();
+        // The connection manager retries contention between requests.
+        db::transaction(&self.0.database, |tx| {
             Box::pin(async move {
                 let runtime = Runtime::get(tx, &key).await?;
-                disconnect(tx, &runtime, reason, now).await
+                disconnect(tx, &runtime, reason, observed_at).await
             })
         })
         .await
     }
 
-    /// Generates and commits the commands now due for connected students.
+    /// Generates candidates for the commands now due for connected students.
+    ///
+    /// The caller sends each command at most once per session.
     ///
     /// # Errors
     ///
     /// Returns a storage error when the schedule cannot be applied.
     pub async fn due_commands(&self) -> Result<Vec<DirectedCommand>, DomainError> {
         let now = self.0.now();
-        db::write(&self.0.database, |tx| Box::pin(due_commands(tx, now))).await
+        db::transaction(&self.0.database, |tx| Box::pin(due_commands(tx, now))).await
     }
 }
 
@@ -228,36 +288,29 @@ async fn connect(
     let mut ack_event_through = 0;
     if let Some(old) = Runtime::find(tx, key).await? {
         restore_connection(tx, key, &old, hello, now).await?;
-        ack_event_through = db::decode_seq(&old.ack_event_through)?;
+        ack_event_through = old.ack_event_through;
     }
 
-    let connection_id = Uuid::new_v4().to_string();
     runtime::Entity::insert(runtime::ActiveModel {
         exam_id: Set(key.exam.clone()),
         oj_user_id: Set(key.user),
         device_id: Set(hello.device_id.to_string()),
         instance_id: Set(hello.instance_id.to_string()),
-        platform: Set(db::enum_name(hello.platform)?),
-        connection_id: Set(connection_id.clone()),
         connected: Set(true),
         execution: Set(db::enum_name(hello.state.execution)?),
         recording: Set(db::enum_name(hello.state.recording)?),
         last_seen_at: Set(db::stored_time(now)?),
-        ack_event_through: Set(db::encode_seq(ack_event_through)),
-        lost_incident_id: Set(None),
+        ack_event_through: Set(ack_event_through),
     })
     .on_conflict(
         OnConflict::columns([Column::ExamId, Column::OjUserId])
             .update_columns([
                 Column::DeviceId,
                 Column::InstanceId,
-                Column::Platform,
-                Column::ConnectionId,
                 Column::Connected,
                 Column::Execution,
                 Column::Recording,
                 Column::LastSeenAt,
-                Column::LostIncidentId,
             ])
             .to_owned(),
     )
@@ -266,8 +319,7 @@ async fn connect(
 
     let (start_at, end_at) = exam.times()?;
     let phase = db::phase(start_at, end_at, now);
-    let commands = commands::issue(tx, key, &connection_id, hello.state, &exam, now)
-        .await?
+    let commands = commands::due(hello.state, start_at, end_at, now)
         .into_iter()
         .collect();
     Ok(ConnectOutcome {
@@ -291,18 +343,17 @@ async fn restore_connection(
     now: OffsetDateTime,
 ) -> Result<(), DomainError> {
     let old_execution = old.state()?.execution;
-    let replaced = old.connected && old_execution != ExecutionState::Finished;
-    if replaced {
-        events::save_server_incident(
-            tx,
-            key,
-            "connection_lost",
-            now,
-            Some(DisconnectReason::Replaced.detail()),
-        )
-        .await?;
-    }
-    if replaced || old.lost_incident_id.is_some() {
+    if old_execution != ExecutionState::Finished {
+        if old.connected {
+            events::save_server_incident(
+                tx,
+                key,
+                "connection_lost",
+                now,
+                Some(DisconnectReason::Replaced.detail()),
+            )
+            .await?;
+        }
         events::save_server_incident(tx, key, "connection_restored", now, None).await?;
     }
     if old.instance_id != hello.instance_id.to_string()
@@ -313,7 +364,7 @@ async fn restore_connection(
     {
         events::save_server_incident(tx, key, "process_restarted", now, None).await?;
     }
-    commands::retire_pending(tx, key, hello.state).await
+    Ok(())
 }
 
 async fn receive(
@@ -321,19 +372,7 @@ async fn receive(
     key: &StudentKey,
     message: ClientMessage,
     now: OffsetDateTime,
-) -> Result<Vec<ServerMessage>, DomainError> {
-    let message = match message {
-        ClientMessage::Hello(_) => return Err(DomainError::InvalidInput),
-        ClientMessage::CommandResult {
-            command_id,
-            status,
-            error_code,
-        } => {
-            let ack = commands::result(tx, key, command_id, status, error_code).await?;
-            return Ok(vec![ack]);
-        }
-        message => message,
-    };
+) -> Result<(), DomainError> {
     let runtime = Runtime::get(tx, key).await?;
     if !runtime.connected {
         return Err(DomainError::NotFound);
@@ -362,7 +401,7 @@ async fn receive(
         }
         _ => return Err(DomainError::InvalidInput),
     }
-    Ok(Vec::new())
+    Ok(())
 }
 
 pub(crate) async fn update_state(
@@ -392,19 +431,14 @@ async fn disconnect(
         return Ok(());
     }
     let key = runtime.key()?;
-    let lost_id = if runtime.state()?.execution == ExecutionState::Finished {
-        None
-    } else {
-        Some(
-            events::save_server_incident(tx, &key, "connection_lost", now, Some(reason.detail()))
-                .await?,
-        )
-    };
+    if runtime.state()?.execution != ExecutionState::Finished {
+        events::save_server_incident(tx, &key, "connection_lost", now, Some(reason.detail()))
+            .await?;
+    }
     runtime::Entity::update(runtime::ActiveModel {
         exam_id: Set(key.exam.clone()),
         oj_user_id: Set(key.user),
         connected: Set(false),
-        lost_incident_id: Set(lost_id),
         ..Default::default()
     })
     .exec_without_returning(tx)
@@ -419,22 +453,13 @@ async fn due_commands(
     let mut commands = Vec::new();
     for runtime in Runtime::online(tx).await? {
         let key = runtime.key()?;
-        let exam = db::exam(tx, &key.exam).await.map_err(|error| match error {
-            DomainError::NotFound => {
-                DomainError::storage(sea_orm::DbErr::RecordNotFound(key.exam.clone()))
-            }
-            error => error,
-        })?;
-        if let Some(command) = commands::issue(
-            tx,
-            &key,
-            &runtime.connection_id,
-            runtime.state()?,
-            &exam,
-            now,
-        )
-        .await?
-        {
+        let exam = match db::enrollment(tx, &key).await {
+            Ok(exam) => exam,
+            Err(DomainError::NotEnrolled) => continue,
+            Err(error) => return Err(error),
+        };
+        let (start_at, end_at) = exam.times()?;
+        if let Some(command) = commands::due(runtime.state()?, start_at, end_at, now) {
             commands.push(DirectedCommand {
                 exam_id: key.exam_id(),
                 oj_user_id: key.user,

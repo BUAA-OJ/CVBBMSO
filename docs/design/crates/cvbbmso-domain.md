@@ -21,7 +21,7 @@ pub struct DirectedCommand {
     pub command: cvbbmso_protocol::ServerMessage,
 }
 
-pub enum DisconnectReason { Closed, HeartbeatTimeout, Replaced }
+pub enum DisconnectReason { Closed, HeartbeatTimeout, Replaced, ServerRestart }
 
 pub enum DomainError {
     NotFound,
@@ -44,6 +44,9 @@ impl ExamService {
     /// 获取共享数据库与时钟的管理服务。
     pub fn admin(&self) -> AdminService;
 
+    /// 返回服务端观察连接状态时使用的 UTC 时钟。
+    pub fn now(&self) -> time::OffsetDateTime;
+
     /// 服务端开始监听前，将上次进程遗留的在线记录转为离线。
     pub async fn recover_online(&self) -> Result<(), DomainError>;
 
@@ -65,13 +68,24 @@ impl ExamService {
         hello: cvbbmso_protocol::ClientHello,
     ) -> Result<ConnectOutcome, DomainError>;
 
-    /// 处理客户端状态、心跳、事件和命令结果；返回协议应答。
+    /// 处理客户端状态、心跳和可靠事件。
     pub async fn receive(
         &self,
         exam_id: uuid::Uuid,
         oj_user_id: i64,
         message: cvbbmso_protocol::ClientMessage,
-    ) -> Result<Vec<cvbbmso_protocol::ServerMessage>, DomainError>;
+    ) -> Result<(), DomainError>;
+
+    /// 在同一事务归档当前会话校验过的终态回执并更新考生状态。
+    pub async fn record_command_result(
+        &self,
+        exam_id: uuid::Uuid,
+        oj_user_id: i64,
+        command_id: uuid::Uuid,
+        name: cvbbmso_protocol::CommandName,
+        status: cvbbmso_protocol::CommandStatus,
+        error_code: Option<String>,
+    ) -> Result<(), DomainError>;
 
     /// 记录当前有效连接的丢失、心跳超时或替换事件。
     pub async fn disconnect(
@@ -81,7 +95,16 @@ impl ExamService {
         reason: DisconnectReason,
     ) -> Result<(), DomainError>;
 
-    /// 根据固定考试时间生成并返回需要推送的持久化命令。
+    /// 使用原观察时间记录断开，暂时锁竞争时由调用方重试。
+    pub async fn disconnect_at(
+        &self,
+        exam_id: uuid::Uuid,
+        oj_user_id: i64,
+        reason: DisconnectReason,
+        observed_at: time::OffsetDateTime,
+    ) -> Result<(), DomainError>;
+
+    /// 根据固定考试时间返回在线考生的候选命令。
     pub async fn due_commands(&self) -> Result<Vec<DirectedCommand>, DomainError>;
 }
 
@@ -105,9 +128,9 @@ impl AdminService {
 `connect` 记录异常的条件：
 
 - `hello.instance_id` 与上次不同，且上次状态为 `recording` 或 `finalizing` 时，写入 `process_restarted`。
-- 此前存在尚未恢复的 `connection_lost` 时，写入 `connection_restored`；首次连接直接建立记录。
+- 旧记录在线且未完成时，写入 `connection_lost`（`detail = "replaced"`）和 `connection_restored`。旧记录离线且未完成时，只写入 `connection_restored`。首次连接直接建立记录。
 
-`receive` 持久化可靠事件并推进确认位置，处理命令结果并返回 `CommandAck`。`disconnect` 由 server 对当前有效连接调用：执行状态为 `finished` 的连接关闭按正常完成处理；其他关闭按 `Closed` / `HeartbeatTimeout` / `Replaced` 分别写入 `connection_lost`，其中 `Replaced` 的 `detail` 为 `"replaced"`。正常完成考试时连接静默关闭。
+`receive` 持久化可靠事件并推进确认位置。`record_command_result` 校验命令失败码，并拒绝已知事件缺口；成功结束还须确认录像摘要和此前事件已连续落库。回执与考生状态一起提交，服务端在提交成功后发出 `CommandAck`。`disconnect` 在同一事务将当前记录设为离线，并为未完成的考生写入 `connection_lost`。已完成的考生静默转为离线。
 
 `due_commands` 根据服务端时钟生成开始/结束命令；实际网络推送由服务端执行。命令由当前在线考生触发；离线考生的命令在 `connect` 时按状态生成。每个命令使用新的唯一 `command_id`。
 
@@ -115,7 +138,7 @@ impl AdminService {
 
 ## 管理操作与输出
 
-`AdminOperation` 与 CLI 命令一一对应；CLI 负责参数解析、CSV 读取和展示，域层负责校验、持久化和审计。CLI 打开数据库时保留在线状态。服务端启动调用 `recover_online` 时，以发现时的 UTC 时间记录未完成考试的失联，并将已完成的在线记录静默转为离线。
+`AdminOperation` 与 CLI 命令一一对应；CLI 负责参数解析、CSV 读取和展示，域层负责校验、持久化和审计。CLI 打开数据库时保留在线状态。服务端启动调用 `recover_online` 时，以发现在线遗留记录的 UTC 时间写入 `connection_lost`，`detail` 为 `server_restart`。已完成的在线记录静默转为离线。
 
 ```rust
 pub enum AdminOperation {
@@ -180,7 +203,7 @@ pub struct StudentRuntime {
 pub struct EventRecord {
     pub exam_id: Uuid,
     pub oj_user_id: i64,
-    pub seq: u64,
+    pub seq: i64,
     pub event: cvbbmso_protocol::ExamEvent,
     pub received_at: OffsetDateTime,
 }
@@ -199,9 +222,9 @@ pub struct IncidentRecord {
 }
 ```
 
-`actor` 由 CLI 提供，缺省为当前操作系统用户名；域层写入审计记录。`AdminOperation` 的输入先经过域层校验：`start_at < end_at`，`RecordingPolicy` 参数大于零，`oj_user_id` 为正整数，CSV 导入去重。错误以 `DomainError` 返回，由 server 或 CLI 映射为对外错误。
+`actor` 由 CLI 提供，缺省为当前操作系统用户名。审计记录包含整数 `audit_id`、`actor`、序列化的操作类型与参数，以及 `occurred_at`；创建考试的审计包含生成的 `exam_id`。`AdminOperation` 的输入先经过域层校验：`start_at < end_at`，`RecordingPolicy` 参数大于零，`oj_user_id` 为正整数，CSV 导入去重。报名只能在 `now < start_at` 时撤销，时间检查与删除在同一事务内完成。错误以 `DomainError` 返回，由 server 或 CLI 映射为对外错误。
 
-`RecordingsShow` 返回已完成的 `RecordingManifest`；未 finalize 或 finalize 失败时返回 `NotFound`。
+`RecordingsShow` 从 `recording_finalized` 事件读取已上报的 `RecordingManifest`。没有摘要事件时返回 `NotFound`。
 
 ## 数据所有权
 
@@ -212,10 +235,10 @@ pub struct IncidentRecord {
 | 考试记录 | `exam_id`、标题、固定起止时间、录像策略 |
 | 报名关系 | `(exam_id, oj_user_id)` 是否允许参加 |
 | 考生运行状态 | 当前设备/进程、连接状态、执行状态、最后心跳、事件确认位置 |
-| 指令记录 | 已下发或待下发的开始/结束命令、唯一 `command_id`、终态结果与 ACK 状态 |
+| 指令记录 | 客户端实际回报的开始/结束命令终态、唯一 `command_id` 和对应失败码 |
 | 可靠事件 | 客户端上报的 `seq`、事件内容和接收时间 |
 | 异常记录 | 服务端与客户端按发生时间保存的证据 |
-| 录像摘要 | 分片元信息和合并文件摘要 |
+| 录像摘要 | 保存在 `recording_finalized` 可靠事件中的分片元信息和合并文件摘要 |
 | 管理审计 | actor、操作、目标、时间 |
 
 ## 考试阶段与调度
@@ -242,15 +265,14 @@ pub struct IncidentRecord {
 - 到达 `start_at` 时，对在线且处于 `ready/idle` 的考生生成 `start_exam`；离线考生在重连后由 `connect` 生成。
 - 到达 `end_at` 时，对在线且已开始录制的考生生成 `end_exam`；离线考生在重连后由 `connect` 生成。
 - 迟到、重连或进程重启时，`connect` 按上表补生成命令。每个命令使用新的 `command_id`。
-- 在线调度生成前检查当前连接是否已有同类型未终态命令；已有则等待结果。
-- `connect` 遇到上一连接遗留的未终态命令时，将其标记为 superseded；若 `hello.state` 表明命令效果未生效，则生成新 ID 的新命令。
-- 服务端收到 `command_result` 后持久化终态并回复 `CommandAck`。若结果丢失，重连时以 `hello.state` 校正：已体现命令效果的状态按完成处理；需要继续执行时生成新命令。
+- 同一 WebSocket 会话由 server 跟踪已发出的命令与结果，按命令类型去重调度。重连时按 `hello.state` 和考试阶段重新判断是否下发命令。
+- 终态归档由客户端的实际回执触发。若结果或 ACK 丢失，重连后按 `hello.state` 判断是否需要重新执行，需回复时使用新下发的命令 ID。
 
 ## 事件、异常与录像摘要
 
 客户端 `event.seq` 按 `(exam_id, oj_user_id)` 连续递增。`receive` 以联合标识和 `seq` 去重，持久化后推进最大连续确认序号 `ack_event_through`；确认位置在下一次 `sync` 中返回。重复 `seq` 内容相同则忽略，内容不同按协议错误处理。
 
-`Recorder::open` 恢复的分片可能以原 `seq` 重报；服务端按 `seq` 幂等，并可按 `(exam_id, oj_user_id, index)` 做辅助去重。`recording_finalized` 保存非空分片清单和合并摘要；`incident` 保存为异常记录。
+`Recorder::open` 恢复的分片可能以原 `seq` 重报；服务端按 `seq` 幂等，并可按 `(exam_id, oj_user_id, index)` 做辅助去重。`recording_finalized` 保存非空分片清单和合并摘要，同一摘要可重报，内容不同的摘要会被拒绝。`incident` 保存为异常记录。
 
 异常记录按发生时间保存，每条记录包含 `occurred_at`：
 
@@ -263,7 +285,7 @@ pub struct IncidentRecord {
 | client | `recording_recovered` | 录屏恢复；作为独立证据保存 |
 | client | `navigation_denied` | 受控浏览器拒绝了导航请求 |
 
-`connection_lost` 与 `connection_restored` 是两条独立记录，CLI 按 `occurred_at` 排序展示和关联。`detail` 为可选字符串，例如 `heartbeat_timeout`、`replaced`、`capture stream stopped`。异常按发生记录保存，消费方按时间判断关联。
+`connection_lost` 与 `connection_restored` 是两条独立记录，CLI 按 `occurred_at`、`incident_id` 排序展示。`source` 由异常 `kind` 推导。`detail` 为可选字符串，例如 `heartbeat_timeout`、`replaced`、`server_restart`、`capture stream stopped`。
 
 ## 错误映射
 
@@ -274,7 +296,7 @@ pub struct IncidentRecord {
 | `NotFound` | 考试、考生、异常或录像不存在 | `EXAM_NOT_FOUND` / CLI 错误 |
 | `NotEnrolled` | 访问者不在该考试的报名名单中 | `NOT_ENROLLED` |
 | `InvalidInput` | 时间、策略、CSV 或参数非法 | `INVALID_REQUEST` |
-| `Conflict` | 重复报名、命令结果与当前命令状态不匹配 | 命令结果用 `COMMAND_STATE_CONFLICT`，其他用 `INVALID_REQUEST` |
+| `Conflict` | 重复报名、开考后撤销报名、命令结果与当前命令状态不匹配 | 命令结果用 `COMMAND_STATE_CONFLICT`，其他用 `INVALID_REQUEST` |
 | `Storage` | 数据库或持久化失败 | `INTERNAL_ERROR` |
 
-客户端 `command_result` 到达时，`receive` 校验 `command_id` 属于当前考生且命令仍可确认；重复的相同结果幂等返回同 ID 的 `CommandAck`，未知或状态不匹配返回 `Conflict`，由 server 映射为 `COMMAND_STATE_CONFLICT`。
+客户端 `command_result` 到达时，server 校验 `command_id` 属于当前 WebSocket 会话。会话内重复的相同结果幂等返回同 ID 的 `CommandAck`，未知命令或冲突结果使用 `COMMAND_STATE_CONFLICT`。

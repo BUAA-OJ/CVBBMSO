@@ -1,30 +1,34 @@
 use std::collections::BTreeSet;
 
 use cvbbmso_protocol::{
-    ExamEvent, ExamSummary, ExecutionState, RecordingManifest, RecordingPolicy, RecordingState,
+    ExamEvent, ExamSummary, ExecutionState, RecordingManifest, RecordingPolicy,
 };
 use sea_orm::{
     ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QueryTrait, Set,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
     DomainError, Service,
     db::{self, Runtime, StudentKey},
-    entity::{audit as stored_audit, enrollment, event, exam, incident, manifest, runtime},
+    entity::{audit as stored_audit, enrollment, event, exam, incident, runtime},
+    events as stored_events,
 };
 
 /// A management operation to perform against the shared exam database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
 #[non_exhaustive]
 #[allow(missing_docs)]
 pub enum AdminOperation {
     /// Creates an exam with fixed times and recording settings.
     ExamsCreate {
         title: String,
+        #[serde(serialize_with = "serialize_audit_time")]
         start_at: OffsetDateTime,
+        #[serde(serialize_with = "serialize_audit_time")]
         end_at: OffsetDateTime,
         policy: RecordingPolicy,
     },
@@ -34,7 +38,7 @@ pub enum AdminOperation {
     ExamsShow { exam_id: Uuid },
     /// Enrolls an individual participant.
     ParticipantsAdd { exam_id: Uuid, oj_user_id: i64 },
-    /// Removes an enrollment while retaining evidence.
+    /// Removes an enrollment before the exam starts while retaining evidence.
     ParticipantsRemove { exam_id: Uuid, oj_user_id: i64 },
     /// Enrolls a batch, deduplicating IDs and skipping existing enrollments.
     ParticipantsImport {
@@ -59,7 +63,7 @@ pub enum AdminOperation {
     },
     /// Looks up an incident by ID.
     IncidentsShow { incident_id: Uuid },
-    /// Looks up the latest successful recording summary.
+    /// Looks up the reported recording summary.
     RecordingsShow { exam_id: Uuid, oj_user_id: i64 },
 }
 
@@ -102,7 +106,7 @@ pub enum AdminOutput {
     Incidents(Vec<IncidentRecord>),
     /// A single incident record.
     Incident(IncidentRecord),
-    /// The latest successful recording summary.
+    /// The reported recording summary.
     Recording(RecordingManifest),
 }
 
@@ -138,7 +142,7 @@ pub struct EventRecord {
     /// The student's Accoding user ID.
     pub oj_user_id: i64,
     /// The original event sequence number.
-    pub seq: u64,
+    pub seq: i64,
     /// The event sent by the client.
     pub event: ExamEvent,
     /// The original server receipt time in UTC.
@@ -202,7 +206,6 @@ impl AdminService {
         actor: String,
         op: AdminOperation,
     ) -> Result<AdminOutput, DomainError> {
-        let now = self.0.now();
         if matches!(
             op,
             AdminOperation::ExamsCreate { .. }
@@ -211,12 +214,14 @@ impl AdminService {
                 | AdminOperation::ParticipantsImport { .. }
         ) {
             db::write(&self.0.database, |tx| {
+                let service = self.0.clone();
                 let actor = actor.clone();
                 let op = op.clone();
-                Box::pin(async move { mutate(tx, &actor, &op, now).await })
+                Box::pin(async move { mutate(tx, &service, &actor, &op).await })
             })
             .await
         } else {
+            let now = self.0.now();
             db::transaction(&self.0.database, |tx| Box::pin(query(tx, op, now))).await
         }
     }
@@ -224,11 +229,12 @@ impl AdminService {
 
 async fn mutate(
     tx: &DatabaseTransaction,
+    service: &Service,
     actor: &str,
     op: &AdminOperation,
-    now: OffsetDateTime,
 ) -> Result<AdminOutput, DomainError> {
-    match *op {
+    let mut now = service.now();
+    let output = match *op {
         AdminOperation::ExamsCreate {
             ref title,
             start_at,
@@ -241,9 +247,8 @@ async fn mutate(
                 return Err(DomainError::InvalidInput);
             }
             let exam_id = Uuid::new_v4();
-            let id = exam_id.to_string();
             exam::Entity::insert(exam::ActiveModel {
-                exam_id: Set(id.clone()),
+                exam_id: Set(exam_id.to_string()),
                 title: Set(title.clone()),
                 start_at: Set(db::input_time(start_at)?),
                 end_at: Set(db::input_time(end_at)?),
@@ -252,8 +257,7 @@ async fn mutate(
             })
             .exec_without_returning(tx)
             .await?;
-            audit(tx, actor, &id, "exams_create", None, 1, now).await?;
-            Ok(AdminOutput::ExamCreated { exam_id })
+            AdminOutput::ExamCreated { exam_id }
         }
         AdminOperation::ParticipantsAdd {
             exam_id,
@@ -264,77 +268,52 @@ async fn mutate(
             if add_participant(tx, &key.exam, key.user).await? == 0 {
                 return Err(DomainError::Conflict);
             }
-            audit(
-                tx,
-                actor,
-                &key.exam,
-                "participants_add",
-                Some(&[key.user]),
-                1,
-                now,
-            )
-            .await?;
-            Ok(AdminOutput::ParticipantAdded)
+            AdminOutput::ParticipantAdded
         }
         AdminOperation::ParticipantsRemove {
             exam_id,
             oj_user_id,
         } => {
             let key = StudentKey::new(exam_id, oj_user_id)?;
-            db::exam(tx, &key.exam).await?;
+            let exam = db::exam(tx, &key.exam).await?;
+            now = service.now();
+            if now >= db::parse_time(&exam.start_at)? {
+                return Err(DomainError::Conflict);
+            }
             let deleted = enrollment::Entity::delete_by_id(key.id()).exec(tx).await?;
             if deleted.rows_affected == 0 {
                 return Err(DomainError::NotFound);
             }
-            audit(
-                tx,
-                actor,
-                &key.exam,
-                "participants_remove",
-                Some(&[key.user]),
-                1,
-                now,
-            )
-            .await?;
-            Ok(AdminOutput::ParticipantRemoved)
+            AdminOutput::ParticipantRemoved
         }
         AdminOperation::ParticipantsImport {
             exam_id,
             ref oj_user_ids,
-        } => import_participants(tx, actor, exam_id, oj_user_ids, now).await,
-        _ => Err(DomainError::InvalidInput),
-    }
+        } => AdminOutput::ParticipantsImported {
+            count: import_participants(tx, exam_id, oj_user_ids).await?,
+        },
+        _ => return Err(DomainError::InvalidInput),
+    };
+    audit(tx, actor, op, &output, now).await?;
+    Ok(output)
 }
 
 async fn import_participants(
     tx: &DatabaseTransaction,
-    actor: &str,
     exam_id: Uuid,
     oj_user_ids: &[i64],
-    now: OffsetDateTime,
-) -> Result<AdminOutput, DomainError> {
+) -> Result<usize, DomainError> {
     for &id in oj_user_ids {
         db::validate_user(id)?;
     }
     let users: BTreeSet<_> = oj_user_ids.iter().copied().collect();
-    let users: Vec<_> = users.into_iter().collect();
     let exam = exam_id.to_string();
     db::exam(tx, &exam).await?;
     let mut count = 0;
-    for &user in &users {
+    for user in users {
         count += add_participant(tx, &exam, user).await?;
     }
-    audit(
-        tx,
-        actor,
-        &exam,
-        "participants_import",
-        Some(&users),
-        count,
-        now,
-    )
-    .await?;
-    Ok(AdminOutput::ParticipantsImported { count })
+    Ok(count)
 }
 
 async fn add_participant(
@@ -358,24 +337,30 @@ async fn add_participant(
 async fn audit(
     tx: &DatabaseTransaction,
     actor: &str,
-    exam: &str,
-    operation: &str,
-    target_users: Option<&[i64]>,
-    count: usize,
+    op: &AdminOperation,
+    output: &AdminOutput,
     now: OffsetDateTime,
 ) -> Result<(), DomainError> {
+    let mut operation = serde_json::to_value(op).map_err(DomainError::storage)?;
+    match output {
+        AdminOutput::ExamCreated { exam_id } => operation["exam_id"] = exam_id.to_string().into(),
+        AdminOutput::ParticipantsImported { count } => operation["change_count"] = (*count).into(),
+        _ => {}
+    }
     stored_audit::Entity::insert(stored_audit::ActiveModel {
-        audit_id: Set(Uuid::new_v4().to_string()),
         actor: Set(actor.into()),
-        operation: Set(operation.into()),
-        exam_id: Set(exam.into()),
-        target_users: Set(target_users.map(|users| db::encode(&users)).transpose()?),
-        change_count: Set(i64::try_from(count).map_err(DomainError::storage)?),
+        operation: Set(db::encode(&operation)?),
         occurred_at: Set(db::stored_time(now)?),
+        ..Default::default()
     })
     .exec_without_returning(tx)
     .await?;
     Ok(())
+}
+
+fn serialize_audit_time<S: Serializer>(time: &OffsetDateTime, ser: S) -> Result<S::Ok, S::Error> {
+    let time = db::timestamp(*time).map_err(serde::ser::Error::custom)?;
+    ser.serialize_str(&time)
 }
 
 async fn query(
@@ -428,8 +413,7 @@ async fn query(
             .await
         }
         AdminOperation::IncidentsShow { incident_id } => {
-            let incident = incident::Entity::find()
-                .filter(incident::Column::IncidentId.eq(incident_id.to_string()))
+            let incident = incident::Entity::find_by_id(incident_id.to_string())
                 .one(tx)
                 .await?
                 .ok_or(DomainError::NotFound)?;
@@ -504,7 +488,7 @@ async fn events(tx: &DatabaseTransaction, key: &StudentKey) -> Result<AdminOutpu
             Ok(EventRecord {
                 exam_id: key.exam_id(),
                 oj_user_id: key.user,
-                seq: db::decode_seq(&row.seq)?,
+                seq: row.seq,
                 event: db::decode(&row.event)?,
                 received_at: db::parse_time(&row.received_at)?,
             })
@@ -521,7 +505,12 @@ impl TryFrom<incident::Model> for IncidentRecord {
             id: db::parse_uuid(&value.incident_id)?,
             exam_id: db::parse_uuid(&value.exam_id)?,
             oj_user_id: value.oj_user_id,
-            source: db::parse_enum(&value.source)?,
+            source: match value.kind.as_str() {
+                "connection_lost" | "connection_restored" | "process_restarted" => {
+                    IncidentSource::Server
+                }
+                _ => IncidentSource::Client,
+            },
             kind: value.kind,
             occurred_at: db::parse_time(&value.occurred_at)?,
             detail: value.detail,
@@ -569,7 +558,7 @@ impl IncidentFilter {
                 query.filter(Column::OccurredAt.lte(until))
             })
             .order_by_asc(Column::OccurredAt)
-            .order_by_asc(Column::Ordinal)
+            .order_by_asc(Column::IncidentId)
             .all(tx)
             .await?
             .into_iter()
@@ -580,18 +569,8 @@ impl IncidentFilter {
 }
 
 async fn recording(tx: &DatabaseTransaction, key: &StudentKey) -> Result<AdminOutput, DomainError> {
-    let runtime = Runtime::get(tx, key).await?;
-    let state = runtime.state()?;
-    if matches!(
-        state.execution,
-        ExecutionState::Finished | ExecutionState::Finalizing
-    ) && state.recording == RecordingState::Failed
-    {
-        return Err(DomainError::NotFound);
-    }
-    let manifest = manifest::Entity::find_by_id(key.id())
-        .one(tx)
+    let (_, manifest) = stored_events::recording(tx, key)
         .await?
         .ok_or(DomainError::NotFound)?;
-    Ok(AdminOutput::Recording(db::decode(&manifest.manifest)?))
+    Ok(AdminOutput::Recording(manifest))
 }
