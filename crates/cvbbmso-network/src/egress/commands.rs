@@ -7,6 +7,7 @@
     reason = "Darwin supplies child deadlines and process group termination"
 )]
 
+use std::cell::Cell;
 use std::fs::{self, File};
 use std::io::{Read, Seek, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -61,14 +62,33 @@ impl Diagnostic {
 }
 
 /// The inherited lock keeps recovery from overtaking an orphaned platform command.
-pub(crate) struct SystemCommands<'a>(pub(crate) Option<&'a File>);
+pub(crate) struct SystemCommands<'a> {
+    lock: Option<&'a File>,
+    unsettled: Cell<bool>,
+}
 
 const COMMAND_TIMEOUT_SECONDS: u32 = 5;
 const REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const CHECK_INTERVAL: Duration = Duration::from_millis(15);
 
-impl SystemCommands<'_> {
+impl<'a> SystemCommands<'a> {
+    pub(crate) fn new(lock: Option<&'a File>) -> Self {
+        Self {
+            lock,
+            unsettled: Cell::new(false),
+        }
+    }
+
+    fn ensure_settled(&self) -> Result<(), NetworkError> {
+        if self.unsettled.get() {
+            Err(NetworkError::Io)
+        } else {
+            Ok(())
+        }
+    }
+
     fn command(&self, program: &str, args: &[&str]) -> Result<Command, NetworkError> {
+        self.ensure_settled()?;
         let mut command = Command::new(program);
         command
             .args(args)
@@ -79,7 +99,7 @@ impl SystemCommands<'_> {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Some(lock) = self.0 {
+        if let Some(lock) = self.lock {
             command.stdin(lock.try_clone().map_err(|_| NetworkError::Io)?);
         }
         // SAFETY: the hook runs in the forked child and calls only
@@ -102,7 +122,7 @@ impl SystemCommands<'_> {
         if include_error {
             command.stderr(output.try_clone().map_err(|_| NetworkError::Io)?);
         }
-        let status = run_command(&mut command)?;
+        let status = self.execute(&mut command)?;
         output.rewind().map_err(|_| NetworkError::Io)?;
         let mut text = Vec::new();
         output
@@ -114,6 +134,15 @@ impl SystemCommands<'_> {
         } else {
             Diagnostic::Rejected(text)
         })
+    }
+
+    fn execute(&self, command: &mut Command) -> Result<ExitStatus, NetworkError> {
+        let child = command.spawn().map_err(|_| NetworkError::Platform)?;
+        finish_child(
+            child,
+            Duration::from_secs(u64::from(COMMAND_TIMEOUT_SECONDS)),
+            &self.unsettled,
+        )
     }
 }
 
@@ -137,19 +166,18 @@ fn arm_child_alarm() -> std::io::Result<()> {
     Ok(())
 }
 
-fn run_command(command: &mut Command) -> Result<ExitStatus, NetworkError> {
-    let child = command.spawn().map_err(|_| NetworkError::Platform)?;
-    finish_child(
-        child,
-        Duration::from_secs(u64::from(COMMAND_TIMEOUT_SECONDS)),
-    )
-}
-
-fn finish_child(mut child: Child, timeout: Duration) -> Result<ExitStatus, NetworkError> {
+fn finish_child(
+    mut child: Child,
+    timeout: Duration,
+    unsettled: &Cell<bool>,
+) -> Result<ExitStatus, NetworkError> {
     let pid = libc::pid_t::try_from(child.id()).map_err(|_| NetworkError::Io)?;
     let exited = match poll_until(timeout, || observe_exit(child.id())) {
         Ok(exited) => exited,
-        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => return Err(NetworkError::Io),
+        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => {
+            unsettled.set(true);
+            return Err(NetworkError::Io);
+        }
         Err(_) => None,
     };
 
@@ -166,7 +194,9 @@ fn finish_child(mut child: Child, timeout: Duration) -> Result<ExitStatus, Netwo
         Ok(Some(_)) => Err(NetworkError::Io),
         _ => {
             // A command stuck in the kernel can retain its descriptor until
-            // it exits. Recovery must still wait for the actual unlock.
+            // it exits. Block rollback in this context as well as cross-process
+            // recovery until a new context can actually acquire the lock.
+            unsettled.set(true);
             let _ = std::thread::Builder::new().spawn(move || child.wait());
             Err(NetworkError::Io)
         }
@@ -221,7 +251,7 @@ fn command_result(status: ExitStatus) -> Result<(), NetworkError> {
 
 impl Commands for SystemCommands<'_> {
     fn run(&self, program: &str, args: &[&str]) -> Result<(), NetworkError> {
-        command_result(run_command(&mut self.command(program, args)?)?)
+        command_result(self.execute(&mut self.command(program, args)?)?)
     }
 
     fn output(&self, program: &str, args: &[&str]) -> Result<String, NetworkError> {
@@ -233,17 +263,17 @@ impl Commands for SystemCommands<'_> {
     }
 
     fn capture(&self, program: &str, args: &[&str], path: &str) -> Result<(), NetworkError> {
+        let mut command = self.command(program, args)?;
         let journal = File::options()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(path)
             .map_err(|_| NetworkError::Io)?;
-        let mut command = self.command(program, args)?;
         command
             .stdout(journal.try_clone().map_err(|_| NetworkError::Io)?)
             .stderr(journal.try_clone().map_err(|_| NetworkError::Io)?);
-        let result = run_command(&mut command).and_then(command_result);
+        let result = self.execute(&mut command).and_then(command_result);
         result.and(journal.sync_all().map_err(|_| NetworkError::Io))
     }
 
@@ -256,6 +286,7 @@ impl Commands for SystemCommands<'_> {
     }
 
     fn write(&self, path: &str, contents: &str) -> Result<(), NetworkError> {
+        self.ensure_settled()?;
         let path = Path::new(path);
         let directory = path.parent().ok_or(NetworkError::Io)?;
         let mut temporary =
@@ -282,6 +313,7 @@ impl Commands for SystemCommands<'_> {
     }
 
     fn remove(&self, path: &str) -> Result<(), NetworkError> {
+        self.ensure_settled()?;
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -302,7 +334,7 @@ mod tests {
         let owner = File::create(&path).unwrap();
         let recovery = File::open(&path).unwrap();
         lock_exclusive(&owner, Duration::ZERO).unwrap();
-        let mut command = SystemCommands(Some(&owner))
+        let mut command = SystemCommands::new(Some(&owner))
             .command("/bin/sh", &["-c", "while :; do :; done"])
             .unwrap();
         let child = command.spawn().unwrap();
@@ -314,12 +346,12 @@ mod tests {
             Err(NetworkError::Io)
         );
         assert!(matches!(
-            finish_child(child, Duration::ZERO),
+            finish_child(child, Duration::ZERO, &Cell::new(false)),
             Err(NetworkError::Io)
         ));
-        lock_exclusive(&recovery, Duration::ZERO).unwrap();
+        lock_exclusive(&recovery, Duration::from_secs(1)).unwrap();
         assert_eq!(
-            SystemCommands(Some(&recovery)).output("/usr/bin/printf", &["recovered"]),
+            SystemCommands::new(Some(&recovery)).output("/usr/bin/printf", &["recovered"]),
             Ok("recovered".to_owned())
         );
     }
@@ -329,7 +361,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let journal = directory.path().join("pf.enable");
         let path = journal.to_str().unwrap();
-        let commands = SystemCommands(None);
+        let commands = SystemCommands::new(None);
         assert_eq!(
             commands.output("/usr/bin/printf", &["ready"]),
             Ok("ready".to_owned())
@@ -350,7 +382,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let journal = directory.path().join("pf.enable");
         assert_eq!(
-            SystemCommands(None).capture(
+            SystemCommands::new(None).capture(
                 "/bin/sh",
                 &["-c", "printf 'Token : 42\\n' >&2; kill -ALRM $$"],
                 journal.to_str().unwrap(),
@@ -361,13 +393,27 @@ mod tests {
     }
 
     #[test]
+    fn a_context_with_a_live_timed_out_child_cannot_start_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("rules");
+        let path = file.to_str().unwrap();
+        let commands = SystemCommands::new(None);
+        commands.write(path, "current").unwrap();
+        commands.unsettled.set(true);
+        assert_eq!(commands.run("/usr/bin/true", &[]), Err(NetworkError::Io));
+        assert_eq!(commands.write(path, "rollback"), Err(NetworkError::Io));
+        assert_eq!(commands.remove(path), Err(NetworkError::Io));
+        assert_eq!(fs::read_to_string(file).unwrap(), "current");
+    }
+
+    #[test]
     fn an_alarmed_leader_cannot_leave_a_descendant_holding_the_lock() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("egress.lock");
         let owner = File::create(&path).unwrap();
         let recovery = File::open(&path).unwrap();
         lock_exclusive(&owner, Duration::ZERO).unwrap();
-        let mut command = SystemCommands(Some(&owner))
+        let mut command = SystemCommands::new(Some(&owner))
             .command(
                 "/bin/sh",
                 &["-c", "exec 3<&0; (while :; do :; done) & kill -ALRM $$"],
@@ -386,7 +432,7 @@ mod tests {
             Err(NetworkError::Io)
         );
         assert!(matches!(
-            finish_child(child, Duration::from_secs(5)),
+            finish_child(child, Duration::from_secs(5), &Cell::new(false)),
             Err(NetworkError::Io)
         ));
         lock_exclusive(&recovery, Duration::from_secs(1)).unwrap();
@@ -395,14 +441,15 @@ mod tests {
     #[test]
     fn the_child_alarm_survives_exec() {
         let binary = std::env::current_exe().unwrap();
-        let mut command = SystemCommands(None)
+        let commands = SystemCommands::new(None);
+        let mut command = commands
             .command(
                 binary.to_str().unwrap(),
                 &["--exact", "egress::commands::tests::check_child_alarm"],
             )
             .unwrap();
         command.env("CVBBMSO_TEST_CHECK_CHILD_ALARM", "1");
-        command_result(run_command(&mut command).unwrap()).unwrap();
+        command_result(commands.execute(&mut command).unwrap()).unwrap();
     }
 
     #[test]

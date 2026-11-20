@@ -21,6 +21,14 @@ pub(crate) fn verify(commands: &dyn Commands) -> Result<(), NetworkError> {
     commands.run(LAUNCHCTL, &["print", DOMAIN])
 }
 
+pub(crate) fn pending(commands: &dyn Commands) -> Result<bool, NetworkError> {
+    match commands.read(PENDING)?.as_deref() {
+        Some(TASK) => Ok(true),
+        None => Ok(false),
+        Some(_) => Err(NetworkError::Io),
+    }
+}
+
 pub(crate) fn cancel(commands: &dyn Commands) -> Result<(), NetworkError> {
     commands.write(PENDING, TASK)?;
     // Delete the definition before bootout, which may stop the recovery helper

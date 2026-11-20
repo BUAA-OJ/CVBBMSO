@@ -7,7 +7,7 @@ use crate::egress::policy::Transport;
 use super::{Services, parse_address};
 
 pub(super) fn discover() -> Result<Services, NetworkError> {
-    let commands = SystemCommands(None);
+    let commands = SystemCommands::new(None);
     let mut services = Services::default();
     let dns = commands.output("/usr/sbin/scutil", &["--dns"])?;
     add_dns(&mut services, &dns);

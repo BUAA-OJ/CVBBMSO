@@ -31,9 +31,9 @@ impl Prepared {
             state::check_protected(Path::new(path), true)?;
         }
         state::check_protected(Path::new(HELPER), false)?;
-        verify_deployment(&SystemCommands(None))?;
+        verify_deployment(&SystemCommands::new(None))?;
         let lock = state::lock()?;
-        let commands = SystemCommands(Some(&lock));
+        let commands = SystemCommands::new(Some(&lock));
         verify_deployment(&commands)?;
         if state::read(&commands)?
             .is_some_and(|state| !state.expired() && process_alive(state.parent))
@@ -45,7 +45,7 @@ impl Prepared {
     }
 
     pub(crate) fn install(self, plan: &Plan) -> Result<InstallResult, NetworkError> {
-        let commands = SystemCommands(Some(&self.lock));
+        let commands = SystemCommands::new(Some(&self.lock));
         let mut guard_state = GuardState::new(std::process::id());
         state::write(&commands, &guard_state)?;
         let mut watchdog = match Watchdog::start() {
@@ -97,12 +97,12 @@ impl Watchdog {
     }
 
     pub(super) fn owns_state(&self) -> Result<bool, NetworkError> {
-        let commands = SystemCommands(None);
+        let commands = SystemCommands::new(None);
         Ok(state::read(&commands)?.is_some_and(|state| self.owns(&state)))
     }
 
     pub(super) fn check(&mut self) -> Result<GuardState, NetworkError> {
-        let state = state::read(&SystemCommands(None))?
+        let state = state::read(&SystemCommands::new(None))?
             .filter(|state| self.owns(state) && !state.expired())
             .ok_or(NetworkError::Platform)?;
         if self
@@ -172,14 +172,15 @@ fn watch_until_recovered(parent: u32) {
 
 fn recovery_tick(parent: Option<u32>) -> Result<bool, NetworkError> {
     let lock = state::lock()?;
-    let commands = SystemCommands(Some(&lock));
-    let state = state::read(&commands)?;
+    let commands = SystemCommands::new(Some(&lock));
+    let Some(state) = state::read(&commands)? else {
+        return recover_without_owner(&commands, parent);
+    };
     // SAFETY: getppid has no preconditions. The kernel reparents an orphan
     // instead of associating it with an unrelated process that reuses a PID.
     let real_parent = u32::try_from(unsafe { libc::getppid() }).ok();
-    let recover_now = match (parent, state) {
-        (Some(_), None) => return Ok(true),
-        (Some(parent), Some(state)) => {
+    let recover_now = match parent {
+        Some(parent) => {
             if state.parent != parent
                 || (state.watchdog != 0 && state.watchdog != std::process::id())
             {
@@ -187,12 +188,26 @@ fn recovery_tick(parent: Option<u32>) -> Result<bool, NetworkError> {
             }
             state.expired() || real_parent != Some(parent) || control_pipe_closed()?
         }
-        (None, state) => state.is_none_or(|state| state.expired() || !process_alive(state.parent)),
+        None => state.expired() || !process_alive(state.parent),
     };
     if recover_now {
         recover(&commands)?;
     }
     Ok(recover_now)
+}
+
+fn recover_without_owner(
+    commands: &dyn Commands,
+    parent: Option<u32>,
+) -> Result<bool, NetworkError> {
+    if cleanup::pending(commands)? {
+        // PF and its owner record were already cleared. The watchdog or
+        // the next scheduled run can finish just the outstanding bootout.
+        cleanup::cancel(commands)?;
+    } else if parent.is_none() {
+        recover(commands)?;
+    }
+    Ok(true)
 }
 
 /// The parent owns the pipe writer for the lifetime of the guard. It closes
@@ -213,4 +228,44 @@ fn control_pipe_closed() -> Result<bool, NetworkError> {
         return Err(NetworkError::Io);
     }
     Ok(stdin.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::egress::commands::testing::{Call, Recorder};
+
+    const DOMAIN: &str = "system/com.cvbbmso.egress-cleanup";
+
+    #[test]
+    fn surviving_recovery_retries_bootout_after_the_guard_state_is_removed() {
+        for parent in [Some(1234), None] {
+            let recorder = Recorder::default();
+            state::write(&recorder, &GuardState::new(1234)).unwrap();
+            recorder.reply(&["bootout", DOMAIN], Err(NetworkError::Io));
+            assert_eq!(recover(&recorder), Err(NetworkError::Io));
+            assert!(state::read(&recorder).unwrap().is_none());
+            assert!(cleanup::pending(&recorder).unwrap());
+
+            recorder.calls.borrow_mut().clear();
+            recorder.reply(&["bootout", DOMAIN], Err(NetworkError::Io));
+            assert_eq!(
+                recover_without_owner(&recorder, parent),
+                Err(NetworkError::Io)
+            );
+            assert!(cleanup::pending(&recorder).unwrap());
+
+            // The original RPC may have removed the task after the timeout.
+            recorder.rejected(&["bootout", DOMAIN], "Boot-out failed");
+            recorder.rejected(
+                &["print", DOMAIN],
+                "Could not find service \"com.cvbbmso.egress-cleanup\" in domain for system",
+            );
+            assert_eq!(recover_without_owner(&recorder, parent), Ok(true));
+            assert!(!cleanup::pending(&recorder).unwrap());
+            assert!(recorder.calls().iter().all(|call| match call {
+                Call::Run(program, _) | Call::Output(program, _) => program == "/bin/launchctl",
+            }));
+        }
+    }
 }
