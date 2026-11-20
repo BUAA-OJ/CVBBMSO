@@ -20,6 +20,7 @@ env:
 
 jobs:
   fmt:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test/hosted-egress-capabilities') }}
     name: Format
     runs-on: ubuntu-latest
     steps:
@@ -30,6 +31,7 @@ jobs:
       - run: cargo fmt --all --check
 
   clippy:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test/hosted-egress-capabilities') }}
     name: Clippy
     runs-on: ubuntu-latest
     steps:
@@ -41,6 +43,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test/hosted-egress-capabilities') }}
     name: Test
     runs-on: ubuntu-latest
     steps:
@@ -50,6 +53,7 @@ jobs:
       - run: cargo test --workspace --all-features
 
   check:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test/hosted-egress-capabilities') }}
     name: Check (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -63,6 +67,7 @@ jobs:
       - run: cargo check --workspace --all-targets
 
   deny:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test/hosted-egress-capabilities') }}
     name: Dependency policy
     runs-on: ubuntu-latest
     steps:
@@ -74,6 +79,7 @@ jobs:
       - run: cargo deny check
 
   audit:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test/hosted-egress-capabilities') }}
     name: Security advisories
     runs-on: ubuntu-latest
     steps:
@@ -83,3 +89,31 @@ jobs:
         with:
           tool: cargo-audit
       - run: cargo audit
+
+  hosted-egress-capabilities:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test/hosted-egress-capabilities' }}
+    name: Egress capabilities (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check capabilities and supervised failure paths
+        timeout-minutes: 3
+        run: python -I -B .github/hosted_egress_probe.py
+      - name: Retain capability and recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: egress-capabilities-${{ matrix.os }}
+          path: ${{ runner.temp }}/cvbbmso-hosted-egress.json
+          if-no-files-found: error
+          retention-days: 7
