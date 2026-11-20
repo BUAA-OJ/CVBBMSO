@@ -79,40 +79,20 @@ async fn session(mut socket: WebSocket, hub: Hub, connection: Connection, timeou
     };
     tokio::pin!(write);
     tokio::select! {
-        () = &mut write => {}
+        () = &mut write => hub.end(connection, DisconnectReason::Closed, None).await,
         () = read => write.await,
     }
-    hub.end(connection, DisconnectReason::Closed, None).await;
 }
 
 async fn first_message(
     reader: &mut (impl Stream<Item = Result<Message, axum::Error>> + Unpin),
     timeout: Duration,
 ) -> Result<Option<ClientHello>, SocketError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let frame = time::timeout_at(deadline, reader.next())
-            .await
-            .map_err(|_| SocketError::HELLO_REQUIRED)?;
-        if Instant::now() >= deadline {
-            return Err(SocketError::HELLO_REQUIRED);
-        }
-        match frame {
-            Some(Ok(Message::Text(text))) => {
-                let message = serde_json::from_str::<ClientMessage>(&text)
-                    .map_err(|_| SocketError::PROTOCOL_ERROR)?;
-                return match message {
-                    ClientMessage::Hello(hello) => Ok(Some(hello)),
-                    _ => Err(SocketError::HELLO_REQUIRED),
-                };
-            }
-            Some(Ok(Message::Binary(_))) => return Err(SocketError::PROTOCOL_ERROR),
-            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-            Some(Err(error)) if malformed_frame(&error) => {
-                return Err(SocketError::PROTOCOL_ERROR);
-            }
-            Some(Ok(Message::Close(_)) | Err(_)) | None => return Ok(None),
-        }
+    match next_message(reader, Instant::now() + timeout).await {
+        Ok(Some((ClientMessage::Hello(hello), _))) => Ok(Some(hello)),
+        Ok(None) => Ok(None),
+        Err(ReadError::Malformed) => Err(SocketError::PROTOCOL_ERROR),
+        Ok(Some(_)) | Err(ReadError::Timeout) => Err(SocketError::HELLO_REQUIRED),
     }
 }
 
@@ -124,21 +104,11 @@ async fn read_frames(
     mut deadline: Instant,
 ) {
     let (reason, error) = loop {
-        let frame = time::timeout_at(deadline, reader.next()).await;
-        let received_at = Instant::now();
-        if received_at >= deadline {
-            break (DisconnectReason::HeartbeatTimeout, None);
-        }
-        match frame {
-            Ok(Some(Ok(Message::Text(text)))) => {
-                let Ok(message) = serde_json::from_str::<ClientMessage>(&text) else {
-                    break (DisconnectReason::Closed, Some(SocketError::PROTOCOL_ERROR));
-                };
-                if matches!(message, ClientMessage::Hello(_)) {
-                    break (DisconnectReason::Closed, Some(SocketError::PROTOCOL_ERROR));
-                }
-                // The receive and timeout notices share one ordered channel. The
-                // manager only commits the renewed deadline after persisting the heartbeat.
+        match next_message(reader, deadline).await {
+            Ok(Some((ClientMessage::Hello(_), _))) | Err(ReadError::Malformed) => {
+                break (DisconnectReason::Closed, Some(SocketError::PROTOCOL_ERROR));
+            }
+            Ok(Some((message, received_at))) => {
                 if matches!(message, ClientMessage::Heartbeat) {
                     deadline = received_at + timeout;
                 }
@@ -146,20 +116,41 @@ async fn read_frames(
                     return;
                 }
             }
-            Ok(Some(Ok(Message::Binary(_)))) => {
-                break (DisconnectReason::Closed, Some(SocketError::PROTOCOL_ERROR));
-            }
-            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
-            Ok(Some(Err(error))) if malformed_frame(&error) => {
-                break (DisconnectReason::Closed, Some(SocketError::PROTOCOL_ERROR));
-            }
-            Ok(Some(Ok(Message::Close(_)) | Err(_)) | None) => {
-                break (DisconnectReason::Closed, None);
-            }
-            Err(_) => break (DisconnectReason::HeartbeatTimeout, None),
+            Ok(None) => break (DisconnectReason::Closed, None),
+            Err(ReadError::Timeout) => break (DisconnectReason::HeartbeatTimeout, None),
         }
     };
     hub.end(connection, reason, error).await;
+}
+
+enum ReadError {
+    Timeout,
+    Malformed,
+}
+
+async fn next_message(
+    reader: &mut (impl Stream<Item = Result<Message, axum::Error>> + Unpin),
+    deadline: Instant,
+) -> Result<Option<(ClientMessage, Instant)>, ReadError> {
+    loop {
+        let frame = time::timeout_at(deadline, reader.next())
+            .await
+            .map_err(|_| ReadError::Timeout)?;
+        let received_at = Instant::now();
+        if received_at >= deadline {
+            return Err(ReadError::Timeout);
+        }
+        match frame {
+            Some(Ok(Message::Text(text))) => {
+                let message = serde_json::from_str(&text).map_err(|_| ReadError::Malformed)?;
+                return Ok(Some((message, received_at)));
+            }
+            Some(Ok(Message::Binary(_))) => return Err(ReadError::Malformed),
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            Some(Err(error)) if malformed_frame(&error) => return Err(ReadError::Malformed),
+            Some(Ok(Message::Close(_)) | Err(_)) | None => return Ok(None),
+        }
+    }
 }
 
 fn malformed_frame(error: &axum::Error) -> bool {

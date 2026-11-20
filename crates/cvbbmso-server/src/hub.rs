@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::Arc,
+    time::Duration,
+};
 
 use cvbbmso_domain::{DisconnectReason, DomainError, ExamService};
 use cvbbmso_protocol::{
@@ -293,9 +297,7 @@ impl Manager {
 
     async fn connect(&mut self, connection: Connection, hello: ClientHello, peer: Peer) {
         // Commit the previous socket's loss before marking this student connected again.
-        if let Some(lost) = self.lost.get(&connection.student).copied()
-            && !self.record_lost(lost).await
-        {
+        if !self.record_lost(connection.student).await {
             connection
                 .span()
                 .in_scope(|| tracing::warn!("WebSocket admission deferred while SQLite is busy"));
@@ -344,12 +346,13 @@ impl Manager {
         message: ClientMessage,
         received_at: Instant,
     ) {
-        let Some(current) = self.current.get_mut(&connection.student) else {
+        let Some(current) = self
+            .current
+            .get_mut(&connection.student)
+            .filter(|current| current.connection.id == connection.id)
+        else {
             return;
         };
-        if current.connection.id != connection.id {
-            return;
-        }
         if received_at >= current.deadline {
             self.end(connection, DisconnectReason::HeartbeatTimeout, None)
                 .await;
@@ -380,42 +383,47 @@ impl Manager {
         reason: DisconnectReason,
         error: Option<SocketError>,
     ) {
-        let Some(current) = self.current.get(&connection.student) else {
+        let student = connection.student;
+        let Entry::Occupied(current) = self.current.entry(student) else {
             return;
         };
-        if current.connection.id != connection.id
+        if current.get().connection.id != connection.id
             || (matches!(reason, DisconnectReason::HeartbeatTimeout)
-                && Instant::now() < current.deadline)
+                && Instant::now() < current.get().deadline)
         {
             return;
         }
-        let lost = LostConnection {
-            connection,
-            reason,
-            observed_at: self.exam.now(),
-        };
-        if !self.record_lost(lost).await {
-            connection
-                .span()
-                .in_scope(|| tracing::warn!("SQLite is busy; deferring disconnect record"));
-            self.lost.insert(connection.student, lost);
+        let current = current.remove();
+        self.lost.insert(
+            student,
+            LostConnection {
+                connection,
+                reason,
+                observed_at: self.exam.now(),
+            },
+        );
+        let span = connection.span();
+        if !self.record_lost(student).await {
+            span.in_scope(|| tracing::warn!("SQLite is busy; deferring disconnect record"));
         }
-        if let Some(current) = self.current.remove(&connection.student) {
-            connection.span().in_scope(|| {
-                if let Some(error) = error {
-                    tracing::warn!(code = error.code, "WebSocket message rejected");
-                }
-                tracing::info!(?reason, "WebSocket disconnected");
-            });
-            let _ = current.close.send(error);
-        }
+        span.in_scope(|| {
+            if let Some(error) = error {
+                tracing::warn!(code = error.code, "WebSocket message rejected");
+            }
+            tracing::info!(?reason, "WebSocket disconnected");
+        });
+        let _ = current.close.send(error);
     }
 
-    async fn record_lost(&mut self, lost: LostConnection) -> bool {
+    /// Returns false when SQLite is busy and the record must be retried.
+    async fn record_lost(&mut self, student: StudentKey) -> bool {
+        let Some(lost) = self.lost.get(&student).copied() else {
+            return true;
+        };
         let StudentKey {
             exam_id,
             oj_user_id,
-        } = lost.connection.student;
+        } = student;
         match self
             .exam
             .disconnect_at(exam_id, oj_user_id, lost.reason, lost.observed_at)
@@ -428,16 +436,16 @@ impl Manager {
                 .in_scope(|| tracing::error!(?error, "could not record WebSocket disconnect")),
             Ok(()) => {}
         }
-        self.lost.remove(&lost.connection.student);
+        self.lost.remove(&student);
         true
     }
 
     async fn retry_lost(&mut self) {
         for _ in 0..DISCONNECT_RETRY_BATCH {
-            let Some(lost) = self.lost.values().next().copied() else {
+            let Some(student) = self.lost.keys().next().copied() else {
                 break;
             };
-            if !self.record_lost(lost).await {
+            if !self.record_lost(student).await {
                 // A locked database applies to all pending disconnects.
                 break;
             }
