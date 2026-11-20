@@ -2,10 +2,7 @@
 
 use std::{
     io,
-    sync::{
-        Arc, Mutex, PoisonError,
-        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
-    },
+    sync::{Arc, mpsc},
     time::Duration,
 };
 
@@ -29,7 +26,7 @@ use objc2_screen_capture_kit::{
     SCStreamDelegate, SCStreamOutput, SCStreamOutputType,
 };
 
-use super::Frame;
+use super::{Frame, FrameSlot};
 use crate::RecordingError;
 
 /// `kCVPixelBufferLock_ReadOnly`: the captured image is only read, never written.
@@ -54,12 +51,11 @@ type CaptureResult<T> = Result<T, CaptureError>;
 
 /// Capture stream of the primary display, delivering the newest image.
 pub(crate) struct Desktop {
-    frames: Receiver<Frame>,
-    stopped: Arc<Mutex<Option<String>>>,
+    slot: Arc<FrameSlot>,
     // Declared before the handler so the stream that references it is released
     // first. The handler is also retained by the stream for its callbacks.
     stream: Retained<SCStream>,
-    // Kept alive because ScreenCaptureKit does not retain stream outputs.
+    // Kept alive because `ScreenCaptureKit` does not retain stream outputs.
     handler: Retained<StreamHandler>,
     // The sample handler queue outlives every callback it dispatches.
     _queue: dispatch2::DispatchRetained<DispatchQueue>,
@@ -85,36 +81,16 @@ impl Desktop {
     /// Waits for the next captured image.
     ///
     /// Returns `Ok(None)` when no new image arrived within `timeout_ms`, which
-    /// is a normal condition for a still screen rather than a fault.
+    /// is a normal condition for a still screen rather than a fault. An image
+    /// the sampler has not consumed yet is replaced by newer ones, so a slow
+    /// consumer never records stale content.
     ///
     /// # Errors
     ///
     /// Returns [`RecordingError::Platform`] when the stream stopped, for example
     /// because the user revoked screen-recording permission.
     pub(crate) fn next_frame(&mut self, timeout_ms: u32) -> Result<Option<Frame>, RecordingError> {
-        if let Some(message) = self.take_stopped() {
-            return Err(failure(CaptureError::Unavailable(message)));
-        }
-        match self
-            .frames
-            .recv_timeout(Duration::from_millis(u64::from(timeout_ms)))
-        {
-            Ok(frame) => Ok(Some(frame)),
-            Err(RecvTimeoutError::Timeout) => match self.take_stopped() {
-                Some(message) => Err(failure(CaptureError::Unavailable(message))),
-                None => Ok(None),
-            },
-            Err(RecvTimeoutError::Disconnected) => Err(failure(CaptureError::Unavailable(
-                "the capture stream stopped".to_owned(),
-            ))),
-        }
-    }
-
-    fn take_stopped(&self) -> Option<String> {
-        self.stopped
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
+        self.slot.next(Duration::from_millis(u64::from(timeout_ms)))
     }
 
     fn open_inner(fps: u32) -> CaptureResult<Self> {
@@ -130,9 +106,8 @@ impl Desktop {
             return Err(CaptureError::EmptyDisplay);
         }
 
-        let (sender, frames) = mpsc::sync_channel(1);
-        let stopped = Arc::new(Mutex::new(None));
-        let handler = StreamHandler::new(sender, Arc::clone(&stopped));
+        let slot = Arc::new(FrameSlot::new());
+        let handler = StreamHandler::new(Arc::clone(&slot));
 
         // SAFETY: every ScreenCaptureKit object below is created here and kept
         // alive for the lifetime of the stream. The filter captures one display
@@ -192,8 +167,7 @@ impl Desktop {
             return Err(error);
         }
         Ok(Self {
-            frames,
-            stopped,
+            slot,
             stream,
             handler,
             _queue: queue,
@@ -321,8 +295,7 @@ fn failure(error: CaptureError) -> RecordingError {
 
 /// State shared with the `ScreenCaptureKit` callbacks.
 struct HandlerIvars {
-    frames: SyncSender<Frame>,
-    stopped: Arc<Mutex<Option<String>>>,
+    slot: Arc<FrameSlot>,
 }
 
 define_class!(
@@ -349,9 +322,9 @@ define_class!(
                 return;
             }
             if let Some(frame) = image_frame(sample_buffer) {
-                // A full channel means the sampler has not consumed the previous
-                // image yet. Dropping the newest keeps the pull model bounded.
-                let _ = self.ivars().frames.try_send(frame);
+                // Replaces an image the sampler has not consumed yet, so a slow
+                // consumer always records the newest screen content.
+                self.ivars().slot.store(frame);
             }
         }
     }
@@ -359,19 +332,14 @@ define_class!(
     unsafe impl SCStreamDelegate for StreamHandler {
         #[unsafe(method(stream:didStopWithError:))]
         unsafe fn did_stop_with_error(&self, _stream: &SCStream, error: &NSError) {
-            let mut slot = self
-                .ivars()
-                .stopped
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            *slot = Some(description(error));
+            self.ivars().slot.stop(description(error));
         }
     }
 );
 
 impl StreamHandler {
-    fn new(frames: SyncSender<Frame>, stopped: Arc<Mutex<Option<String>>>) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(HandlerIvars { frames, stopped });
+    fn new(slot: Arc<FrameSlot>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(HandlerIvars { slot });
         // SAFETY: NSObject's `init` accepts a fully initialized instance.
         unsafe { msg_send![super(this), init] }
     }

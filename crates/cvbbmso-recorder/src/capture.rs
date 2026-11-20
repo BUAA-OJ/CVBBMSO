@@ -4,6 +4,14 @@
 // platform test exercises it until then.
 #![allow(dead_code)]
 
+use std::{
+    io,
+    sync::{Condvar, Mutex, MutexGuard, PoisonError},
+    time::{Duration, Instant},
+};
+
+use crate::RecordingError;
+
 mod sampling;
 
 #[allow(unused_imports)] // Consumed by the encoder pipeline in the next milestone.
@@ -69,6 +77,90 @@ impl Frame {
             height,
             pixels: packed,
         })
+    }
+}
+
+/// Newest captured image plus the reason capture stopped.
+///
+/// Push-based backends deliver images from their own callback thread while the
+/// sampler pulls them. Keeping only the newest image means a slow consumer can
+/// never read a stale frame after a newer one was produced, and a still screen
+/// cannot strand the last change behind an unconsumed older image.
+pub(crate) struct FrameSlot {
+    state: Mutex<SlotState>,
+    ready: Condvar,
+}
+
+/// Contents of a [`FrameSlot`].
+#[derive(Default)]
+struct SlotState {
+    frame: Option<Frame>,
+    stopped: Option<String>,
+}
+
+impl FrameSlot {
+    /// Creates an empty slot.
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(SlotState::default()),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// Waits up to `timeout` for an image the caller has not consumed yet.
+    ///
+    /// A pending image is delivered before the stop reason, so a change captured
+    /// just before the stream stopped is not lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordingError::Platform`] with the backend's message once the
+    /// stream has stopped; the error repeats for later calls.
+    pub(crate) fn next(&self, timeout: Duration) -> Result<Option<Frame>, RecordingError> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.lock();
+        loop {
+            if let Some(frame) = state.frame.take() {
+                return Ok(Some(frame));
+            }
+            if let Some(message) = &state.stopped {
+                return Err(RecordingError::Platform(Some(io::Error::other(
+                    message.clone(),
+                ))));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let (guard, wait) = self
+                .ready
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(PoisonError::into_inner);
+            state = guard;
+            if wait.timed_out() && state.frame.is_none() && state.stopped.is_none() {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Replaces the pending image, so the newest image always wins.
+    pub(crate) fn store(&self, frame: Frame) {
+        let mut state = self.lock();
+        state.frame = Some(frame);
+        drop(state);
+        self.ready.notify_all();
+    }
+
+    /// Records that capture stopped, waking a waiting consumer.
+    pub(crate) fn stop(&self, message: String) {
+        let mut state = self.lock();
+        state.stopped = Some(message);
+        drop(state);
+        self.ready.notify_all();
+    }
+
+    fn lock(&self) -> MutexGuard<'_, SlotState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -168,7 +260,10 @@ mod unsupported {
 
 #[cfg(test)]
 mod tests {
-    use super::{Frame, Rotation, rotate};
+    use std::time::Duration;
+
+    use super::{Frame, FrameSlot, Rotation, rotate};
+    use crate::RecordingError;
 
     /// A 2x3 image whose pixels encode their own coordinates: `x | y << 4`.
     fn source() -> (Vec<u8>, u32, u32) {
@@ -259,5 +354,42 @@ mod tests {
         assert!(Frame::from_padded_bgra(&[], 0, 1, 8).is_none());
         assert!(Frame::from_padded_bgra(&[], 2, 0, 8).is_none());
         assert!(Frame::from_padded_bgra(&[], u32::MAX, 1, usize::MAX).is_none());
+    }
+
+    /// One-pixel frame tagged by `value` so replacement is visible.
+    fn tagged(value: u8) -> Frame {
+        Frame {
+            width: 1,
+            height: 1,
+            pixels: vec![value, value, value, value],
+        }
+    }
+
+    #[test]
+    fn a_newer_image_replaces_an_unconsumed_one() {
+        let slot = FrameSlot::new();
+        slot.store(tagged(1));
+        slot.store(tagged(2));
+
+        let frame = slot
+            .next(Duration::ZERO)
+            .expect("image")
+            .expect("pending image");
+        assert_eq!(frame.pixels, [2, 2, 2, 2]);
+        assert!(slot.next(Duration::ZERO).expect("empty").is_none());
+    }
+
+    #[test]
+    fn a_stopped_stream_reports_the_reason_after_the_last_image() {
+        let slot = FrameSlot::new();
+        slot.store(tagged(3));
+        slot.stop("screen recording permission was revoked".to_owned());
+
+        assert!(slot.next(Duration::ZERO).expect("last image").is_some());
+
+        let error = slot.next(Duration::ZERO).err().expect("stopped");
+        assert!(matches!(error, RecordingError::Platform(Some(_))));
+        // The reason repeats instead of degrading into a still screen.
+        assert!(slot.next(Duration::ZERO).is_err());
     }
 }

@@ -5,7 +5,7 @@ use std::{
     io,
     marker::PhantomData,
     ptr::{self, NonNull},
-    sync::{Arc, Condvar, Mutex, PoisonError},
+    sync::{Arc, Condvar, Mutex, PoisonError, mpsc},
     time::{Duration, Instant},
 };
 
@@ -60,6 +60,12 @@ enum EncoderError {
     /// A pending frame did not complete in time.
     #[error("timed out waiting for {0}")]
     Timeout(&'static str),
+    /// A drain timed out; its thread still owns the session and callback state.
+    #[error("the encoder was detached after a drain timeout")]
+    Detached,
+    /// The drain helper thread could not be started or ended unexpectedly.
+    #[error("the encoder drain thread failed")]
+    DrainThread(#[source] io::Error),
     /// The encoder output omitted a required parameter set.
     #[error("encoder output is missing the {0}")]
     MissingParameterSet(&'static str),
@@ -115,7 +121,10 @@ pub(crate) struct Encoder {
     last_pts: i64,
     /// Whether the next frame must be an IDR.
     force_keyframe: bool,
-    // The session belongs to the thread that created it.
+    /// Set when a drain timed out; the session then belongs to the drain thread.
+    detached: bool,
+    // The session is used from the thread that created it, except for the
+    // detaching drain thread described by [`Encoder::flush_inner`].
     _thread: PhantomData<*const ()>,
 }
 
@@ -185,6 +194,7 @@ impl Encoder {
             fps,
             last_pts: 0,
             force_keyframe: true,
+            detached: false,
             _thread: PhantomData,
         };
         encoder.configure(bitrate)?;
@@ -244,6 +254,9 @@ impl Encoder {
         frame: &Nv12Frame,
         timestamp: Duration,
     ) -> EncoderResult<Vec<Sample>> {
+        if self.detached {
+            return Err(EncoderError::Detached);
+        }
         let pixel_buffer = self.pixel_buffer(frame)?;
         let presentation = self.presentation_time(timestamp);
         let duration =
@@ -276,16 +289,54 @@ impl Encoder {
     }
 
     fn flush_inner(&mut self) -> EncoderResult<Vec<Sample>> {
-        // SAFETY: the session is live; completing all frames is explicit and
-        // only affects frames already submitted.
-        let status = unsafe { self.session.complete_frames(kCMTimeInvalid) };
-        if status != 0 {
-            return Err(EncoderError::Status {
-                status,
-                operation: "completing pending frames",
-            });
+        if self.detached {
+            return Err(EncoderError::Detached);
         }
-        self.wait_for_completion(DRAIN_TIMEOUT)?;
+        // `CompleteFrames` blocks until every pending frame has been emitted, so
+        // run it on its own thread: the deadline then covers both that blocking
+        // call and the callbacks it triggers, and a wedged encoder cannot pin
+        // the sampling thread forever.
+        let deadline = Instant::now() + DRAIN_TIMEOUT;
+        let (send, receive) = mpsc::channel();
+        let session = DrainSession(self.session.clone());
+        let shared = Arc::clone(&self.shared);
+        let handle = std::thread::Builder::new()
+            .name("cvbbmso-vt-drain".to_owned())
+            .spawn(move || {
+                // SAFETY: the session is live and the encoder does not use it
+                // while this thread runs. Releases happen session first so the
+                // callback state outlives every possible callback.
+                let status = unsafe { session.0.complete_frames(kCMTimeInvalid) };
+                let _ = send.send(status);
+                drop(session);
+                drop(shared);
+            })
+            .map_err(|error| EncoderError::DrainThread(io::Error::other(error)))?;
+        match receive.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(status) => {
+                let _ = handle.join();
+                if status != 0 {
+                    return Err(EncoderError::Status {
+                        status,
+                        operation: "completing pending frames",
+                    });
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // The drain thread keeps the session and the callback state
+                // alive; stop using this encoder and let that thread release
+                // them once the blocked call returns.
+                self.detached = true;
+                return Err(EncoderError::Timeout("the encoder to drain"));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = handle.join();
+                return Err(EncoderError::DrainThread(io::Error::other(
+                    "the drain thread ended without a status",
+                )));
+            }
+        }
+        self.wait_for_completion(deadline)?;
         self.take_samples()
     }
 
@@ -460,8 +511,7 @@ impl Encoder {
         Ok(std::mem::take(&mut state.samples))
     }
 
-    fn wait_for_completion(&self, timeout: Duration) -> EncoderResult<()> {
-        let deadline = Instant::now() + timeout;
+    fn wait_for_completion(&self, deadline: Instant) -> EncoderResult<()> {
         let mut state = self.lock_state();
         while state.completed < state.submitted {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -505,8 +555,21 @@ impl Encoder {
     }
 }
 
+/// Session handle moved into the drain thread.
+struct DrainSession(CFRetained<VTCompressionSession>);
+
+// SAFETY: `VideoToolbox` sessions are Core Foundation objects that may be
+// retained and released from any thread. The encoder never touches the session
+// while `flush_inner` waits for the drain thread, so access stays serialized.
+unsafe impl Send for DrainSession {}
+
 impl Drop for Encoder {
     fn drop(&mut self) {
+        if self.detached {
+            // The drain thread still uses the session; releasing our references
+            // is enough and that thread releases the objects once it returns.
+            return;
+        }
         // SAFETY: invalidating a live session stops new callbacks before the
         // session and the shared state are released.
         unsafe { self.session.invalidate() };
@@ -598,9 +661,17 @@ unsafe extern "C-unwind" fn output_callback(
     // SAFETY: the creational contract above guarantees a live `Shared`.
     let shared = unsafe { &*refcon.cast::<Shared>() };
     let mut state = shared.state.lock().unwrap_or_else(PoisonError::into_inner);
-    if status == 0
-        && let Some(sample_buffer) = unsafe { sample_buffer.as_ref() }
-    {
+    // VideoToolbox reports compression failures through `status`; keeping the
+    // raw status makes them surface as an encoder fault instead of looking like
+    // a dropped frame.
+    if status != 0 {
+        if state.failure.is_none() {
+            state.failure = Some(io::Error::other(EncoderError::Status {
+                status,
+                operation: "encoding a frame",
+            }));
+        }
+    } else if let Some(sample_buffer) = unsafe { sample_buffer.as_ref() } {
         match sample_from_buffer(sample_buffer) {
             Ok((sample, config)) => {
                 if state.config.is_none() {
@@ -611,7 +682,9 @@ unsafe extern "C-unwind" fn output_callback(
                 }
             }
             Err(error) => {
-                state.failure = Some(io::Error::other(error));
+                if state.failure.is_none() {
+                    state.failure = Some(io::Error::other(error));
+                }
             }
         }
     }
