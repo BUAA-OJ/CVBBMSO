@@ -3,7 +3,10 @@
 //! The trait exists as a test seam: the real implementation shells out to the
 //! platform tools, tests record the calls instead of touching the firewall.
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::process::Command;
 
 use crate::NetworkError;
@@ -20,6 +23,9 @@ pub(crate) trait Commands {
     /// Runs `program` and returns its standard output.
     fn output(&self, program: &str, args: &[&str]) -> Result<String, NetworkError>;
 
+    /// Runs a command with its output written directly to a new journal.
+    fn capture(&self, program: &str, args: &[&str], path: &str) -> Result<(), NetworkError>;
+
     /// Reads a file, or returns `None` when it does not exist.
     fn read(&self, path: &str) -> Result<Option<String>, NetworkError>;
 
@@ -30,29 +36,57 @@ pub(crate) trait Commands {
     fn remove(&self, path: &str) -> Result<(), NetworkError>;
 }
 
-/// Commands backed by the operating system.
-pub(crate) struct SystemCommands;
+/// The inherited lock keeps recovery from overtaking an orphaned platform command.
+pub(crate) struct SystemCommands<'a>(pub(crate) Option<&'a File>);
 
-impl Commands for SystemCommands {
-    fn run(&self, program: &str, args: &[&str]) -> Result<(), NetworkError> {
-        let output = Command::new(program)
+impl SystemCommands<'_> {
+    fn command(&self, program: &str, args: &[&str]) -> Result<Command, NetworkError> {
+        let mut command = Command::new(program);
+        command
             .args(args)
+            .current_dir("/")
+            .env_clear()
+            .env("LC_ALL", "C");
+        if let Some(lock) = self.0 {
+            command.stdin(lock.try_clone().map_err(|_| NetworkError::Io)?);
+        }
+        Ok(command)
+    }
+}
+
+impl Commands for SystemCommands<'_> {
+    fn run(&self, program: &str, args: &[&str]) -> Result<(), NetworkError> {
+        self.output(program, args).map(drop)
+    }
+
+    fn output(&self, program: &str, args: &[&str]) -> Result<String, NetworkError> {
+        let output = self
+            .command(program, args)?
             .output()
             .map_err(|_| NetworkError::Platform)?;
         if output.status.success() {
-            Ok(())
+            String::from_utf8(output.stdout).map_err(|_| NetworkError::Platform)
         } else {
             Err(NetworkError::Platform)
         }
     }
 
-    fn output(&self, program: &str, args: &[&str]) -> Result<String, NetworkError> {
-        let output = Command::new(program)
-            .args(args)
-            .output()
+    fn capture(&self, program: &str, args: &[&str], path: &str) -> Result<(), NetworkError> {
+        let journal = File::options()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|_| NetworkError::Io)?;
+        let stdout = journal.try_clone().map_err(|_| NetworkError::Io)?;
+        let status = self
+            .command(program, args)?
+            .stdout(stdout)
+            .stderr(journal)
+            .status()
             .map_err(|_| NetworkError::Platform)?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        if status.success() {
+            Ok(())
         } else {
             Err(NetworkError::Platform)
         }
@@ -67,10 +101,29 @@ impl Commands for SystemCommands {
     }
 
     fn write(&self, path: &str, contents: &str) -> Result<(), NetworkError> {
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            fs::create_dir_all(parent).map_err(|_| NetworkError::Io)?;
+        let path = Path::new(path);
+        let directory = path.parent().ok_or(NetworkError::Io)?;
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(directory).map_err(|_| NetworkError::Io)?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {
+                temporary
+                    .as_file()
+                    .set_permissions(metadata.permissions())
+                    .map_err(|_| NetworkError::Io)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(NetworkError::Io),
         }
-        fs::write(path, contents).map_err(|_| NetworkError::Io)
+        temporary
+            .write_all(contents.as_bytes())
+            .map_err(|_| NetworkError::Io)?;
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|_| NetworkError::Io)?;
+        temporary.persist(path).map_err(|_| NetworkError::Io)?;
+        Ok(())
     }
 
     fn remove(&self, path: &str) -> Result<(), NetworkError> {
@@ -89,6 +142,7 @@ pub(crate) mod testing {
     use super::Commands;
     use crate::NetworkError;
     use std::cell::RefCell;
+    use std::collections::{HashMap, VecDeque};
 
     /// One command invocation.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,12 +153,14 @@ pub(crate) mod testing {
         Output(String, Vec<String>),
     }
 
+    type Replies = HashMap<Vec<String>, VecDeque<Result<String, NetworkError>>>;
+
     /// Records calls and serves canned file contents.
     #[derive(Debug, Default)]
     pub(crate) struct Recorder {
         pub(crate) calls: RefCell<Vec<Call>>,
-        pub(crate) files: RefCell<std::collections::HashMap<String, String>>,
-        pub(crate) fail_on: RefCell<Option<String>>,
+        pub(crate) files: RefCell<HashMap<String, String>>,
+        replies: RefCell<Replies>,
     }
 
     impl Recorder {
@@ -125,11 +181,21 @@ pub(crate) mod testing {
             self.files.borrow().get(path).cloned()
         }
 
-        fn fail_if(&self, program: &str) -> Result<(), NetworkError> {
-            if self.fail_on.borrow().as_deref() == Some(program) {
-                return Err(NetworkError::Platform);
-            }
-            Ok(())
+        pub(crate) fn reply(&self, args: &[&str], result: Result<&str, NetworkError>) {
+            self.replies
+                .borrow_mut()
+                .entry(args.iter().map(|arg| (*arg).to_owned()).collect())
+                .or_default()
+                .push_back(result.map(str::to_owned));
+        }
+
+        fn response(&self, args: &[&str]) -> Result<String, NetworkError> {
+            let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+            self.replies
+                .borrow_mut()
+                .get_mut(&args)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or_else(|| Ok(String::new()))
         }
     }
 
@@ -139,7 +205,7 @@ pub(crate) mod testing {
                 program.to_owned(),
                 args.iter().map(|arg| (*arg).to_owned()).collect(),
             ));
-            self.fail_if(program)
+            self.response(args).map(drop)
         }
 
         fn output(&self, program: &str, args: &[&str]) -> Result<String, NetworkError> {
@@ -147,8 +213,12 @@ pub(crate) mod testing {
                 program.to_owned(),
                 args.iter().map(|arg| (*arg).to_owned()).collect(),
             ));
-            self.fail_if(program)?;
-            Ok(String::new())
+            self.response(args)
+        }
+
+        fn capture(&self, program: &str, args: &[&str], path: &str) -> Result<(), NetworkError> {
+            let output = self.output(program, args)?;
+            self.write(path, &output)
         }
 
         fn read(&self, path: &str) -> Result<Option<String>, NetworkError> {

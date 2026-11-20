@@ -19,21 +19,26 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "rt", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
 url.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation.workspace = true
 libc.workspace = true
 system-configuration.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Networking_WinHttp",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
     "Win32_NetworkManagement_WindowsFilteringPlatform",
     "Win32_Security",
     "Win32_System_Rpc",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 

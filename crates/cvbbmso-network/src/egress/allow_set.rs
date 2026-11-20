@@ -1,26 +1,37 @@
 //! Allowed addresses, with a grace period for replaced entries.
 
 use std::collections::HashSet;
-use std::net::IpAddr;
+use std::hash::Hash;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use crate::NetworkError;
 
 /// Addresses of one origin, keeping replaced addresses reachable for a while so
 /// connections that already started are not cut.
-#[derive(Debug, Default, Clone)]
-struct EndpointSet {
-    current: HashSet<IpAddr>,
-    retired: Vec<(IpAddr, Instant)>,
+#[derive(Debug, Clone)]
+struct EndpointSet<T> {
+    current: HashSet<T>,
+    retired: Vec<(T, Instant)>,
 }
 
-impl EndpointSet {
-    fn replace(&mut self, next: Vec<IpAddr>, now: Instant, grace: Duration) {
-        let next: HashSet<IpAddr> = next.into_iter().collect();
+impl<T> Default for EndpointSet<T> {
+    fn default() -> Self {
+        Self {
+            current: HashSet::new(),
+            retired: Vec::new(),
+        }
+    }
+}
+
+impl<T: Copy + Eq + Hash + Ord> EndpointSet<T> {
+    fn replace(&mut self, next: Vec<T>, now: Instant, grace: Duration) {
+        let next: HashSet<T> = next.into_iter().collect();
         for address in self.current.difference(&next) {
             self.retired.push((*address, now + grace));
         }
-        self.retired.retain(|(_, until)| *until > now);
+        self.retired
+            .retain(|(address, until)| *until > now && !next.contains(address));
         self.current = next;
     }
 
@@ -28,8 +39,8 @@ impl EndpointSet {
         self.current.is_empty()
     }
 
-    fn active(&self, now: Instant) -> Vec<IpAddr> {
-        let mut addresses: Vec<IpAddr> = self
+    fn active(&self, now: Instant) -> Vec<T> {
+        let mut addresses: Vec<T> = self
             .current
             .iter()
             .copied()
@@ -49,9 +60,9 @@ impl EndpointSet {
 /// Addresses the guard allows, split by purpose.
 #[derive(Debug, Clone)]
 pub(crate) struct AllowSet {
-    accoding: EndpointSet,
-    server: EndpointSet,
-    certificate: EndpointSet,
+    accoding: EndpointSet<IpAddr>,
+    server: EndpointSet<IpAddr>,
+    certificate: EndpointSet<SocketAddr>,
     grace: Duration,
 }
 
@@ -78,7 +89,7 @@ impl AllowSet {
         &mut self,
         accoding: Vec<IpAddr>,
         server: Vec<IpAddr>,
-        certificate: Vec<IpAddr>,
+        certificate: Vec<SocketAddr>,
         now: Instant,
     ) -> Result<(), NetworkError> {
         let nothing_known = self.accoding.is_empty() && self.server.is_empty();
@@ -95,15 +106,8 @@ impl AllowSet {
         Ok(())
     }
 
-    /// Drops expired retired addresses.
-    pub(crate) fn prune(&mut self, now: Instant) {
-        for set in [&mut self.accoding, &mut self.server, &mut self.certificate] {
-            set.retired.retain(|(_, until)| *until > now);
-        }
-    }
-
     /// Returns the addresses to allow, in rule-set order.
-    pub(crate) fn active(&self, now: Instant) -> (Vec<IpAddr>, Vec<IpAddr>, Vec<IpAddr>) {
+    pub(crate) fn active(&self, now: Instant) -> (Vec<IpAddr>, Vec<IpAddr>, Vec<SocketAddr>) {
         (
             self.accoding.active(now),
             self.server.active(now),
