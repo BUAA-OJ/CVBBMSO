@@ -1,4 +1,5 @@
 //! Computes the complement of the exam allowlist as terminal PF drop rules.
+//! On ingress, reject TCP/UDP peers whose return packets could not be sent.
 //! An allowed packet matches no filter here, so it reaches the host rules
 //! with its original decision and metadata.
 
@@ -101,6 +102,14 @@ impl Rules {
             filters,
             "block drop out quick from any to ! <{LOOPBACK}> fragment"
         );
+        let _ = writeln!(
+            filters,
+            "block drop in quick on ! lo0 proto {{ tcp udp }} from <{LOOPBACK}> to any"
+        );
+        let _ = writeln!(
+            filters,
+            "block drop in quick proto {{ tcp udp }} from ! <{LOOPBACK}> to any fragment"
+        );
 
         // PF uses protocol zero as its wildcard. For IPv6 it processes the
         // Hop-by-Hop header before classifying the transport.
@@ -168,6 +177,10 @@ impl Rules {
                 filters,
                 "block drop out quick proto {protocol} from any to ! <{LOOPBACK}>"
             );
+            let _ = writeln!(
+                filters,
+                "block drop in quick proto {protocol} from ! <{LOOPBACK}> to any"
+            );
             return;
         }
         let mut start = 0;
@@ -179,6 +192,10 @@ impl Rules {
                 filters,
                 "block drop out quick proto {protocol} from any to ! <{name}> port {port}"
             );
+            let _ = writeln!(
+                filters,
+                "block drop in quick proto {protocol} from ! <{name}> port {port} to any"
+            );
             let port = u32::from(port);
             if start < port {
                 gaps.push(port_range(start, port - 1));
@@ -189,10 +206,14 @@ impl Rules {
             gaps.push(port_range(start, u32::from(u16::MAX)));
         }
         if !gaps.is_empty() {
+            let gaps = gaps.join(" ");
             let _ = writeln!(
                 filters,
-                "block drop out quick proto {protocol} from any to ! <{LOOPBACK}> port {{ {} }}",
-                gaps.join(" ")
+                "block drop out quick proto {protocol} from any to ! <{LOOPBACK}> port {{ {gaps} }}"
+            );
+            let _ = writeln!(
+                filters,
+                "block drop in quick proto {protocol} from ! <{LOOPBACK}> port {{ {gaps} }} to any"
             );
         }
     }
