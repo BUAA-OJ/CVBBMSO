@@ -1,4 +1,4 @@
-use std::{io, ptr::NonNull, sync::mpsc, time::Duration};
+use std::{io, path::Path, ptr::NonNull, sync::mpsc, time::Duration};
 
 use block2::RcBlock;
 use objc2_core_graphics::{CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess};
@@ -13,9 +13,18 @@ mod cookie_scope;
 use super::admission::Failure;
 use cookie_scope::matches_cookie;
 
-pub(super) fn is_elevated() -> bool {
+pub(super) fn is_root() -> bool {
     // SAFETY: geteuid has no arguments or memory preconditions.
     unsafe { libc::geteuid() == 0 }
+}
+
+pub(super) fn is_in_applications() -> bool {
+    let Ok(applications) = Path::new("/Applications").canonicalize() else {
+        return false;
+    };
+    std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .is_ok_and(|path| path.starts_with(applications))
 }
 
 pub(super) fn screen_permission() -> Result<(), Failure> {

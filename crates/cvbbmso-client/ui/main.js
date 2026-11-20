@@ -7,11 +7,19 @@ const studentControls = document.querySelector("#student-controls");
 const admissionPanel = document.querySelector("#admission-panel");
 const admissionStatus = document.querySelector("#admission-status");
 const admissionRetry = document.querySelector("#admission-retry");
+const admissionSettings = document.querySelector("#admission-settings");
 const admittedControls = document.querySelector("#admitted-controls");
 let admissionRevision = 0;
 
 const admissionErrors = new Map([
   ["elevation_required", "请以管理员身份启动客户端。"],
+  ["macos_login_required", "请以当前登录用户在 Finder 的「应用程序」中打开 CVBBMSO。"],
+  ["macos_unsupported", "当前 macOS 版本不支持考试后台服务，请联系考试管理员。"],
+  ["macos_untrusted_installation", "请使用监考方提供的安装包，将 CVBBMSO.app 从磁盘映像拖到「应用程序」，再双击打开。"],
+  ["macos_approval_required", "请在系统设置的「登录项与扩展」中允许 CVBBMSO 后台服务，然后返回客户端。"],
+  ["macos_service_unavailable", "考试后台服务尚未就绪，请重试。"],
+  ["macos_unsupported_pf_configuration", "当前 PF 配置无法启用考试网络限制，请联系考试管理员后重试。"],
+  ["macos_busy", "另一个客户端或守卫会话仍在运行，请关闭后重试。"],
   ["monitor_unconfigured", "未配置监考服务地址，请联系考试管理员。"],
   ["inspection_failed", "无法完成网络预检，请重试。"],
   ["proxy_configured", "检测到系统代理，请关闭代理后重试。"],
@@ -24,6 +32,7 @@ const admissionErrors = new Map([
 ]);
 const restartRequired = new Set([
   "elevation_required", "monitor_unconfigured", "guard_lost", "screen_restart_required",
+  "macos_login_required", "macos_unsupported", "macos_untrusted_installation",
 ]);
 
 async function refreshAdmission(retry = false) {
@@ -35,6 +44,7 @@ async function refreshAdmission(retry = false) {
     admittedControls.hidden = !ready;
     admissionPanel.hidden = ready;
     admissionRetry.hidden = result.status !== "blocked" || restartRequired.has(result.reason);
+    admissionSettings.hidden = result.status !== "blocked" || result.reason !== "macos_approval_required";
     admissionStatus.textContent = result.status === "exiting"
       ? "正在关闭客户端…"
       : admissionErrors.get(result.reason) ?? "正在检查考试环境…";
@@ -42,11 +52,24 @@ async function refreshAdmission(retry = false) {
     if (revision !== admissionRevision) return;
     admissionPanel.hidden = false;
     admittedControls.hidden = true;
+    admissionSettings.hidden = true;
     admissionStatus.textContent = "无法读取考试环境检查结果。";
   }
 }
 
 admissionRetry.addEventListener("click", () => refreshAdmission(true));
+admissionSettings.addEventListener("click", async () => {
+  admissionSettings.disabled = true;
+  try {
+    await core.invoke("open_helper_approval_settings");
+  } catch (error) {
+    if (!admissionSettings.hidden && typeof error === "string") {
+      admissionStatus.textContent = error;
+    }
+  } finally {
+    admissionSettings.disabled = false;
+  }
+});
 
 async function checkDevice(retry) {
   vmRetry.hidden = true;

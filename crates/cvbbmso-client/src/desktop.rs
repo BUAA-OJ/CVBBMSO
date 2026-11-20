@@ -133,6 +133,8 @@ fn builder() -> tauri::Builder<Wry> {
         .invoke_handler(tauri::generate_handler![
             vm_preflight,
             admission::admission_status,
+            #[cfg(target_os = "macos")]
+            admission::open_helper_approval_settings,
             open_accoding,
             inspect_session,
             list_exams,
@@ -141,6 +143,11 @@ fn builder() -> tauri::Builder<Wry> {
             exam::close_exam,
         ])
         .on_window_event(|window, event| {
+            #[cfg(target_os = "macos")]
+            if window.label() == UI && matches!(event, WindowEvent::Focused(true)) {
+                let app = window.app_handle();
+                app.state::<admission::Admission>().recheck_approval(app);
+            }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 match window.label() {
                     UI => {

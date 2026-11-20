@@ -5,6 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = tauri_build::AppManifest::new().commands(&[
         "vm_preflight",
         "admission_status",
+        "open_helper_approval_settings",
         "open_accoding",
         "inspect_session",
         "list_exams",

@@ -45,6 +45,18 @@ const EXAM_TITLE: &str = "<b>Fixture exam</b>";
 pub(super) struct FakeProbe(Mutex<VecDeque<Verdict>>);
 
 impl FakeProbe {
+    fn for_smoke(detected: bool) -> Self {
+        let verdicts = if detected {
+            VecDeque::from([Verdict::Detected(Diagnostic::GuestIdentity)])
+        } else {
+            VecDeque::from([
+                Verdict::Unknown(Diagnostic::TimedOut),
+                Verdict::NotDetected(Diagnostic::HardwareIdentity),
+            ])
+        };
+        Self(Mutex::new(verdicts))
+    }
+
     pub(super) fn next(&self) -> Verdict {
         self.0
             .lock()
@@ -98,15 +110,7 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
                 _ => {}
             }
             app.manage(admission.clone());
-            let outcomes = if detected {
-                VecDeque::from([Verdict::Detected(Diagnostic::GuestIdentity)])
-            } else {
-                VecDeque::from([
-                    Verdict::Unknown(Diagnostic::TimedOut),
-                    Verdict::NotDetected(Diagnostic::HardwareIdentity),
-                ])
-            };
-            app.manage(FakeProbe(Mutex::new(outcomes)));
+            app.manage(FakeProbe::for_smoke(detected));
             let ui = build_ui(app.handle())?;
             let app = app.handle().clone();
             async_runtime::spawn(async move {
@@ -190,6 +194,7 @@ async fn check_admission_retry(ui: &WebviewWindow, admission: &FakeAdmission) ->
         assert_eq!(admission.installs(), 0);
         check_environment_gate(ui).await?;
         ui.eval("document.querySelector('#admission-retry').click()")?;
+        check_helper_approval(ui, admission).await?;
     }
     timeout(DEADLINE, admission.install_started()).await?;
     ui.eval(r"
@@ -217,6 +222,44 @@ async fn check_admission_retry(ui: &WebviewWindow, admission: &FakeAdmission) ->
     assert_eq!(admission.installs(), 1);
     assert_eq!(admission.shutdowns(), 0);
     println!("Startup checks preceded installation; concurrent retries installed one guard.");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn check_helper_approval(ui: &WebviewWindow, fake: &FakeAdmission) -> Result<(), Error> {
+    wait_for(
+        ui,
+        "!document.querySelector('#admission-settings').hidden && document.querySelector('#admission-status').textContent.includes('登录项与扩展')",
+        "the native helper approval prompt",
+    )
+    .await?;
+    check_environment_gate(ui).await?;
+    assert_eq!(fake.installs(), 0);
+    assert_eq!(fake.settings_opens(), 0);
+
+    ui.eval("document.querySelector('#admission-settings').click()")?;
+    timeout(DEADLINE, fake.settings_opened()).await?;
+    assert_eq!(fake.settings_opens(), 1);
+    check_environment_gate(ui).await?;
+    assert_eq!(fake.installs(), 0);
+
+    fake.grant_approval();
+    let app = ui.app_handle();
+    app.state::<admission::Admission>().recheck_approval(app);
+    wait_for(
+        ui,
+        "document.querySelector('#admission-settings').hidden && !document.querySelector('#admission-retry').hidden && document.querySelector('#admission-status').textContent.includes('PF 配置')",
+        "PF configuration blocking the approved helper",
+    )
+    .await?;
+    check_environment_gate(ui).await?;
+    assert_eq!(fake.installs(), 0);
+
+    fake.enable_pf();
+    ui.eval("document.querySelector('#admission-retry').click()")?;
+    println!(
+        "A pending approval and unavailable PF both blocked admission; only the local settings action opened settings."
+    );
     Ok(())
 }
 
@@ -832,6 +875,7 @@ async fn check_ipc(ui: &WebviewWindow, oj: &WebviewWindow) -> Result<(), Error> 
             const results = await Promise.allSettled([
                 invoke("vm_preflight", { retry: true }),
                 invoke("admission_status", { retry: true }),
+                invoke("open_helper_approval_settings"),
                 invoke("inspect_session"),
                 invoke("list_exams"),
                 invoke("open_exam", { exam_id: "00000000-0000-0000-0000-000000000010" }),
