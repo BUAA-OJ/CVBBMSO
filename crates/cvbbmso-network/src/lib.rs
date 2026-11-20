@@ -33,7 +33,17 @@ mod endpoint;
 mod inspector;
 mod proxy;
 
+#[cfg(target_os = "macos")]
+pub use self::egress::managed::MacosEgressGuard;
 pub use self::egress::{EgressGuard, EgressPolicy};
+
+/// Entry point for the signed macOS `LaunchDaemon` and its recovery subprocess.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+#[must_use]
+pub fn macos_egress_service_main() -> std::process::ExitCode {
+    egress::managed::service_main()
+}
 
 /// Entry point of the `cvbbmso-egress-watchdog` helper binary.
 ///
@@ -73,4 +83,28 @@ pub enum NetworkError {
     /// A name required by the egress policy could not be resolved.
     #[error("the egress policy address could not be resolved")]
     Resolution,
+    /// The signed app service requires macOS 14 or later.
+    #[cfg(target_os = "macos")]
+    #[error("the macOS egress service requires macOS 14 or later")]
+    MacosUnsupported,
+    /// The build, signature or app location is ineligible for privileged use.
+    #[cfg(target_os = "macos")]
+    #[error("the signed macOS egress service or app installation could not be trusted")]
+    MacosUntrustedInstallation,
+    /// An administrator must approve the registered system service.
+    #[cfg(target_os = "macos")]
+    #[error("approve the egress service in macOS Login Items & Extensions")]
+    MacosApprovalRequired,
+    /// The registered service could not be contacted or validated.
+    #[cfg(target_os = "macos")]
+    #[error("the macOS egress service is unavailable")]
+    MacosServiceUnavailable,
+    /// The live or persistent host PF policy requires administrator review.
+    #[cfg(target_os = "macos")]
+    #[error("the host PF configuration needs administrator review")]
+    MacosUnsupportedPfConfiguration,
+    /// Another client or an unfinished cleanup owns the system filter.
+    #[cfg(target_os = "macos")]
+    #[error("another session owns the macOS egress guard")]
+    MacosBusy,
 }
