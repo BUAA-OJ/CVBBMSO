@@ -16,6 +16,7 @@ workspace = true
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 cvbbmso-accoding.workspace = true
 cvbbmso-exam.workspace = true
+cvbbmso-network.workspace = true
 cvbbmso-protocol.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -29,13 +30,15 @@ uuid = { workspace = true, features = ["v4"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2.workspace = true
+libc.workspace = true
+objc2-core-graphics = { workspace = true, features = ["CGWindow"] }
 objc2-foundation.workspace = true
 objc2-web-kit.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 webview2-com.workspace = true
 windows-core.workspace = true
-windows-sys = { workspace = true, features = ["Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [target.'cfg(any(target_os = "macos", windows))'.build-dependencies]
 tauri-build.workspace = true

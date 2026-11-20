@@ -4,6 +4,49 @@ const vmStatus = document.querySelector("#vm-status");
 const vmDiagnostic = document.querySelector("#vm-diagnostic");
 const vmRetry = document.querySelector("#vm-retry");
 const studentControls = document.querySelector("#student-controls");
+const admissionPanel = document.querySelector("#admission-panel");
+const admissionStatus = document.querySelector("#admission-status");
+const admissionRetry = document.querySelector("#admission-retry");
+const admittedControls = document.querySelector("#admitted-controls");
+let admissionRevision = 0;
+
+const admissionErrors = new Map([
+  ["elevation_required", "请以管理员身份启动客户端。"],
+  ["monitor_unconfigured", "未配置监考服务地址，请联系考试管理员。"],
+  ["inspection_failed", "无法完成网络预检，请重试。"],
+  ["proxy_configured", "检测到系统代理，请关闭代理后重试。"],
+  ["proxy_unknown", "无法确认系统代理状态，请联系考试管理员。"],
+  ["monitor_unreachable", "无法连接监考服务，请检查网络后重试。"],
+  ["guard_install_failed", "无法启用出站网络守卫，请联系考试管理员。"],
+  ["guard_lost", "出站网络守卫校验失败，客户端将结束当前考试。请关闭并重新启动。"],
+  ["screen_permission", "请在系统设置中允许客户端录制屏幕，再重试。"],
+  ["screen_restart_required", "屏幕录制权限已设置，请重新启动客户端。"],
+]);
+const restartRequired = new Set([
+  "elevation_required", "monitor_unconfigured", "guard_lost", "screen_restart_required",
+]);
+
+async function refreshAdmission(retry = false) {
+  const revision = ++admissionRevision;
+  try {
+    const result = await core.invoke("admission_status", { retry });
+    if (revision !== admissionRevision) return;
+    const ready = result.status === "ready";
+    admittedControls.hidden = !ready;
+    admissionPanel.hidden = ready;
+    admissionRetry.hidden = result.status !== "blocked" || restartRequired.has(result.reason);
+    admissionStatus.textContent = result.status === "exiting"
+      ? "正在关闭客户端…"
+      : admissionErrors.get(result.reason) ?? "正在检查考试环境…";
+  } catch {
+    if (revision !== admissionRevision) return;
+    admissionPanel.hidden = false;
+    admittedControls.hidden = true;
+    admissionStatus.textContent = "无法读取考试环境检查结果。";
+  }
+}
+
+admissionRetry.addEventListener("click", () => refreshAdmission(true));
 
 async function checkDevice(retry) {
   vmRetry.hidden = true;
@@ -76,7 +119,7 @@ const examErrors = new Map([
   ["unexpected_response", "监考服务返回了异常响应，请稍后重试。"],
 ]);
 const examSessionErrors = new Map([
-  ["admission_unavailable", "考试准入检查尚未就绪，暂不能进入考试。"],
+  ["admission_unavailable", "考试环境检查尚未通过，请查看检查结果。"],
   ["session_busy", "已有考试会话，请先退出当前考试。"],
   ["session_closed", "考试会话已关闭，请重新选择。"],
   ["not_enrolled", "监考服务未核验到本场考试的报名。"],
@@ -262,3 +305,9 @@ try {
   examFeedback.textContent = "考试状态通知暂不可用。";
 }
 renderExamSession();
+
+try {
+  await event.listen("admission-status", () => refreshAdmission());
+} finally {
+  await refreshAdmission();
+}

@@ -22,6 +22,7 @@ block2 = { version = "0.6", default-features = false, features = ["std"] }
 core-foundation = "0.10"
 cvbbmso-accoding = { version = "0.1.0", path = "crates/cvbbmso-accoding" }
 cvbbmso-exam = { version = "0.1.0", path = "crates/cvbbmso-exam" }
+cvbbmso-network = { version = "0.1.0", path = "crates/cvbbmso-network" }
 cvbbmso-protocol = { version = "0.1.0", path = "crates/cvbbmso-protocol" }
 cvbbmso-recorder = { version = "0.1.0", path = "crates/cvbbmso-recorder" }
 dispatch2 = { version = "0.3", default-features = false, features = ["objc2", "std"] }

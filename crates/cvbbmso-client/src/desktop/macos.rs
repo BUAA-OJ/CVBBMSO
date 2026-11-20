@@ -1,6 +1,7 @@
 use std::{io, ptr::NonNull, sync::mpsc, time::Duration};
 
 use block2::RcBlock;
+use objc2_core_graphics::{CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess};
 use objc2_foundation::{NSArray, NSHTTPCookie};
 use objc2_web_kit::WKWebView;
 use tauri::WebviewWindow;
@@ -9,7 +10,27 @@ use url::Url;
 #[path = "macos/cookie_scope.rs"]
 mod cookie_scope;
 
+use super::admission::Failure;
 use cookie_scope::matches_cookie;
+
+pub(super) fn is_elevated() -> bool {
+    // SAFETY: geteuid has no arguments or memory preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
+
+pub(super) fn screen_permission() -> Result<(), Failure> {
+    if CGPreflightScreenCaptureAccess() {
+        return Ok(());
+    }
+    let granted = CGRequestScreenCaptureAccess();
+    if CGPreflightScreenCaptureAccess() {
+        Ok(())
+    } else if granted {
+        Err(Failure::ScreenRestartRequired)
+    } else {
+        Err(Failure::ScreenPermission)
+    }
+}
 
 pub(super) fn cookie_pairs(
     browser: &WebviewWindow,
