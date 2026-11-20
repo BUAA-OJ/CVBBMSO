@@ -29,7 +29,7 @@ pub(super) enum Failure {
     MonitorUnreachable,
     GuardInstallFailed,
     GuardLost,
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     ScreenPermission,
     #[cfg(target_os = "macos")]
     ScreenRestartRequired,
@@ -55,7 +55,7 @@ impl Failure {
             Self::MonitorUnreachable => "无法连接监考服务，请检查网络后重试。",
             Self::GuardInstallFailed => "无法启用出站网络守卫，请联系考试管理员。",
             Self::GuardLost => "出站网络守卫校验失败，请联系监考人员后重新启动客户端。",
-            #[cfg(any(target_os = "macos", test))]
+            #[cfg(target_os = "macos")]
             Self::ScreenPermission => "请在系统设置中允许客户端录制屏幕，再重试。",
             #[cfg(target_os = "macos")]
             Self::ScreenRestartRequired => "屏幕录制权限已设置，请重新启动客户端。",
@@ -184,23 +184,29 @@ impl Guard {
     }
 }
 
+enum Prepared {
+    System(EgressPolicy),
+    #[cfg(test)]
+    Fixture(fixture::Admission),
+}
+
 enum Work {
-    Network(JoinHandle<Result<Option<Guard>, Failure>>),
-    Screen(JoinHandle<Result<(), Failure>>),
+    Preflight(JoinHandle<Result<Prepared, Failure>>),
+    Install(JoinHandle<Result<Guard, Failure>>),
 }
 
 enum Completed {
-    Network(Result<Option<Guard>, Failure>),
-    Screen(Result<(), Failure>),
+    Preflight(Result<Prepared, Failure>),
+    Install(Result<Guard, Failure>),
 }
 
 async fn completed(work: Option<&mut Work>) -> Completed {
     match work {
-        Some(Work::Network(work)) => {
-            Completed::Network(work.await.unwrap_or(Err(Failure::InspectionFailed)))
+        Some(Work::Preflight(work)) => {
+            Completed::Preflight(work.await.unwrap_or(Err(Failure::InspectionFailed)))
         }
-        Some(Work::Screen(work)) => {
-            Completed::Screen(work.await.unwrap_or(Err(Failure::InspectionFailed)))
+        Some(Work::Install(work)) => {
+            Completed::Install(work.await.unwrap_or(Err(Failure::InspectionFailed)))
         }
         None => pending().await,
     }
@@ -226,10 +232,7 @@ async fn run(
     loop {
         let checking = *changes.borrow_and_update() == Status::Checking;
         if checking && work.is_none() {
-            work = Some(Work::Network(tokio::spawn(prepare(
-                app.clone(),
-                guard.is_some(),
-            ))));
+            work = Some(Work::Preflight(tokio::spawn(prepare(app.clone()))));
         }
         tokio::select! {
             biased;
@@ -237,12 +240,12 @@ async fn run(
                 // An in-flight system install can outlive its future. Keep
                 // waiting for its result so shutdown has the guard to remove.
                 match work {
-                    Some(Work::Network(task)) => {
-                        if let Ok(Ok(Some(installed))) = task.await {
+                    Some(Work::Install(task)) => {
+                        if let Ok(Ok(installed)) = task.await {
                             guard = Some(installed);
                         }
                     }
-                    Some(Work::Screen(task)) => task.abort(),
+                    Some(Work::Preflight(task)) => task.abort(),
                     None => {}
                 }
                 let ok = match guard {
@@ -268,20 +271,18 @@ async fn run(
             result = completed(work.as_mut()) => {
                 work = None;
                 match result {
-                    Completed::Network(Ok(installed)) => {
-                        if let Some(installed) = installed {
-                            verify_at = Some(Instant::now() + installed.interval());
-                            guard = Some(installed);
-                        }
+                    Completed::Preflight(Ok(prepared)) => {
                         if admission.status() == Status::Checking {
-                            work = Some(Work::Screen(tokio::spawn(check_screen(app.clone()))));
+                            work = Some(Work::Install(tokio::spawn(install(app.clone(), prepared))));
                         }
                     }
-                    Completed::Network(Err(error)) | Completed::Screen(Err(error)) => {
-                        admission.set(&app, Status::Blocked(error), |status| status == Status::Checking);
-                    }
-                    Completed::Screen(Ok(())) => {
+                    Completed::Install(Ok(installed)) => {
+                        verify_at = Some(Instant::now() + installed.interval());
+                        guard = Some(installed);
                         admission.set(&app, Status::Ready, |status| status == Status::Checking);
+                    }
+                    Completed::Preflight(Err(error)) | Completed::Install(Err(error)) => {
+                        admission.set(&app, Status::Blocked(error), |status| status == Status::Checking);
                     }
                 }
             }
@@ -289,16 +290,16 @@ async fn run(
     }
 }
 
-async fn prepare(app: AppHandle, guard_installed: bool) -> Result<Option<Guard>, Failure> {
+async fn prepare(app: AppHandle) -> Result<Prepared, Failure> {
     if app.state::<Admission>().status() != Status::Checking {
-        return Ok(None);
+        return Err(Failure::InspectionFailed);
     }
     #[cfg(test)]
     if let Some(fake) = app.try_state::<fixture::Admission>() {
-        return fake
-            .prepare(guard_installed)
-            .await
-            .map(|guard| guard.map(Guard::Fixture));
+        fake.check_network()?;
+        #[cfg(target_os = "macos")]
+        fake.screen()?;
+        return Ok(Prepared::Fixture(fake.inner().clone()));
     }
     if !platform::is_elevated() {
         return Err(Failure::ElevationRequired);
@@ -321,9 +322,6 @@ async fn prepare(app: AppHandle, guard_installed: bool) -> Result<Option<Guard>,
     if report.endpoint != EndpointState::Reachable {
         return Err(Failure::MonitorUnreachable);
     }
-    if guard_installed || app.state::<Admission>().status() != Status::Checking {
-        return Ok(None);
-    }
     let policy = EgressPolicy {
         accoding_origin: desktop
             .login
@@ -333,32 +331,34 @@ async fn prepare(app: AppHandle, guard_installed: bool) -> Result<Option<Guard>,
             .map_err(|_| Failure::GuardInstallFailed)?,
         server_origin,
     };
-    EgressGuard::install(policy)
-        .await
-        .map(|guard| Some(Guard::System(guard)))
-        .map_err(|_| Failure::GuardInstallFailed)
+    #[cfg(target_os = "macos")]
+    check_screen(&app).await?;
+    Ok(Prepared::System(policy))
 }
 
-async fn check_screen(app: AppHandle) -> Result<(), Failure> {
-    #[cfg(test)]
-    if let Some(fake) = app.try_state::<fixture::Admission>() {
-        return fake.screen();
+async fn install(app: AppHandle, prepared: Prepared) -> Result<Guard, Failure> {
+    if app.state::<Admission>().status() != Status::Checking {
+        return Err(Failure::GuardInstallFailed);
     }
-    #[cfg(target_os = "macos")]
-    {
-        let (reply, result) = oneshot::channel();
-        let current = app.clone();
-        app.run_on_main_thread(move || {
-            if current.state::<Admission>().status() == Status::Checking {
-                let _ = reply.send(platform::screen_permission());
-            }
-        })
-        .map_err(|_| Failure::InspectionFailed)?;
-        result.await.map_err(|_| Failure::InspectionFailed)?
+    match prepared {
+        Prepared::System(policy) => EgressGuard::install(policy)
+            .await
+            .map(Guard::System)
+            .map_err(|_| Failure::GuardInstallFailed),
+        #[cfg(test)]
+        Prepared::Fixture(fake) => fake.install().await.map(Guard::Fixture),
     }
-    #[cfg(windows)]
-    {
-        let _ = app;
-        Ok(())
-    }
+}
+
+#[cfg(target_os = "macos")]
+async fn check_screen(app: &AppHandle) -> Result<(), Failure> {
+    let (reply, result) = oneshot::channel();
+    let current = app.clone();
+    app.run_on_main_thread(move || {
+        if current.state::<Admission>().status() == Status::Checking {
+            let _ = reply.send(platform::screen_permission());
+        }
+    })
+    .map_err(|_| Failure::InspectionFailed)?;
+    result.await.map_err(|_| Failure::InspectionFailed)?
 }

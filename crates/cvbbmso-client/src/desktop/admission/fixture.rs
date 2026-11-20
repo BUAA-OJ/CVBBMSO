@@ -13,6 +13,7 @@ pub(in crate::desktop) struct Admission(Arc<Counters>);
 #[derive(Default)]
 struct Counters {
     proxy_once: AtomicBool,
+    #[cfg(target_os = "macos")]
     screen_once: AtomicBool,
     pause_install: AtomicBool,
     fail_verify: AtomicBool,
@@ -31,6 +32,7 @@ impl Admission {
     pub(in crate::desktop) fn require_retry(&self) {
         self.pause();
         self.0.proxy_once.store(true, Ordering::Relaxed);
+        #[cfg(target_os = "macos")]
         self.0.screen_once.store(true, Ordering::Relaxed);
     }
 
@@ -58,21 +60,23 @@ impl Admission {
         self.0.verifies.load(Ordering::Relaxed)
     }
 
-    pub(super) async fn prepare(&self, guard_installed: bool) -> Result<Option<Guard>, Failure> {
+    pub(super) fn check_network(&self) -> Result<(), Failure> {
         if self.0.proxy_once.swap(false, Ordering::Relaxed) {
             return Err(Failure::ProxyConfigured);
         }
-        if guard_installed {
-            return Ok(None);
-        }
+        Ok(())
+    }
+
+    pub(super) async fn install(&self) -> Result<Guard, Failure> {
         self.0.installs.fetch_add(1, Ordering::Relaxed);
         self.0.installing.notify_one();
         if self.0.pause_install.swap(false, Ordering::Relaxed) {
             self.0.resume.notified().await;
         }
-        Ok(Some(Guard(Arc::clone(&self.0))))
+        Ok(Guard(Arc::clone(&self.0)))
     }
 
+    #[cfg(target_os = "macos")]
     pub(super) fn screen(&self) -> Result<(), Failure> {
         if self.0.screen_once.swap(false, Ordering::Relaxed) {
             Err(Failure::ScreenPermission)

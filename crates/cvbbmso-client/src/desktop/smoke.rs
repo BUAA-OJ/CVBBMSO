@@ -181,7 +181,16 @@ fn check_exit_peer(peer: &std::sync::mpsc::Receiver<oneshot::Receiver<()>>) -> i
 
 async fn check_admission_retry(ui: &WebviewWindow, admission: &FakeAdmission) -> Result<(), Error> {
     wait_for(ui, "!document.querySelector('#admission-retry').hidden && document.querySelector('#admission-status').textContent.includes('代理')", "proxy preflight denial").await?;
+    assert_eq!(admission.installs(), 0);
+    check_environment_gate(ui).await?;
     ui.eval("document.querySelector('#admission-retry').click()")?;
+    #[cfg(target_os = "macos")]
+    {
+        wait_for(ui, "!document.querySelector('#admission-retry').hidden && document.querySelector('#admission-status').textContent.includes('录制屏幕')", "screen permission denial").await?;
+        assert_eq!(admission.installs(), 0);
+        check_environment_gate(ui).await?;
+        ui.eval("document.querySelector('#admission-retry').click()")?;
+    }
     timeout(DEADLINE, admission.install_started()).await?;
     ui.eval(r"
         window.admissionProbe = 'pending';
@@ -199,8 +208,6 @@ async fn check_admission_retry(ui: &WebviewWindow, admission: &FakeAdmission) ->
     assert_eq!(admission.installs(), 1);
     admission.resume();
 
-    wait_for(ui, "!document.querySelector('#admission-retry').hidden && document.querySelector('#admission-status').textContent.includes('录制屏幕')", "screen permission denial").await?;
-    ui.eval("document.querySelector('#admission-retry').click()")?;
     wait_for(
         ui,
         "!document.querySelector('#admitted-controls').hidden",
@@ -209,9 +216,7 @@ async fn check_admission_retry(ui: &WebviewWindow, admission: &FakeAdmission) ->
     .await?;
     assert_eq!(admission.installs(), 1);
     assert_eq!(admission.shutdowns(), 0);
-    println!(
-        "Concurrent admission retries installed one guard; screen permission reused that guard."
-    );
+    println!("Startup checks preceded installation; concurrent retries installed one guard.");
     Ok(())
 }
 
@@ -603,6 +608,7 @@ async fn check_blocked_preflight(
             io::Error::other("Blocked client created a remote WebView or made a request").into(),
         );
     }
+    assert_eq!(app.state::<FakeAdmission>().installs(), 0);
     println!("{description} rejected direct IPC without any remote WebView or request.");
     if detected {
         ui.eval(
