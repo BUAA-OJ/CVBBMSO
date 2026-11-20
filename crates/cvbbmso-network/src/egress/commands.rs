@@ -42,6 +42,9 @@ pub(crate) trait Commands {
     /// Writes a file, replacing its contents.
     fn write(&self, path: &str, contents: &str) -> Result<(), NetworkError>;
 
+    /// Publishes a complete journal and removes its staging name atomically.
+    fn publish(&self, staging: &str, path: &str) -> Result<(), NetworkError>;
+
     /// Removes a file, succeeding when it does not exist.
     fn remove(&self, path: &str) -> Result<(), NetworkError>;
 }
@@ -312,6 +315,11 @@ impl Commands for SystemCommands<'_> {
         Ok(())
     }
 
+    fn publish(&self, staging: &str, path: &str) -> Result<(), NetworkError> {
+        self.ensure_settled()?;
+        fs::rename(staging, path).map_err(|_| NetworkError::Io)
+    }
+
     fn remove(&self, path: &str) -> Result<(), NetworkError> {
         self.ensure_settled()?;
         match fs::remove_file(path) {
@@ -570,6 +578,13 @@ pub(crate) mod testing {
             self.files
                 .borrow_mut()
                 .insert(path.to_owned(), contents.to_owned());
+            Ok(())
+        }
+
+        fn publish(&self, staging: &str, path: &str) -> Result<(), NetworkError> {
+            let mut files = self.files.borrow_mut();
+            let contents = files.remove(staging).ok_or(NetworkError::Io)?;
+            files.insert(path.to_owned(), contents);
             Ok(())
         }
 

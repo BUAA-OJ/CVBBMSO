@@ -23,6 +23,8 @@ use rules::Rules;
 const ANCHOR: &str = "com.cvbbmso.egress";
 const RULES: &str = "/Library/Application Support/com.cvbbmso/pf.rules";
 const TOKEN: &str = "/Library/Application Support/com.cvbbmso/pf.enable";
+const ENABLE_BASELINE: &str = "/Library/Application Support/com.cvbbmso/pf.enable.before";
+const ENABLE_CAPTURE: &str = "/Library/Application Support/com.cvbbmso/pf.enable.capture";
 const PFCTL: &str = "/sbin/pfctl";
 const ROOT_RULE: &str = "anchor \"com.cvbbmso.egress\" all";
 pub(crate) fn prepare() -> Result<(), NetworkError> {
@@ -100,8 +102,7 @@ fn install_with(
     verify_deployment(commands)?;
     let expected = stage(commands, Rules::new(plan))?;
     load_anchor(commands)?;
-    commands.capture(PFCTL, &["-E"], TOKEN)?;
-    read_token(commands)?.ok_or(NetworkError::Platform)?;
+    enable_pf(commands)?;
     verify_with(commands, &expected)?;
     // PF tests state before either filter direction. Recheck connections
     // initiated from the local address as well as to it, without flushing PF.
@@ -237,7 +238,7 @@ fn verify_with(commands: &dyn Commands, expected: &Expected) -> Result<(), Netwo
     let references = commands.output(PFCTL, &["-s", "References"])?;
     if !info.lines().any(|line| line.starts_with("Status: Enabled"))
         || live.trim() != expected.kernel
-        || !has_reference(&references, reference)
+        || !reference_tokens(&references)?.contains(&reference)
     {
         return Err(NetworkError::Platform);
     }
@@ -280,15 +281,38 @@ fn normalize_address(address: &str) -> Result<String, NetworkError> {
 }
 
 fn read_token(commands: &dyn Commands) -> Result<Option<u64>, NetworkError> {
-    let Some(contents) = commands.read(TOKEN)? else {
-        return Ok(None);
-    };
-    Ok(contents.lines().find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        (key.trim() == "Token")
-            .then(|| value.trim().parse::<u64>().ok())
-            .flatten()
-    }))
+    Ok(commands.read(TOKEN)?.as_deref().and_then(complete_token))
+}
+
+fn complete_token(contents: &str) -> Option<u64> {
+    let mut records = contents.split_inclusive('\n').filter_map(|line| {
+        let (label, value) = line.split_once(':')?;
+        (label.trim() == "Token").then_some(value)
+    });
+    // A missing newline could leave a valid-looking prefix of another token.
+    let token = records.next()?.strip_suffix('\n')?.trim().parse().ok()?;
+    records.next().is_none().then_some(token)
+}
+
+fn enable_pf(commands: &dyn Commands) -> Result<(), NetworkError> {
+    let before = reference_tokens(&commands.output(PFCTL, &["-s", "References"])?)?;
+    let baseline = serde_json::to_string(&before).map_err(|_| NetworkError::Io)?;
+    commands.write(ENABLE_BASELINE, &baseline)?;
+    let result = commands.capture(PFCTL, &["-E"], ENABLE_CAPTURE);
+    let token = commands
+        .read(ENABLE_CAPTURE)?
+        .as_deref()
+        .and_then(complete_token);
+    if let Some(token) = token {
+        if before.contains(&token) {
+            return Err(NetworkError::Io);
+        }
+        // The deployed watchdog may predate this transaction. Give it only
+        // one complete, atomically published token at its original path.
+        commands.publish(ENABLE_CAPTURE, TOKEN)?;
+    }
+    result?;
+    token.map(|_| ()).ok_or(NetworkError::Platform)
 }
 
 fn recover_with(commands: &dyn Commands) -> Result<(), NetworkError> {
@@ -306,27 +330,96 @@ fn recover_with(commands: &dyn Commands) -> Result<(), NetworkError> {
         }
     }
 
-    if let Some(token) = read_token(commands)?
-        && commands.run(PFCTL, &["-X", &token.to_string()]).is_err()
-    {
-        let references = commands.output(PFCTL, &["-s", "References"])?;
-        if has_reference(&references, token) {
-            return Err(NetworkError::Platform);
-        }
-    }
-    for path in [TOKEN, RULES] {
+    recover_reference(commands)?;
+    for path in [ENABLE_CAPTURE, TOKEN, ENABLE_BASELINE, RULES] {
         commands.remove(path)?;
     }
     Ok(())
 }
 
-fn has_reference(output: &str, token: u64) -> bool {
-    output.lines().any(|line| {
-        line.split_whitespace()
-            .nth(2)
+fn recover_reference(commands: &dyn Commands) -> Result<(), NetworkError> {
+    let journal = commands.read(TOKEN)?;
+    let capture = commands.read(ENABLE_CAPTURE)?;
+    let baseline = commands.read(ENABLE_BASELINE)?;
+    let canonical = journal.as_deref().and_then(complete_token);
+    let captured = capture.as_deref().and_then(complete_token);
+    if capture.is_some() && (journal.is_some() || baseline.is_none()) {
+        return Err(NetworkError::Io);
+    }
+    let before = baseline
+        .as_deref()
+        .map(serde_json::from_str::<BTreeSet<u64>>)
+        .transpose()
+        .map_err(|_| NetworkError::Io)?;
+    if let Some(token) = canonical.or(captured) {
+        if before
+            .as_ref()
+            .is_some_and(|tokens| tokens.contains(&token))
+        {
+            return Err(NetworkError::Io);
+        }
+        if let Err(error) = commands.run(PFCTL, &["-X", &token.to_string()]) {
+            let current = reference_tokens(&commands.output(PFCTL, &["-s", "References"])?)?;
+            if current.contains(&token) {
+                return Err(error);
+            }
+        }
+    } else if journal.is_some() || capture.is_some() {
+        let current = reference_tokens(&commands.output(PFCTL, &["-s", "References"])?)?;
+        if !current.is_empty() {
+            // DIOCSTARTREF may have committed before pfctl printed its token.
+            // Even a baseline token could have been released and recycled.
+            return Err(NetworkError::Io);
+        }
+    }
+    Ok(())
+}
+
+fn has_enable_record(commands: &dyn Commands) -> Result<bool, NetworkError> {
+    Ok(commands.read(ENABLE_BASELINE)?.is_some() || commands.read(ENABLE_CAPTURE)?.is_some())
+}
+
+fn reference_tokens(output: &str) -> Result<BTreeSet<u64>, NetworkError> {
+    let mut lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let first = lines.next().ok_or(NetworkError::Platform)?;
+    if first == "No pf starter references held" && lines.next().is_none() {
+        return Ok(BTreeSet::new());
+    }
+    if first != "TOKENS:"
+        || !lines.next().is_some_and(|line| {
+            line.split_ascii_whitespace()
+                .eq(["PID", "Process", "Name", "TOKEN", "TIMESTAMP"])
+        })
+    {
+        return Err(NetworkError::Platform);
+    }
+    let mut tokens = BTreeSet::new();
+    for line in lines {
+        let mut fields = line.split_ascii_whitespace();
+        let pid = fields.next().ok_or(NetworkError::Platform)?;
+        pid.parse::<u32>().map_err(|_| NetworkError::Platform)?;
+        let time = fields.next_back().ok_or(NetworkError::Platform)?;
+        if time.split(':').count() != 3
+            || !time.split(':').all(|part| part.parse::<u32>().is_ok())
+            || fields.next_back() != Some("days")
+            || fields
+                .next_back()
+                .is_none_or(|days| days.parse::<u32>().is_err())
+        {
+            return Err(NetworkError::Platform);
+        }
+        let token = fields
+            .next_back()
             .and_then(|value| value.parse::<u64>().ok())
-            == Some(token)
-    })
+            .ok_or(NetworkError::Platform)?;
+        if fields.next().is_none() || !tokens.insert(token) {
+            return Err(NetworkError::Platform);
+        }
+    }
+    Ok(tokens)
 }
 
 fn local_addresses() -> Result<Vec<IpAddr>, NetworkError> {
@@ -396,6 +489,21 @@ mod tests {
     const LIVE: &[&str] = &["-a", ANCHOR, "-s", "rules"];
     const ROOT: &[&str] = &["-s", "rules"];
     const TABLES: &[&str] = &["-a", ANCHOR, "-s", "Tables"];
+    const REFERENCES: &[&str] = &["-s", "References"];
+    const NO_REFERENCES: &str = "No pf starter references held\n";
+    const PROJECT_REFERENCE: &str = concat!(
+        "TOKENS:\nPID Process Name TOKEN TIMESTAMP\n",
+        "202 pfctl 42 0 days 00:00:01\n",
+    );
+    const HOST_REFERENCE: &str = concat!(
+        "TOKENS:\nPID Process Name TOKEN TIMESTAMP\n",
+        "101 Host Firewall 4 0 days 01:02:03\n",
+    );
+    const BOTH_REFERENCES: &str = concat!(
+        "TOKENS:\nPID Process Name TOKEN TIMESTAMP\n",
+        "202 pfctl 42 0 days 00:00:01\n",
+        "101 Host Firewall 4 0 days 01:02:03\n",
+    );
 
     fn plan() -> Plan {
         let ip = |text: &str| text.parse::<IpAddr>().unwrap();
@@ -416,7 +524,7 @@ mod tests {
         recorder.reply(&["-s", "info"], Ok("Status: Enabled for 0 days"));
         recorder.reply(ROOT, Ok(LIVE_ROOT));
         recorder.reply(LIVE, Ok(live));
-        recorder.reply(&["-s", "References"], Ok("202 pfctl 42 0 days"));
+        recorder.reply(REFERENCES, Ok(PROJECT_REFERENCE));
         recorder.reply(
             TABLES,
             Ok(&rules.tables.keys().cloned().collect::<Vec<_>>().join("\n")),
@@ -435,6 +543,7 @@ mod tests {
         recorder.reply(ROOT, Ok(LIVE_ROOT));
         recorder.reply(PARSE, Ok(BOTH));
         recorder.reply(&["-E"], Ok("pf enabled\nToken : 42\n"));
+        recorder.reply(REFERENCES, Ok(NO_REFERENCES));
         healthy(&recorder, BOTH, &Rules::new(&plan()));
 
         let local = ["192.0.2.123", "2001:db8::123", "127.0.0.1"].map(|ip| ip.parse().unwrap());
@@ -442,6 +551,7 @@ mod tests {
         assert_eq!(recorder.contents(PF_CONF).as_deref(), Some(BASE));
         assert_only_own_mutations(&recorder);
         assert_eq!(read_token(&recorder).unwrap(), Some(42));
+        assert!(recorder.contents(ENABLE_CAPTURE).is_none());
         assert_eq!(
             state_kills(&recorder),
             [
@@ -459,10 +569,11 @@ mod tests {
         recorder.reply(ROOT, Ok(LIVE_ROOT));
         recorder.reply(PARSE, Ok(BOTH));
         recorder.reply(&["-E"], Ok("pf enabled\nToken : 42\n"));
+        recorder.reply(REFERENCES, Ok(NO_REFERENCES));
         recorder.reply(&["-s", "info"], Ok("Status: Disabled"));
         recorder.reply(ROOT, Ok(LIVE_ROOT));
         recorder.reply(LIVE, Ok(BOTH));
-        recorder.reply(&["-s", "References"], Ok("202 pfctl 42 0 days"));
+        recorder.reply(REFERENCES, Ok(PROJECT_REFERENCE));
 
         assert_eq!(
             install_with(&recorder, &plan(), &[]).err(),
@@ -480,6 +591,73 @@ mod tests {
                 .calls()
                 .contains(&Call::Run(PFCTL.to_owned(), vec!["-X".into(), "42".into()]))
         );
+    }
+
+    #[test]
+    fn enable_timeout_with_missing_or_partial_token_keeps_unknown_references() {
+        for partial in ["", "Token : 4"] {
+            let recorder = Recorder::with_file(ENABLE_CAPTURE, partial);
+            recorder.reply(REFERENCES, Ok(HOST_REFERENCE));
+            recorder.reply(&["-E"], Err(NetworkError::Io));
+            assert_eq!(enable_pf(&recorder), Err(NetworkError::Io));
+            assert!(recorder.contents(TOKEN).is_none());
+
+            recorder.reply(REFERENCES, Ok(BOTH_REFERENCES));
+            assert_eq!(recover_with(&recorder), Err(NetworkError::Io));
+            assert_eq!(recorder.contents(ENABLE_CAPTURE).as_deref(), Some(partial));
+            assert_eq!(recorder.contents(ENABLE_BASELINE).as_deref(), Some("[4]"));
+            assert!(recorder.calls().iter().all(|call| !matches!(call,
+                Call::Run(_, args) if args.first().is_some_and(|arg| arg == "-X")
+            )));
+        }
+    }
+
+    #[test]
+    fn an_incomplete_capture_can_be_cleared_when_no_references_remain() {
+        let recorder = Recorder::with_file(ENABLE_CAPTURE, "");
+        recorder.write(ENABLE_BASELINE, "[4]").unwrap();
+        recorder.reply(REFERENCES, Ok(HOST_REFERENCE));
+        assert_eq!(recover_with(&recorder), Err(NetworkError::Io));
+        assert!(has_enable_record(&recorder).unwrap());
+
+        recorder.reply(REFERENCES, Ok(NO_REFERENCES));
+        recover_with(&recorder).unwrap();
+        assert!(!has_enable_record(&recorder).unwrap());
+        assert!(
+            recorder
+                .calls()
+                .iter()
+                .all(|call| matches!(call, Call::Output(..)))
+        );
+    }
+
+    #[test]
+    fn after_publication_old_cleanup_cannot_leave_a_staged_token_to_release_again() {
+        let recorder = Recorder::default();
+        recorder.reply(REFERENCES, Ok(HOST_REFERENCE));
+        recorder.reply(&["-E"], Ok("Token : 42\n"));
+        enable_pf(&recorder).unwrap();
+
+        // The old helper released 42 and only knew the canonical path.
+        assert_eq!(read_token(&recorder).unwrap(), Some(42));
+        recorder.remove(TOKEN).unwrap();
+        recover_with(&recorder).unwrap();
+        assert!(!has_enable_record(&recorder).unwrap());
+        assert!(
+            recorder
+                .calls()
+                .iter()
+                .all(|call| matches!(call, Call::Output(..)))
+        );
+    }
+
+    #[test]
+    fn a_failed_release_with_an_unreadable_reference_list_keeps_the_token() {
+        let recorder = Recorder::with_file(TOKEN, "Token : 42\n");
+        recorder.reply(&["-X", "42"], Err(NetworkError::Io));
+        recorder.reply(REFERENCES, Ok(""));
+        assert_eq!(recover_with(&recorder), Err(NetworkError::Platform));
+        assert_eq!(read_token(&recorder).unwrap(), Some(42));
     }
 
     #[test]

@@ -13,7 +13,9 @@ use crate::egress::commands::{Commands, SystemCommands};
 use crate::egress::policy::Plan;
 use crate::egress::state::{self, GuardState};
 
-use super::{PfGuard, install_with, local_addresses, recover_with, verify_deployment};
+use super::{
+    PfGuard, has_enable_record, install_with, local_addresses, recover_with, verify_deployment,
+};
 
 pub(crate) const HELPER: &str = "/Library/PrivilegedHelperTools/com.cvbbmso.egress-watchdog";
 
@@ -204,7 +206,7 @@ fn recover_without_owner(
         // PF and its owner record were already cleared. The watchdog or
         // the next scheduled run can finish just the outstanding bootout.
         cleanup::cancel(commands)?;
-    } else if parent.is_none() {
+    } else if parent.is_none() || has_enable_record(commands)? {
         recover(commands)?;
     }
     Ok(true)
@@ -233,9 +235,62 @@ fn control_pipe_closed() -> Result<bool, NetworkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egress::backend::macos::{
+        ANCHOR, ENABLE_BASELINE, ENABLE_CAPTURE, PFCTL, RULES, TOKEN,
+    };
     use crate::egress::commands::testing::{Call, Recorder};
 
     const DOMAIN: &str = "system/com.cvbbmso.egress-cleanup";
+
+    #[test]
+    fn a_new_helper_can_resume_after_the_old_helper_clears_the_anchor_and_owner() {
+        for (capture, expected_release, result) in [
+            ("pf enabled\nToken : 42\n", true, Ok(true)),
+            ("pf enabled\nToken : 4", false, Err(NetworkError::Io)),
+        ] {
+            let recorder = Recorder::with_file(ENABLE_CAPTURE, capture);
+            recorder.write(ENABLE_BASELINE, "[4]").unwrap();
+            recorder.write(RULES, "block drop out quick all").unwrap();
+            state::write(&recorder, &GuardState::new(1234)).unwrap();
+
+            // The old helper has no token at its legacy path. It flushes the
+            // anchor and clears the owner and job using only its own files.
+            assert!(recorder.contents(TOKEN).is_none());
+            recorder.run(PFCTL, &["-a", ANCHOR, "-F", "rules"]).unwrap();
+            recorder.remove(RULES).unwrap();
+            state::remove(&recorder).unwrap();
+            recorder
+                .run("/bin/launchctl", &["bootout", DOMAIN])
+                .unwrap();
+            assert_eq!(recorder.contents(ENABLE_CAPTURE).as_deref(), Some(capture));
+            assert_eq!(recorder.contents(ENABLE_BASELINE).as_deref(), Some("[4]"));
+
+            recorder.reply(
+                &["-s", "References"],
+                Ok(concat!(
+                    "TOKENS:\nPID Process Name TOKEN TIMESTAMP\n",
+                    "202 pfctl 42 0 days 00:00:01\n",
+                    "101 Host Firewall 4 0 days 00:00:03\n",
+                )),
+            );
+            assert_eq!(recover_without_owner(&recorder, Some(1234)), result);
+            let releases = recorder
+                .calls()
+                .into_iter()
+                .filter_map(|call| match call {
+                    Call::Run(_, args) if args.first().is_some_and(|arg| arg == "-X") => Some(args),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if expected_release {
+                assert_eq!(releases, [vec!["-X", "42"]]);
+                assert!(!has_enable_record(&recorder).unwrap());
+            } else {
+                assert!(releases.is_empty());
+                assert!(has_enable_record(&recorder).unwrap());
+            }
+        }
+    }
 
     #[test]
     fn surviving_recovery_retries_bootout_after_the_guard_state_is_removed() {

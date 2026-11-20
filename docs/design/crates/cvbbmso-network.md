@@ -110,6 +110,8 @@ Windows 使用 WinINet、WinHTTP 与代理环境变量；macOS 使用 SystemConf
 
 macOS 在 PF 已清理但 launchd 任务状态未确认时保留受保护的 `egress-cleanup.pending`。仍在运行的看门狗或下一次计划任务只重试任务卸载。若两者均已退出，下次安装接手。CLI 超时本身无法撤销 launchd 已收到的请求。
 
+PF 启用前保存引用快照，`pfctl -E` 将原始输出写到 `pf.enable.capture`。确认输出包含完整令牌行后，再将文件原子改名为旧 helper 使用的 `pf.enable`。客户端在改名前退出时，旧 helper 可以清理 anchor、所有者记录和恢复任务。启用记录仍在，新版恢复或下一次新版安装会接手。没有完整令牌且内核仍列出引用时，新版保留记录并报告清理失败。内核可能复用引用令牌，启用前后的列表只能用于核查，无法据此认领其他引用。[Apple XNU 的 PF 引用实现](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/pf_ioctl.c)
+
 现有 helper 的路径、`--watch` 和 `--recover` 参数、状态格式和固定 launchd 标识继续兼容。旧二进制自身启动的平台命令仍可能无界等待。更新后的进程对自己运行的 CLI 实施期限，无法替旧进程增加期限，固定任务标识也无法隔离迟到的 launchd RPC。两项都应在部署验收中明确记录。
 
 系统服务白名单按 IP、协议和端口匹配。平台未报告的加密 DNS 配置和部署证书链独有的 OCSP、CRL 或时间戳地址需要随部署验证。
