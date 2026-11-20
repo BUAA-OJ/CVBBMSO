@@ -6,7 +6,7 @@
 //! has nothing to undo, and the watchdog only covers the macOS adapter.
 #![allow(unsafe_code, reason = "WFP has no safe binding")]
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -14,13 +14,14 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_ACTION_TYPE, FWP_CONDITION_VALUE0,
     FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_UINT8, FWP_UINT16, FWP_V4_ADDR_AND_MASK,
     FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0,
-    FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_IP_PROTOCOL, FWPM_CONDITION_IP_REMOTE_ADDRESS,
-    FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0, FWPM_FILTER_CONDITION0,
-    FWPM_FILTER_FLAG_DISABLED, FWPM_FILTER0, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-    FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SESSION0, FWPM_SUBLAYER0,
-    FWPM_TXN_READ_ONLY, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteById0,
-    FwpmFilterGetById0, FwpmFreeMemory0, FwpmSubLayerAdd0, FwpmTransactionAbort0,
-    FwpmTransactionBegin0, FwpmTransactionCommit0,
+    FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_IP_LOCAL_PORT, FWPM_CONDITION_IP_PROTOCOL,
+    FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0,
+    FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_DISABLED, FWPM_FILTER0,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+    FWPM_LAYER_OUTBOUND_TRANSPORT_V4, FWPM_LAYER_OUTBOUND_TRANSPORT_V6, FWPM_SESSION_FLAG_DYNAMIC,
+    FWPM_SESSION0, FWPM_SUBLAYER0, FWPM_TXN_READ_ONLY, FwpmEngineClose0, FwpmEngineOpen0,
+    FwpmFilterAdd0, FwpmFilterDeleteById0, FwpmFilterGetById0, FwpmFreeMemory0, FwpmSubLayerAdd0,
+    FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
 };
 use windows_sys::Win32::Security::{
     GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
@@ -43,6 +44,15 @@ const PERMIT_WEIGHT: u8 = 5;
 const PROTOCOL_TCP: u8 = 6;
 /// IP protocol numbers used in conditions.
 const PROTOCOL_UDP: u8 = 17;
+const PROTOCOL_ICMPV6: u8 = 58;
+const ALE_LAYERS: [GUID; 2] = [
+    FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+];
+const TRANSPORT_LAYERS: [GUID; 2] = [
+    FWPM_LAYER_OUTBOUND_TRANSPORT_V4,
+    FWPM_LAYER_OUTBOUND_TRANSPORT_V6,
+];
 /// Loopback prefixes kept reachable for local IPC.
 const LOOPBACK_V4: ([u8; 4], u8) = ([127, 0, 0, 1], 32);
 /// Loopback prefixes kept reachable for local IPC.
@@ -297,6 +307,8 @@ enum ConditionSpec {
     Protocol(u8),
     /// Matches a remote port.
     Port(u16),
+    /// Matches the ICMP type, which aliases the local port at transport.
+    IcmpType(u16),
 }
 
 /// Adds one filter owned by the guard sublayer.
@@ -410,6 +422,15 @@ impl OwnedCondition {
                     _mask_v6: None,
                 }
             }
+            ConditionSpec::IcmpType(kind) => {
+                let mut condition = condition_of(FWPM_CONDITION_IP_LOCAL_PORT, FWP_UINT16);
+                condition.conditionValue.Anonymous = FWP_CONDITION_VALUE0_0 { uint16: *kind };
+                Self {
+                    condition,
+                    _mask_v4: None,
+                    _mask_v6: None,
+                }
+            }
         }
     }
 }
@@ -445,30 +466,56 @@ fn prefix_mask_v4(prefix: u8) -> u32 {
 
 /// Returns the complete filter list for `plan`.
 fn filter_specs(plan: &Plan) -> Vec<FilterSpec> {
-    let mut specifications = Vec::new();
+    // Receiving a TCP SYN is authorized at RECV_ACCEPT, so its SYN-ACK and
+    // later replies need per-packet filtering even when ALE_CONNECT is absent.
+    [ALE_LAYERS, TRANSPORT_LAYERS]
+        .into_iter()
+        .flat_map(|layers| layer_filters(plan, layers))
+        .chain(neighbor_discovery())
+        .collect()
+}
 
-    for layer in [
-        FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-        FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-    ] {
-        specifications.push(FilterSpec {
+fn layer_filters(plan: &Plan, layers: [GUID; 2]) -> Vec<FilterSpec> {
+    let [ipv4, ipv6] = layers;
+    let mut specifications = layers
+        .into_iter()
+        .map(|layer| FilterSpec {
             layer,
             weight: BLOCK_WEIGHT,
             action: FWP_ACTION_BLOCK,
             conditions: Vec::new(),
-        });
-    }
+        })
+        .collect::<Vec<_>>();
 
     // Loopback for local IPC.
-    specifications.push(permit_v4(LOOPBACK_V4.0, LOOPBACK_V4.1, Vec::new()));
-    specifications.push(permit_v6(LOOPBACK_V6.0, LOOPBACK_V6.1, Vec::new()));
+    specifications.push(permit(
+        ipv4,
+        ConditionSpec::AddressV4(LOOPBACK_V4.0, LOOPBACK_V4.1),
+        Vec::new(),
+    ));
+    specifications.push(permit(
+        ipv6,
+        ConditionSpec::AddressV6(LOOPBACK_V6.0, LOOPBACK_V6.1),
+        Vec::new(),
+    ));
+    specifications.push(permit(
+        ipv6,
+        ConditionSpec::AddressV6(
+            std::net::Ipv4Addr::from(LOOPBACK_V4.0)
+                .to_ipv6_mapped()
+                .octets(),
+            128,
+        ),
+        Vec::new(),
+    ));
 
     for service in &plan.services {
         let protocol = match service.transport {
             Transport::Tcp => PROTOCOL_TCP,
             Transport::Udp => PROTOCOL_UDP,
         };
-        specifications.push(permit_address(
+        specifications.extend(permit_address(
+            layers,
             &service.remote.ip(),
             service.remote.port(),
             protocol,
@@ -478,44 +525,82 @@ fn filter_specs(plan: &Plan) -> Vec<FilterSpec> {
     for target in [&plan.accoding, &plan.server] {
         for address in &target.addresses {
             for protocol in [PROTOCOL_TCP, PROTOCOL_UDP] {
-                specifications.push(permit_address(address, target.port, protocol));
+                specifications.extend(permit_address(layers, address, target.port, protocol));
             }
         }
     }
 
     for address in &plan.certificate {
-        specifications.push(permit_address(&address.ip(), address.port(), PROTOCOL_TCP));
+        specifications.extend(permit_address(
+            layers,
+            &address.ip(),
+            address.port(),
+            PROTOCOL_TCP,
+        ));
     }
 
     specifications
 }
 
-/// Builds a permit filter for one address and port.
-fn permit_address(address: &IpAddr, port: u16, protocol: u8) -> FilterSpec {
-    let conditions = vec![ConditionSpec::Protocol(protocol), ConditionSpec::Port(port)];
-    match address {
-        IpAddr::V4(v4) => permit_v4(v4.octets(), 32, conditions),
-        IpAddr::V6(v6) => permit_v6(v6.octets(), 128, conditions),
-    }
+/// Dual-stack sockets can be classified with an IPv4-mapped address at ALE.
+fn permit_address(
+    [ipv4, ipv6]: [GUID; 2],
+    address: &IpAddr,
+    port: u16,
+    protocol: u8,
+) -> impl Iterator<Item = FilterSpec> {
+    let conditions = || vec![ConditionSpec::Protocol(protocol), ConditionSpec::Port(port)];
+    let v4 = match address {
+        IpAddr::V4(v4) => Some(permit(
+            ipv4,
+            ConditionSpec::AddressV4(v4.octets(), 32),
+            conditions(),
+        )),
+        IpAddr::V6(_) => None,
+    };
+    let v6 = match address {
+        IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+        IpAddr::V6(v6) => *v6,
+    };
+    v4.into_iter().chain([permit(
+        ipv6,
+        ConditionSpec::AddressV6(v6.octets(), 128),
+        conditions(),
+    )])
 }
 
-/// Builds a permit filter for an IPv4 prefix.
-fn permit_v4(octets: [u8; 4], prefix: u8, mut conditions: Vec<ConditionSpec>) -> FilterSpec {
-    conditions.insert(0, ConditionSpec::AddressV4(octets, prefix));
-    FilterSpec {
-        layer: FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-        weight: PERMIT_WEIGHT,
-        action: FWP_ACTION_PERMIT,
-        conditions,
-    }
+fn neighbor_discovery() -> impl Iterator<Item = FilterSpec> {
+    let all_routers = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
+    let all_nodes = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+    let solicited_node = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 0);
+    let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0);
+    [
+        (133, all_routers, 128),
+        (135, solicited_node, 104),
+        (135, link_local, 10),
+        (136, all_nodes, 128),
+        (136, link_local, 10),
+    ]
+    .into_iter()
+    .map(|(kind, destination, prefix)| {
+        permit(
+            TRANSPORT_LAYERS[1],
+            ConditionSpec::AddressV6(destination.octets(), prefix),
+            vec![
+                ConditionSpec::Protocol(PROTOCOL_ICMPV6),
+                ConditionSpec::IcmpType(kind),
+                ConditionSpec::Port(0),
+            ],
+        )
+    })
 }
 
-/// Builds a permit filter for an IPv6 prefix.
-fn permit_v6(octets: [u8; 16], prefix: u8, mut conditions: Vec<ConditionSpec>) -> FilterSpec {
-    conditions.insert(0, ConditionSpec::AddressV6(octets, prefix));
+fn permit(layer: GUID, address: ConditionSpec, mut conditions: Vec<ConditionSpec>) -> FilterSpec {
+    conditions.insert(0, address);
     FilterSpec {
-        layer: FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        layer,
         weight: PERMIT_WEIGHT,
+        // This is a soft permit. It cannot override a host firewall block.
         action: FWP_ACTION_PERMIT,
         conditions,
     }
@@ -558,27 +643,29 @@ fn require_elevated() -> Result<(), NetworkError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOCK_WEIGHT, PERMIT_WEIGHT, filter_specs, prefix_mask_v4};
+    use super::*;
     use crate::egress::policy::{Plan, Target};
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::Ipv4Addr;
 
     fn plan() -> Plan {
         Plan::new(
             Target::new(vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))], 443),
-            Target::new(vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)], 8443),
+            Target::new(vec!["2001:db8::10".parse().unwrap()], 8443),
             vec!["203.0.113.20:80".parse().expect("certificate responder")],
             Vec::new(),
         )
     }
 
     #[test]
-    fn a_block_filter_exists_for_both_families() {
+    fn a_block_filter_exists_for_both_families_at_connect_and_transport() {
         let specifications = filter_specs(&plan());
-        let blocks = specifications
-            .iter()
-            .filter(|specification| specification.weight == BLOCK_WEIGHT)
-            .count();
-        assert_eq!(blocks, 2);
+        for layer in ALE_LAYERS.into_iter().chain(TRANSPORT_LAYERS) {
+            assert!(specifications.iter().any(|specification| {
+                same_layer(specification.layer, layer)
+                    && specification.action == FWP_ACTION_BLOCK
+                    && specification.conditions.is_empty()
+            }));
+        }
     }
 
     #[test]
@@ -594,23 +681,63 @@ mod tests {
     }
 
     #[test]
-    fn every_allowed_address_becomes_a_permit() {
+    fn transport_replies_match_the_same_remote_address_port_and_protocol() {
         let specifications = filter_specs(&plan());
-        // Origins have two protocols each; the responder is TCP-only.
-        let permits = specifications
-            .iter()
-            .filter(|specification| specification.weight == PERMIT_WEIGHT)
-            .count();
-        assert_eq!(permits, 7);
+        let v6 = "2001:db8::10".parse::<Ipv6Addr>().unwrap().octets();
+        for protocol in [PROTOCOL_TCP, PROTOCOL_UDP] {
+            assert!(specifications.iter().any(|spec| same_layer(spec.layer, TRANSPORT_LAYERS[0])
+                && matches!(&spec.conditions[..], [ConditionSpec::AddressV4([203, 0, 113, 10], 32), ConditionSpec::Protocol(found), ConditionSpec::Port(443)] if *found == protocol)));
+            assert!(specifications.iter().any(|spec| same_layer(spec.layer, TRANSPORT_LAYERS[1])
+                && matches!(&spec.conditions[..], [ConditionSpec::AddressV6(address, 128), ConditionSpec::Protocol(found), ConditionSpec::Port(8443)] if *found == protocol && *address == v6)));
+        }
+        let refreshed = filter_specs(&Plan::default());
+        assert!(!refreshed.iter().any(|spec| matches!(
+            &spec.conditions[..],
+            [
+                _,
+                ConditionSpec::Protocol(PROTOCOL_TCP | PROTOCOL_UDP),
+                ConditionSpec::Port(443 | 8443)
+            ]
+        )));
+    }
+
+    #[test]
+    fn transport_neighbor_discovery_uses_scoped_zero_code_types() {
+        let specs = neighbor_discovery().collect::<Vec<_>>();
+        assert_eq!(specs.len(), 5);
+        for spec in specs {
+            assert!(same_layer(spec.layer, TRANSPORT_LAYERS[1]));
+            assert!(matches!(
+                &spec.conditions[..],
+                [
+                    ConditionSpec::AddressV6(_, 10 | 104 | 128),
+                    ConditionSpec::Protocol(PROTOCOL_ICMPV6),
+                    ConditionSpec::IcmpType(133 | 135 | 136),
+                    ConditionSpec::Port(0)
+                ]
+            ));
+        }
+    }
+
+    fn same_layer(a: GUID, b: GUID) -> bool {
+        (a.data1, a.data2, a.data3, a.data4) == (b.data1, b.data2, b.data3, b.data4)
     }
 
     #[test]
     fn ffi_sees_all_three_conditions_in_order() {
-        use super::*;
-        let filter = permit_address(&"203.0.113.10".parse().unwrap(), 8443, PROTOCOL_TCP);
+        let filter = permit_address(
+            TRANSPORT_LAYERS,
+            &"203.0.113.10".parse().unwrap(),
+            8443,
+            PROTOCOL_TCP,
+        )
+        .next()
+        .unwrap();
         with_filter(&filter, |raw| {
             assert!(!raw.displayData.name.is_null());
             assert_eq!(raw.numFilterConditions, 3);
+            assert!(same_layer(raw.layerKey, TRANSPORT_LAYERS[0]));
+            assert_eq!(raw.flags & windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, 0);
             // SAFETY: with_filter keeps the array and its data live. The type
             // assertions select the correct union member for each condition.
             unsafe {
