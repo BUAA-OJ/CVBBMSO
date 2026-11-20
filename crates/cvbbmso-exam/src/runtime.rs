@@ -791,7 +791,12 @@ impl<C: Capture> Runtime<C> {
         self.drain_recorder_events().await;
         match result {
             Ok(manifest) => {
-                // The save that records the manifest also records the state.
+                // A segment notification can arrive after the drain. Save any
+                // missing segments together with the manifest and final state.
+                for segment in &manifest.segments {
+                    self.journal
+                        .append(ExamEvent::SegmentFinalized(segment.clone()));
+                }
                 let changed =
                     self.update_state(ExecutionState::Finalizing, RecordingState::Complete);
                 self.record(ExamEvent::RecordingFinalized(manifest)).await;

@@ -69,7 +69,7 @@ fn state(execution: ExecutionState, recording: RecordingState) -> ClientState {
 }
 
 fn segment(index: u32) -> SegmentMeta {
-    let start = OffsetDateTime::now_utc();
+    let start = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(u64::from(index));
     SegmentMeta::new(
         index,
         start,
@@ -127,7 +127,7 @@ impl Script {
 
 struct FakeCapture {
     script: Script,
-    final_segment: Option<mpsc::Sender<RecorderEvent>>,
+    segment_count: u32,
 }
 
 impl Capture for FakeCapture {
@@ -150,21 +150,12 @@ impl Capture for FakeCapture {
 
     fn finish(&mut self) -> impl Future<Output = Result<RecordingManifest, RecordingError>> + Send {
         self.script.0.lock().unwrap().calls.push("finish");
-        let segment = segment(1);
         let manifest = RecordingManifest::new(
-            vec![segment.clone()],
+            (1..=self.segment_count).map(segment).collect(),
             Sha256Digest::parse(&"b".repeat(64)).unwrap(),
-        );
-        let final_segment = self.final_segment.clone();
-        async move {
-            if let Some(sender) = final_segment {
-                sender
-                    .send(RecorderEvent::SegmentFinalized(segment))
-                    .await
-                    .unwrap();
-            }
-            Ok(manifest.unwrap())
-        }
+        )
+        .unwrap();
+        async move { Ok(manifest) }
     }
 }
 
@@ -181,7 +172,7 @@ struct Harness {
     script: Script,
     recorder: mpsc::Sender<RecorderEvent>,
     events: Option<mpsc::Receiver<RecorderEvent>>,
-    seal_on_finish: bool,
+    segment_count: u32,
     open_gate: Option<OpenGate>,
 }
 
@@ -197,7 +188,7 @@ impl Harness {
             script: Script::default(),
             recorder,
             events: Some(events),
-            seal_on_finish: false,
+            segment_count: 1,
             open_gate: None,
         }
     }
@@ -229,7 +220,7 @@ impl Harness {
         let monitor = Monitor::for_test(self.base.clone()).unwrap();
         let capture = FakeCapture {
             script: self.script.clone(),
-            final_segment: self.seal_on_finish.then(|| self.recorder.clone()),
+            segment_count: self.segment_count,
         };
         let events = self.events.take().expect("launched once per harness");
         let open_gate = self.open_gate.take();
@@ -819,7 +810,7 @@ async fn a_full_send_queue_cannot_hold_recording_past_the_offline_deadline() {
         journal,
         capture: FakeCapture {
             script: harness.script.clone(),
-            final_segment: None,
+            segment_count: 1,
         },
         recorder,
         inbound_tx,
@@ -939,12 +930,29 @@ async fn a_failed_journal_write_keeps_the_exam_running() {
 }
 
 #[tokio::test]
-async fn end_result_waits_for_the_manifest_to_be_saved_and_sent() {
+async fn end_result_waits_for_the_tail_segment_and_manifest_to_be_saved_and_sent() {
     let mut harness = Harness::new().await;
-    harness.seal_on_finish = true;
+    harness.segment_count = 2;
     let (mut conn, handle) = harness.connected(ExamPhase::Running).await;
     let mut view = handle.subscribe();
     start_recording(&mut conn).await;
+    harness
+        .recorder
+        .send(RecorderEvent::SegmentFinalized(segment(1)))
+        .await
+        .unwrap();
+    let (seq, event) = expect_event(conn.recv().await);
+    assert_eq!(seq, 1);
+    assert!(matches!(event, ExamEvent::SegmentFinalized(meta) if meta.index == 1));
+
+    drop(conn);
+    let mut conn = harness.accept().await;
+    assert!(matches!(conn.recv().await, ClientMessage::Hello(_)));
+    conn.send(sync(ExamPhase::Running, 1)).await;
+    timeout(WAIT, view.wait_for(|view| view.connected))
+        .await
+        .unwrap()
+        .unwrap();
     let blocker = harness.block_journal_writes();
 
     conn.send(command(2, CommandName::EndExam)).await;
@@ -963,14 +971,27 @@ async fn end_result_waits_for_the_manifest_to_be_saved_and_sent() {
     .await
     .unwrap()
     .unwrap();
+    // The recorder publishes this notification after finish returned its manifest.
+    harness
+        .recorder
+        .send(RecorderEvent::SegmentFinalized(segment(2)))
+        .await
+        .unwrap();
     std::fs::remove_dir(&blocker).unwrap();
 
     let (seq, event) = expect_event(conn.recv().await);
-    assert_eq!(seq, 1);
-    assert!(matches!(event, ExamEvent::SegmentFinalized(meta) if meta.index == 1));
-    let (seq, event) = expect_event(conn.recv().await);
     assert_eq!(seq, 2);
-    assert!(matches!(event, ExamEvent::RecordingFinalized(_)));
+    let ExamEvent::SegmentFinalized(tail) = event else {
+        panic!("expected the tail segment before the manifest, got {event:?}");
+    };
+    assert_eq!(tail.index, 2);
+    let (seq, event) = expect_event(conn.recv().await);
+    assert_eq!(seq, 3);
+    let ExamEvent::RecordingFinalized(manifest) = event else {
+        panic!("expected the manifest after the tail segment, got {event:?}");
+    };
+    assert_eq!(manifest.segments.len(), 2);
+    assert_eq!(manifest.segments[1], tail);
     expect_result(&conn.recv().await, 2, CommandStatus::Completed);
     conn.send(ack(2)).await;
     conn.closed().await;
@@ -1011,8 +1032,11 @@ async fn restart_replays_finalized_evidence_without_running_finish_again() {
         &conn.recv().await,
         state(ExecutionState::Finalizing, RecordingState::Finalizing),
     );
-    let (seq, manifest) = expect_event(conn.recv().await);
+    let (seq, segment) = expect_event(conn.recv().await);
     assert_eq!(seq, 1);
+    assert!(matches!(&segment, ExamEvent::SegmentFinalized(meta) if meta.index == 1));
+    let (seq, manifest) = expect_event(conn.recv().await);
+    assert_eq!(seq, 2);
     assert!(matches!(manifest, ExamEvent::RecordingFinalized(_)));
     expect_status(
         &conn.recv().await,
@@ -1034,7 +1058,8 @@ async fn restart_replays_finalized_evidence_without_running_finish_again() {
     let mut restarted = Harness::new().await;
     std::mem::swap(&mut restarted.data, &mut harness.data);
     let (mut conn, handle) = restarted.connected(ExamPhase::Ended).await;
-    assert_eq!(expect_event(conn.recv().await), (1, manifest));
+    assert_eq!(expect_event(conn.recv().await), (1, segment));
+    assert_eq!(expect_event(conn.recv().await), (2, manifest));
     conn.send(command(3, CommandName::EndExam)).await;
     expect_result(&conn.recv().await, 3, CommandStatus::Completed);
     assert_eq!(restarted.script.calls(), Vec::<&str>::new());
