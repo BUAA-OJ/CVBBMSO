@@ -2,6 +2,7 @@
 
 use std::{
     io,
+    ptr::NonNull,
     sync::{Arc, mpsc},
     time::Duration,
 };
@@ -13,12 +14,15 @@ use objc2::{
     rc::Retained,
     runtime::{NSObject, NSObjectProtocol, ProtocolObject},
 };
+use objc2_core_foundation::CFGetTypeID;
 use objc2_core_graphics::{CGDisplayPixelsHigh, CGDisplayPixelsWide, CGMainDisplayID};
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_core_video::{
-    CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
-    CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
-    CVPixelBufferUnlockBaseAddress, kCVPixelFormatType_32BGRA,
+    CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow,
+    CVPixelBufferGetDataSize, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType,
+    CVPixelBufferGetTypeID, CVPixelBufferGetWidth, CVPixelBufferIsPlanar,
+    CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+    kCVPixelFormatType_32BGRA,
 };
 use objc2_foundation::{NSArray, NSError, NSString};
 use objc2_screen_capture_kit::{
@@ -31,6 +35,7 @@ use crate::RecordingError;
 
 /// `kCVPixelBufferLock_ReadOnly`: the captured image is only read, never written.
 const READ_ONLY: CVPixelBufferLockFlags = CVPixelBufferLockFlags(1);
+const BGRA_BYTES_PER_PIXEL: usize = 4;
 /// How long the blocking setup waits for `ScreenCaptureKit`'s async steps.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long dropping the backend waits for the stream to stop.
@@ -131,7 +136,6 @@ impl Desktop {
             configuration.setPixelFormat(kCVPixelFormatType_32BGRA);
             configuration.setShowsCursor(false);
             configuration.setCapturesAudio(false);
-            configuration.setQueueDepth(1);
             configuration.setMinimumFrameInterval(CMTime::new(1, fps));
         }
 
@@ -213,6 +217,14 @@ fn start_capture(stream: &SCStream) -> CaptureResult<()> {
     }
 }
 
+/// One retained display in transit from the query callback to the capture thread.
+struct ShareableDisplay(Retained<SCDisplay>);
+
+// SAFETY: SCDisplay holds read-only display metadata and has no main-thread
+// affinity. The channel moves the retain without accessing the display, and
+// Objective-C retain/release can run on either thread.
+unsafe impl Send for ShareableDisplay {}
+
 /// Resolves the display whose identifier matches the main display.
 fn primary_display() -> CaptureResult<Retained<SCDisplay>> {
     let main_id = CGMainDisplayID();
@@ -220,8 +232,7 @@ fn primary_display() -> CaptureResult<Retained<SCDisplay>> {
     let completion = RcBlock::new(
         move |content: *mut SCShareableContent, error: *mut NSError| {
             // SAFETY: ScreenCaptureKit passes either NULL or valid objects for the
-            // duration of this callback. The display is retained before it crosses
-            // the channel as an owned pointer.
+            // duration of this callback. The array gives us retained displays.
             let result = unsafe {
                 if content.is_null() {
                     Err(if error.is_null() {
@@ -231,14 +242,12 @@ fn primary_display() -> CaptureResult<Retained<SCDisplay>> {
                     })
                 } else {
                     let displays = (*content).displays();
-                    match displays
+                    displays
                         .to_vec()
                         .into_iter()
                         .find(|display| display.displayID() == main_id)
-                    {
-                        Some(display) => Ok(Retained::into_raw(display) as usize),
-                        None => Err("the primary display is not shareable".to_owned()),
-                    }
+                        .map(ShareableDisplay)
+                        .ok_or_else(|| "the primary display is not shareable".to_owned())
                 }
             };
             let _ = send.send(result);
@@ -253,13 +262,19 @@ fn primary_display() -> CaptureResult<Retained<SCDisplay>> {
             &completion,
         );
     }
-    let captured = receive.recv_timeout(SETUP_TIMEOUT).map_err(|_| {
-        CaptureError::Unavailable("the shareable content query timed out".to_owned())
-    })?;
-    let pointer = captured.map_err(CaptureError::Unavailable)? as *mut SCDisplay;
-    // SAFETY: the block transferred exactly one retain of this display.
-    unsafe { Retained::from_raw(pointer) }
-        .ok_or_else(|| CaptureError::Unavailable("the primary display is gone".to_owned()))
+    wait_for_display(receive, SETUP_TIMEOUT).map(|display| display.0)
+}
+
+fn wait_for_display<T>(
+    receive: mpsc::Receiver<Result<T, String>>,
+    timeout: Duration,
+) -> CaptureResult<T> {
+    let result = receive.recv_timeout(timeout);
+    // Close the channel on timeout so any queued or later result is dropped.
+    drop(receive);
+    result
+        .map_err(|_| CaptureError::Unavailable("the shareable content query timed out".to_owned()))?
+        .map_err(CaptureError::Unavailable)
 }
 
 /// Message used when `ScreenCaptureKit` or Foundation reports an error.
@@ -270,22 +285,92 @@ fn description(error: &NSError) -> String {
 
 /// Copies one captured BGRA image out of its pixel buffer.
 fn image_frame(sample_buffer: &CMSampleBuffer) -> Option<Frame> {
-    // SAFETY: the sample buffer belongs to ScreenCaptureKit for the duration of
-    // the callback; the pixel buffer is locked while its bytes are read.
+    // SAFETY: the sample buffer is live for the duration of the callback.
     let image = unsafe { sample_buffer.image_buffer() }?;
-    let width = u32::try_from(CVPixelBufferGetWidth(&image)).ok()?;
-    let height = u32::try_from(CVPixelBufferGetHeight(&image)).ok()?;
-    if unsafe { CVPixelBufferLockBaseAddress(&image, READ_ONLY) } != 0 {
+    pixel_buffer_frame(&image)
+}
+
+fn pixel_buffer_frame(image: &CVPixelBuffer) -> Option<Frame> {
+    if CFGetTypeID(Some(image)) != CVPixelBufferGetTypeID()
+        || CVPixelBufferGetPixelFormatType(image) != kCVPixelFormatType_32BGRA
+        || CVPixelBufferIsPlanar(image)
+    {
         return None;
     }
-    let pitch = CVPixelBufferGetBytesPerRow(&image);
-    let base = CVPixelBufferGetBaseAddress(&image).cast::<u8>();
-    // SAFETY: a successful read-only lock guarantees `pitch * height` readable
-    // bytes at the base address until the matching unlock below.
-    let bytes = unsafe { std::slice::from_raw_parts(base, pitch.checked_mul(height as usize)?) };
-    let frame = Frame::from_padded_bgra(bytes, width, height, pitch);
-    unsafe { CVPixelBufferUnlockBaseAddress(&image, READ_ONLY) };
-    frame
+
+    let locked = ReadOnlyPixelBuffer::lock(image)?;
+    locked.copy_bgra()
+}
+
+struct ReadOnlyPixelBuffer<'a>(&'a CVPixelBuffer);
+
+impl<'a> ReadOnlyPixelBuffer<'a> {
+    fn lock(image: &'a CVPixelBuffer) -> Option<Self> {
+        // SAFETY: the caller checked this is a live pixel buffer. The guard
+        // balances a successful lock with the same flags.
+        if unsafe { CVPixelBufferLockBaseAddress(image, READ_ONLY) } != 0 {
+            return None;
+        }
+        Some(Self(image))
+    }
+
+    fn copy_bgra(&self) -> Option<Frame> {
+        let image = self.0;
+        let width = CVPixelBufferGetWidth(image);
+        let height = CVPixelBufferGetHeight(image);
+        let frame_width = u32::try_from(width).ok()?;
+        let frame_height = u32::try_from(height).ok()?;
+        let pitch = CVPixelBufferGetBytesPerRow(image);
+        let readable = CVPixelBufferGetDataSize(image);
+        let base = CVPixelBufferGetBaseAddress(image).cast::<u8>();
+        let (base, row_bytes) = packed_bgra_rows(base, width, height, pitch, readable)?;
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(row_bytes.checked_mul(height)?)
+            .ok()?;
+        for row in 0..height {
+            // SAFETY: the layout check bounded every visible row in the locked
+            // packed buffer. Slice only the pixel bytes; padding need not be
+            // initialized. The guard outlives each copy.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(base.as_ptr().add(row * pitch), row_bytes) };
+            pixels.extend_from_slice(bytes);
+        }
+        Some(Frame {
+            width: frame_width,
+            height: frame_height,
+            pixels,
+        })
+    }
+}
+
+impl Drop for ReadOnlyPixelBuffer<'_> {
+    fn drop(&mut self) {
+        // SAFETY: construction succeeded with the same buffer and flags.
+        unsafe { CVPixelBufferUnlockBaseAddress(self.0, READ_ONLY) };
+    }
+}
+
+fn packed_bgra_rows(
+    base: *mut u8,
+    width: usize,
+    height: usize,
+    pitch: usize,
+    readable: usize,
+) -> Option<(NonNull<u8>, usize)> {
+    let base = NonNull::new(base)?;
+    let row_bytes = width.checked_mul(BGRA_BYTES_PER_PIXEL)?;
+    if row_bytes == 0 || pitch < row_bytes {
+        return None;
+    }
+    let used = height
+        .checked_sub(1)?
+        .checked_mul(pitch)?
+        .checked_add(row_bytes)?;
+    if used > readable || used > isize::MAX as usize {
+        return None;
+    }
+    Some((base, row_bytes))
 }
 
 /// Preserves the adapter error without exposing its type in public signatures.

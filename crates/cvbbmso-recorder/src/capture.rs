@@ -42,44 +42,6 @@ pub(crate) struct Frame {
     pub(crate) pixels: Vec<u8>,
 }
 
-impl Frame {
-    /// Packs rows of padded BGRA pixels into a tightly packed frame.
-    ///
-    /// Platform surfaces carry a row pitch that can exceed the visible width;
-    /// only the first `width * 4` bytes of each row belong to the image. Returns
-    /// `None` when the pitch cannot hold a row, when `pixels` is shorter than
-    /// `pitch * height`, or when the dimensions are zero.
-    pub(crate) fn from_padded_bgra(
-        pixels: &[u8],
-        width: u32,
-        height: u32,
-        pitch: usize,
-    ) -> Option<Self> {
-        const BGRA: usize = 4;
-
-        let columns = usize::try_from(width).ok()?;
-        let rows = usize::try_from(height).ok()?;
-        let row_bytes = columns.checked_mul(BGRA)?;
-        if columns == 0 || rows == 0 || pitch < row_bytes {
-            return None;
-        }
-        let length = pitch.checked_mul(rows)?;
-        let capacity = row_bytes.checked_mul(rows)?;
-        if pixels.len() < length {
-            return None;
-        }
-        let mut packed = Vec::with_capacity(capacity);
-        for row in pixels[..length].chunks_exact(pitch) {
-            packed.extend_from_slice(&row[..row_bytes]);
-        }
-        Some(Self {
-            width,
-            height,
-            pixels: packed,
-        })
-    }
-}
-
 /// Newest captured image plus the reason capture stopped.
 ///
 /// Push-based backends deliver images from their own callback thread while the
@@ -318,42 +280,6 @@ mod tests {
     #[test]
     fn mismatched_length_is_rejected() {
         assert_eq!(rotate(&[0, 0, 0], 2, 3, Rotation::None), (Vec::new(), 0, 0));
-    }
-
-    #[test]
-    fn padded_rows_are_packed_without_the_padding() {
-        // Two 2-pixel rows with a three-byte tail of platform padding each.
-        let pixels = [
-            1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, //
-            9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0,
-        ];
-
-        let frame = Frame::from_padded_bgra(&pixels, 2, 2, 11).expect("frame");
-
-        assert_eq!(frame.width, 2);
-        assert_eq!(frame.height, 2);
-        assert_eq!(
-            frame.pixels,
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-        );
-    }
-
-    #[test]
-    fn a_tight_pitch_keeps_every_byte() {
-        let pixels: Vec<u8> = (1..=8).collect();
-
-        let frame = Frame::from_padded_bgra(&pixels, 2, 1, 8).expect("frame");
-
-        assert_eq!(frame.pixels, pixels);
-    }
-
-    #[test]
-    fn unpadded_and_short_rows_are_rejected() {
-        assert!(Frame::from_padded_bgra(&[0; 12], 4, 1, 12).is_none());
-        assert!(Frame::from_padded_bgra(&[0; 4], 2, 2, 8).is_none());
-        assert!(Frame::from_padded_bgra(&[], 0, 1, 8).is_none());
-        assert!(Frame::from_padded_bgra(&[], 2, 0, 8).is_none());
-        assert!(Frame::from_padded_bgra(&[], u32::MAX, 1, usize::MAX).is_none());
     }
 
     /// One-pixel frame tagged by `value` so replacement is visible.
