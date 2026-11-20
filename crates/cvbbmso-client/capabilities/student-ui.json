@@ -7,6 +7,7 @@
   "permissions": [
     "allow-vm-preflight",
     "allow-admission-status",
+    "allow-open-helper-approval-settings",
     "allow-open-accoding",
     "allow-inspect-session",
     "allow-list-exams",

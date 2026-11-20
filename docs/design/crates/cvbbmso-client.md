@@ -4,7 +4,7 @@
 
 ## 桌面底座
 
-当前底座可在 Windows 和 macOS 启动本地控制窗，并通过独立窗口打开 Accoding 登录页。用 `cargo run --release --locked -p cvbbmso-client` 启动。虚拟机预检通过后，控制窗可调用 `open_accoding`、`inspect_session` 和 `list_exams`。关闭控制窗将退出应用，同时关闭 Accoding 窗口。`inspect_session` 将 Cookie 是否可用定向通知本地 UI。加载报名列表时由监考服务复验 Accoding 身份。
+客户端在 Windows 和 macOS 启动本地控制窗。Windows 使用安装后的程序，macOS 正式启动要求 macOS 14 或更新版本。先从 DMG 将已签名的 CVBBMSO.app 拖到「应用程序」，再以当前登录用户在 Finder 中双击打开。准入通过后，可以从控制窗打开独立的 Accoding 窗口。关闭控制窗会退出应用并关闭 Accoding 窗口。`inspect_session` 将 Cookie 是否可用定向通知本地 UI。加载报名列表时由监考服务复验 Accoding 身份。
 
 部署时可在编译环境中设置 `CVBBMSO_SERVER_ORIGIN`，例如 `https://monitor.example.org`。该值须为 HTTPS Origin，可含端口。显式配置无效地址（含空字符串）会导致启动失败。未设置该变量时，控制窗可照常启动，加载报名列表会提示未配置监考服务地址。远程页面和前端命令均无法设置请求目的地。应用数据根目录通过 Tauri 的 `app_local_data_dir()` 取得。Windows 的 Accoding WebView 用该目录下的 `accoding/` 保存浏览器配置，macOS 使用系统管理的应用 WebKit 数据存储。
 
@@ -25,6 +25,7 @@
 | `vm_preflight` | `{ retry: bool }` | `{ status, reason }` | 读取设备检查结果。仅在上次结果为 `unknown` 时响应重试 |
 | `admission_status` | `{ retry: bool }` | `{ status, reason? }` | 读取正式准入状态，或重试可恢复的失败。仅本地控制窗可调用 |
 | `admission-status` 事件 | 无 | `{ status, reason? }` | 定向通知本地控制窗正式准入状态变化 |
+| `open_helper_approval_settings` | 无 | `()` | macOS 等待后台服务批准时，由本地控制窗点击操作后打开系统设置 |
 | `list_exams` | 无 | `ExamSummary[]` | 使用当前 Cookie 调用 `GET /api/exams` |
 | `open_exam` | `{ exam_id: uuid }` | `{ "connected": true }` | 调用 `Exam::connect`；等待初始 `sync` 后返回。网络、出站守卫和权限预检已在启动时完成 |
 | `get_exam_status` | 无 | `ClientView` 或 `null` | 读取当前考试状态快照 |
@@ -63,19 +64,16 @@ impl AppState {
 
 ## 启动预检、出站守卫与屏幕权限
 
-应用启动时、以及预检失败后用户重试进入考试时，客户端执行一次启动流程：
+启动时先在 Rust 中执行虚拟机预检。其余准入步骤只在 `NotDetected` 后运行。两端都调用 `cvbbmso-network::Inspector::check` 检查系统代理和监考地址。代理状态须为 `clear`，监考状态须为 `reachable`。检查失败时，界面给出原因并等待重试。
 
-1. 在 Rust 中执行虚拟机预检。只有 `NotDetected` 放行。其余结果阻断 Accoding 窗口、会话检查、报名列表请求和进入考试。
-2. 检查当前进程是否具备管理员/root 权限。系统级出站守卫需要特权。无法取得权限时，客户端停留在考试外并展示提权指引。
-3. 调用 `cvbbmso-network::Inspector::check`。只有 `proxy = clear` 且 `endpoint = reachable` 才允许进入考试。检测到代理、代理状态未知、服务端不可达或检查失败时，客户端停留在考试外并展示对应错误，等待用户重试。
-4. 调用 `cvbbmso-network::EgressGuard::install`，传入 Accoding Origin 和监考服务器 Origin。守卫保持到应用退出，期间系统只放行允许的出站流量。安装失败时同样停留在考试外。
-5. macOS 上由本 crate 的平台适配层探测屏幕录制权限，未授权时发起系统授权请求。仍无权限或授权后需要重启应用时，展示明确指引并阻止进入考试。Windows 视为已授权。
+- **macOS** 应用以当前登录用户运行。从磁盘映像或其他位置运行时，控制窗提示将应用复制到「应用程序」后重新打开。网络预检通过后，Rust 在主线程检查屏幕录制权限，按需请求系统授权。还未授权或需要重启时，客户端停在控制窗。之后才调用 `MacosEgressGuard::install`，守卫先核对安装来源和签名，再通过系统服务流程注册、等待批准以及启用 PF。等待批准时可打开「登录项与扩展」。返回控制窗会重新检查，拒绝后也可手动重试。PF 无法启用所需规则时保留阻断，管理员修复后可以重试。
+- **Windows** 进程先检查管理员权限，再做网络预检并调用 `EgressGuard::install`。Windows 视为具备录屏权限。
 
-虚拟机检查通过后，Rust 启动其余准入步骤。只有 `admission_status` 返回 `ready` 时才开放登录窗口、会话检查、报名列表和考试入场。虚拟机检查通过后，即使其余准入步骤尚未通过，未配置监考服务地址时 `list_exams` 也返回 `monitor_unconfigured`。控制窗可重试代理、可达性、守卫安装和屏幕权限失败。管理员权限、部署配置、录屏权限要求重启或运行期守卫失效时，界面显示对应的操作指引。
+刚启动、等待批准与安装期间，Rust 拒绝打开 Accoding、读取会话、请求报名列表和进入考试。守卫返回已验证的句柄后，`admission_status` 才返回 `ready` 并开放这些操作。虚拟机预检通过后，若监考地址缺失，`list_exams` 仍返回 `monitor_unconfigured`。
 
-出站守卫归应用所有。录屏权限失败后的重试复用已安装的守卫，单次检查期间的并发重试共用同一次启动流程。客户端每 30 秒校验守卫。运行期校验失败时，Rust 阻止新入场并结束活动考试，界面提示联系监考人员后重新启动客户端。退出会等待正在安装的守卫返回，并在考试运行时收尾后撤销守卫。正常退出一场考试不撤销守卫。
+一次只运行一次准入检查。守卫由应用持有，每 30 秒复查。运行期校验失败时，Rust 阻止新入场并结束活动考试，界面提示联系监考人员后重新启动客户端。关闭一场考试时守卫继续运行。退出客户端会先结束并封存考试，再等待已开始的守卫安装并清理其状态。
 
-Release 桌面冒烟使用测试替身验证准入重试和守卫失效。`--native-admission-exit` 验证安装尚未返回时退出的顺序。真实 PF、WFP 和特权部署在隔离环境中验收。
+Release 桌面冒烟使用替身检查权限顺序、并发重试、macOS 等待批准和 PF 阻断，以及运行期守卫失效。`--native-admission-exit` 覆盖安装尚未返回时退出。签名 DMG、系统服务授权、真实 PF 与 WFP 在隔离环境中验收。
 
 ### 虚拟机预检
 
@@ -85,8 +83,6 @@ Release 桌面冒烟使用测试替身验证准入重试和守卫失效。`--nat
 - 查询只读。macOS 最长等待 5 秒。Windows 的 15 秒上限涵盖系统进程启动、CIM 加载及查询。关键读取失败、超时或证据冲突的诊断仅在本地保留预定义类别，内容不含设备序列号或唯一标识。`Detected` 显示阻断信息及退出入口。`Unknown` 显示原因和重试入口。初次结果返回前也禁止使用受限命令。
 - 新增本地命令 `vm_preflight`，输入 `{ retry: bool }`，返回 `{ status, reason }`，供控制窗显示状态。显式重试只在 `Unknown` 后重新读取系统信息。现有命令的名称、入参和成功载荷保持原契约。阻断时，`open_accoding` 和 `inspect_session` 返回本地提示，`list_exams` 返回 `preflight_blocked`。
 - 托管运行器的桌面冒烟仅在测试构建中使用预设结果。换用测试参数 `--native-vm-probe` 可记录当前系统原生探测的结果。部署验收还需记录实际 Windows 实体机（启用内存完整性）、Windows 虚拟机、Apple silicon 实体 Mac 和 Apple silicon macOS 虚拟机的系统版本及适用的虚拟机产品。
-
-屏幕权限探测与申请由 binary crate 内部实现，发生在应用启动流程中；未通过时 UI 展示阻断提示。`open_exam` 在启动流程全部通过后调用 `Exam::connect`。网络预检在应用启动和用户重试进入考试时执行，出站守卫在此时安装并保持到应用退出；`close_exam` 只释放考试运行时，应用退出时调用 `shutdown`。客户端每 30 秒调用 `EgressGuard::verify`；运行期校验失败时停止考试并提示用户。
 
 ## 受控浏览器规范
 

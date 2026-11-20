@@ -13,7 +13,16 @@ pub(in crate::desktop) struct Admission(Arc<Counters>);
 #[derive(Default)]
 struct Counters {
     proxy_once: AtomicBool,
+    #[cfg(target_os = "macos")]
     screen_once: AtomicBool,
+    #[cfg(target_os = "macos")]
+    approval_required: AtomicBool,
+    #[cfg(target_os = "macos")]
+    pf_blocked: AtomicBool,
+    #[cfg(target_os = "macos")]
+    settings_opens: AtomicUsize,
+    #[cfg(target_os = "macos")]
+    settings_opened: Notify,
     pause_install: AtomicBool,
     fail_verify: AtomicBool,
     installs: AtomicUsize,
@@ -31,7 +40,12 @@ impl Admission {
     pub(in crate::desktop) fn require_retry(&self) {
         self.pause();
         self.0.proxy_once.store(true, Ordering::Relaxed);
-        self.0.screen_once.store(true, Ordering::Relaxed);
+        #[cfg(target_os = "macos")]
+        {
+            self.0.screen_once.store(true, Ordering::Relaxed);
+            self.0.approval_required.store(true, Ordering::Relaxed);
+            self.0.pf_blocked.store(true, Ordering::Relaxed);
+        }
     }
 
     pub(in crate::desktop) async fn install_started(&self) {
@@ -58,21 +72,60 @@ impl Admission {
         self.0.verifies.load(Ordering::Relaxed)
     }
 
-    pub(super) async fn prepare(&self, guard_installed: bool) -> Result<Option<Guard>, Failure> {
+    pub(super) fn check_network(&self) -> Result<(), Failure> {
         if self.0.proxy_once.swap(false, Ordering::Relaxed) {
             return Err(Failure::ProxyConfigured);
         }
-        if guard_installed {
-            return Ok(None);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::desktop) fn grant_approval(&self) {
+        self.0.approval_required.store(false, Ordering::Relaxed);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::desktop) fn enable_pf(&self) {
+        self.0.pf_blocked.store(false, Ordering::Relaxed);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::desktop) fn settings_opens(&self) -> usize {
+        self.0.settings_opens.load(Ordering::Relaxed)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::desktop) async fn settings_opened(&self) {
+        self.0.settings_opened.notified().await;
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn open_approval_settings(&self) {
+        self.0.settings_opens.fetch_add(1, Ordering::Relaxed);
+        self.0.settings_opened.notify_one();
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn check_helper(&self) -> Result<(), Failure> {
+        if self.0.approval_required.load(Ordering::Relaxed) {
+            return Err(Failure::MacosApprovalRequired);
         }
+        if self.0.pf_blocked.load(Ordering::Relaxed) {
+            return Err(Failure::MacosUnsupportedPfConfiguration);
+        }
+        Ok(())
+    }
+
+    pub(super) async fn install(&self) -> Guard {
         self.0.installs.fetch_add(1, Ordering::Relaxed);
         self.0.installing.notify_one();
         if self.0.pause_install.swap(false, Ordering::Relaxed) {
             self.0.resume.notified().await;
         }
-        Ok(Some(Guard(Arc::clone(&self.0))))
+        Guard(Arc::clone(&self.0))
     }
 
+    #[cfg(target_os = "macos")]
     pub(super) fn screen(&self) -> Result<(), Failure> {
         if self.0.screen_once.swap(false, Ordering::Relaxed) {
             Err(Failure::ScreenPermission)
