@@ -20,6 +20,7 @@ use crate::NetworkError;
 const DIRECTORY: &str = "/Library/Application Support/com.cvbbmso";
 const STATE: &str = "/Library/Application Support/com.cvbbmso/egress.state";
 const LOCK: &str = "/Library/Application Support/com.cvbbmso/egress.lock";
+const LEASE_COUNTER: &str = "/Library/Application Support/com.cvbbmso/egress.lease-counter";
 const TTL_SECONDS: u64 = 15 * 60;
 const RENEW_AFTER_SECONDS: u64 = 5 * 60;
 
@@ -29,15 +30,18 @@ pub(crate) struct GuardState {
     pub(crate) parent: u32,
     pub(crate) watchdog: u32,
     expires_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) generation: Option<Generation>,
 }
 
 impl GuardState {
-    pub(crate) fn new(parent: u32) -> Self {
+    pub(crate) fn new(parent: u32, generation: Option<Generation>) -> Self {
         let mut state = Self {
-            version: 2,
+            version: if generation.is_some() { 3 } else { 2 },
             parent,
             watchdog: 0,
             expires_at_unix: 0,
+            generation,
         };
         state.renew();
         state
@@ -53,6 +57,56 @@ impl GuardState {
 
     pub(crate) fn renewal_due(&self) -> bool {
         self.expires_at_unix.saturating_sub(unix_now()) <= TTL_SECONDS - RENEW_AFTER_SECONDS
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(try_from = "String")]
+pub(crate) struct Generation(String);
+
+impl Generation {
+    /// Allocates a lease name under the recovery lock. The counter prevents
+    /// reuse, and entropy keeps names independent across fresh deployments.
+    pub(crate) fn allocate(commands: &dyn Commands) -> Result<Self, NetworkError> {
+        let current = commands.read(LEASE_COUNTER)?;
+        let current = current.as_deref().unwrap_or("0");
+        let next = current
+            .parse::<u64>()
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or(NetworkError::Io)?;
+        let nonce = lease_nonce()?;
+        commands.write(LEASE_COUNTER, &next.to_string())?;
+        Ok(Self(format!("{next:016x}{nonce:016x}")))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn lease_nonce() -> Result<u64, NetworkError> {
+    let mut nonce = 0u64;
+    // SAFETY: nonce is an initialized 8-byte output buffer.
+    if unsafe { libc::getentropy((&raw mut nonce).cast(), size_of::<u64>()) } != 0 {
+        return Err(NetworkError::Io);
+    }
+    Ok(nonce)
+}
+
+impl TryFrom<String> for Generation {
+    type Error = NetworkError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            Ok(Self(value))
+        } else {
+            Err(NetworkError::Policy)
+        }
     }
 }
 
@@ -75,9 +129,14 @@ pub(crate) fn read(commands: &dyn Commands) -> Result<Option<GuardState>, Networ
         serde_json::from_str::<serde_json::Value>(&encoded).map_err(|_| NetworkError::Io)?;
     match encoded.get("version").and_then(serde_json::Value::as_u64) {
         Some(1) => Ok(None), // The original implementation did not identify the owner.
-        Some(2) => serde_json::from_value(encoded)
-            .map(Some)
-            .map_err(|_| NetworkError::Io),
+        Some(2 | 3) => {
+            let state =
+                serde_json::from_value::<GuardState>(encoded).map_err(|_| NetworkError::Io)?;
+            if (state.version == 3) != state.generation.is_some() {
+                return Err(NetworkError::Io);
+            }
+            Ok(Some(state))
+        }
         _ => Err(NetworkError::Io),
     }
 }
@@ -185,12 +244,31 @@ mod tests {
     #[test]
     fn a_new_state_round_trips_before_the_watchdog_is_spawned() {
         let recorder = Recorder::default();
-        write(&recorder, &GuardState::new(1234)).unwrap();
+        write(&recorder, &GuardState::new(1234, None)).unwrap();
         let state = read(&recorder).unwrap().unwrap();
         assert_eq!(state.parent, 1234);
         assert_eq!(state.watchdog, 0);
         assert!(!state.expired());
         assert!(!state.renewal_due());
+    }
+
+    #[test]
+    fn versioned_state_carries_a_distinct_generation_and_rejects_missing_generations() {
+        let recorder = Recorder::default();
+        let first = Generation::allocate(&recorder).unwrap();
+        let second = Generation::allocate(&recorder).unwrap();
+        assert_ne!(first, second);
+        assert!(first.as_str().starts_with("0000000000000001"));
+        assert!(second.as_str().starts_with("0000000000000002"));
+        write(&recorder, &GuardState::new(1234, Some(second.clone()))).unwrap();
+        assert_eq!(read(&recorder).unwrap().unwrap().generation, Some(second));
+        recorder
+            .write(
+                STATE,
+                r#"{"version":3,"parent":1234,"watchdog":0,"expires_at_unix":0}"#,
+            )
+            .unwrap();
+        assert_eq!(read(&recorder).err(), Some(NetworkError::Io));
     }
 
     #[test]
@@ -207,7 +285,7 @@ mod tests {
 
     #[test]
     fn recovery_leaves_unknown_state_versions_in_place() {
-        let recorder = Recorder::with_file(STATE, r#"{"version":3}"#);
+        let recorder = Recorder::with_file(STATE, r#"{"version":4}"#);
         assert_eq!(read(&recorder).err(), Some(NetworkError::Io));
         assert!(recorder.contents(STATE).is_some());
     }

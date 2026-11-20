@@ -18,12 +18,22 @@ use std::time::{Duration, Instant};
 
 use crate::NetworkError;
 
+pub(crate) const CAPTURE_PID: &str = "Capture PID: ";
+
 /// Runs platform tools and reads or writes the files they need.
 #[cfg_attr(
     not(any(target_os = "macos", windows)),
     allow(dead_code, reason = "only the platform adapters call these methods")
 )]
 pub(crate) trait Commands {
+    /// Returns the wall clock used by the PF reference listing.
+    fn unix_seconds(&self) -> Result<u64, NetworkError> {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .map_err(|_| NetworkError::Io)
+    }
+
     /// Runs `program` and fails unless it exits successfully.
     fn run(&self, program: &str, args: &[&str]) -> Result<(), NetworkError>;
 
@@ -39,8 +49,14 @@ pub(crate) trait Commands {
     /// Reads a file, or returns `None` when it does not exist.
     fn read(&self, path: &str) -> Result<Option<String>, NetworkError>;
 
+    /// Returns the file's modification time in whole Unix seconds.
+    fn modified_seconds(&self, path: &str) -> Result<u64, NetworkError>;
+
     /// Writes a file, replacing its contents.
     fn write(&self, path: &str, contents: &str) -> Result<(), NetworkError>;
+
+    /// Creates a file atomically and refuses to replace an existing file.
+    fn write_new(&self, path: &str, contents: &str) -> Result<(), NetworkError>;
 
     /// Publishes a complete journal and removes its staging name atomically.
     fn publish(&self, staging: &str, path: &str) -> Result<(), NetworkError>;
@@ -88,6 +104,38 @@ impl<'a> SystemCommands<'a> {
         } else {
             Ok(())
         }
+    }
+
+    fn write_atomic(&self, path: &str, contents: &str, replace: bool) -> Result<(), NetworkError> {
+        self.ensure_settled()?;
+        let path = Path::new(path);
+        let directory = path.parent().ok_or(NetworkError::Io)?;
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(directory).map_err(|_| NetworkError::Io)?;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if replace && metadata.is_file() => {
+                temporary
+                    .as_file()
+                    .set_permissions(metadata.permissions())
+                    .map_err(|_| NetworkError::Io)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(NetworkError::Io),
+        }
+        temporary
+            .write_all(contents.as_bytes())
+            .map_err(|_| NetworkError::Io)?;
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|_| NetworkError::Io)?;
+        if replace {
+            temporary.persist(path)
+        } else {
+            temporary.persist_noclobber(path)
+        }
+        .map_err(|_| NetworkError::Io)?;
+        Ok(())
     }
 
     fn command(&self, program: &str, args: &[&str]) -> Result<Command, NetworkError> {
@@ -165,6 +213,26 @@ fn arm_child_alarm() -> std::io::Result<()> {
             return Err(std::io::Error::last_os_error());
         }
         libc::alarm(COMMAND_TIMEOUT_SECONDS);
+    }
+    Ok(())
+}
+
+fn write_capture_pid() -> std::io::Result<()> {
+    let mut line = *b"Capture PID: 0000000000\n";
+    // SAFETY: getpid is async-signal-safe and has no preconditions.
+    let mut pid = unsafe { libc::getpid() }.unsigned_abs();
+    for digit in line[CAPTURE_PID.len()..CAPTURE_PID.len() + 10]
+        .iter_mut()
+        .rev()
+    {
+        *digit += (pid % 10) as u8;
+        pid /= 10;
+    }
+    // SAFETY: before exec, STDOUT already points at the capture journal.
+    // The initialized buffer stays live throughout this async-signal-safe call.
+    let written = unsafe { libc::write(libc::STDOUT_FILENO, line.as_ptr().cast(), line.len()) };
+    if usize::try_from(written) != Ok(line.len()) {
+        return Err(std::io::Error::from_raw_os_error(libc::EIO));
     }
     Ok(())
 }
@@ -276,6 +344,9 @@ impl Commands for SystemCommands<'_> {
         command
             .stdout(journal.try_clone().map_err(|_| NetworkError::Io)?)
             .stderr(journal.try_clone().map_err(|_| NetworkError::Io)?);
+        // SAFETY: the hook only formats a PID in a stack buffer and calls
+        // async-signal-safe functions. A failed write prevents exec.
+        unsafe { command.pre_exec(write_capture_pid) };
         let result = self.execute(&mut command).and_then(command_result);
         result.and(journal.sync_all().map_err(|_| NetworkError::Io))
     }
@@ -288,31 +359,21 @@ impl Commands for SystemCommands<'_> {
         }
     }
 
+    fn modified_seconds(&self, path: &str) -> Result<u64, NetworkError> {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .map_err(|_| NetworkError::Io)?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .map_err(|_| NetworkError::Io)
+    }
+
     fn write(&self, path: &str, contents: &str) -> Result<(), NetworkError> {
-        self.ensure_settled()?;
-        let path = Path::new(path);
-        let directory = path.parent().ok_or(NetworkError::Io)?;
-        let mut temporary =
-            tempfile::NamedTempFile::new_in(directory).map_err(|_| NetworkError::Io)?;
-        match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_file() => {
-                temporary
-                    .as_file()
-                    .set_permissions(metadata.permissions())
-                    .map_err(|_| NetworkError::Io)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            _ => return Err(NetworkError::Io),
-        }
-        temporary
-            .write_all(contents.as_bytes())
-            .map_err(|_| NetworkError::Io)?;
-        temporary
-            .as_file()
-            .sync_all()
-            .map_err(|_| NetworkError::Io)?;
-        temporary.persist(path).map_err(|_| NetworkError::Io)?;
-        Ok(())
+        self.write_atomic(path, contents, true)
+    }
+
+    fn write_new(&self, path: &str, contents: &str) -> Result<(), NetworkError> {
+        self.write_atomic(path, contents, false)
     }
 
     fn publish(&self, staging: &str, path: &str) -> Result<(), NetworkError> {
@@ -382,7 +443,17 @@ mod tests {
             commands.capture("/bin/sh", &["-c", "printf diagnostic >&2; exit 2"], path),
             Err(NetworkError::Platform)
         );
-        assert_eq!(fs::read_to_string(path).unwrap(), "diagnostic");
+        let contents = fs::read_to_string(path).unwrap();
+        let (header, output) = contents.split_once('\n').unwrap();
+        assert!(
+            header
+                .strip_prefix(CAPTURE_PID)
+                .unwrap()
+                .parse::<u32>()
+                .unwrap()
+                > 1
+        );
+        assert_eq!(output, "diagnostic");
     }
 
     #[test]
@@ -397,7 +468,9 @@ mod tests {
             ),
             Err(NetworkError::Io),
         );
-        assert_eq!(fs::read_to_string(journal).unwrap(), "Token : 42\n");
+        let contents = fs::read_to_string(journal).unwrap();
+        assert!(contents.starts_with(CAPTURE_PID));
+        assert!(contents.ends_with("\nToken : 42\n"));
     }
 
     #[test]
@@ -473,7 +546,7 @@ mod tests {
 pub(crate) mod testing {
     //! Recording implementation of [`Commands`] used by the adapter tests.
 
-    use super::{Commands, Diagnostic};
+    use super::{CAPTURE_PID, Commands, Diagnostic};
     use crate::NetworkError;
     use std::cell::RefCell;
     use std::collections::{HashMap, VecDeque};
@@ -545,6 +618,10 @@ pub(crate) mod testing {
     }
 
     impl Commands for Recorder {
+        fn unix_seconds(&self) -> Result<u64, NetworkError> {
+            Ok(1_800_000_000)
+        }
+
         fn run(&self, program: &str, args: &[&str]) -> Result<(), NetworkError> {
             self.calls.borrow_mut().push(Call::Run(
                 program.to_owned(),
@@ -567,11 +644,16 @@ pub(crate) mod testing {
 
         fn capture(&self, program: &str, args: &[&str], path: &str) -> Result<(), NetworkError> {
             let output = self.output(program, args)?;
-            self.write(path, &output)
+            self.write(path, &format!("{CAPTURE_PID}0000000202\n{output}"))
         }
 
         fn read(&self, path: &str) -> Result<Option<String>, NetworkError> {
             Ok(self.files.borrow().get(path).cloned())
+        }
+
+        fn modified_seconds(&self, path: &str) -> Result<u64, NetworkError> {
+            self.contents(path).ok_or(NetworkError::Io)?;
+            self.unix_seconds()
         }
 
         fn write(&self, path: &str, contents: &str) -> Result<(), NetworkError> {
@@ -579,6 +661,13 @@ pub(crate) mod testing {
                 .borrow_mut()
                 .insert(path.to_owned(), contents.to_owned());
             Ok(())
+        }
+
+        fn write_new(&self, path: &str, contents: &str) -> Result<(), NetworkError> {
+            if self.files.borrow().contains_key(path) {
+                return Err(NetworkError::Io);
+            }
+            self.write(path, contents)
         }
 
         fn publish(&self, staging: &str, path: &str) -> Result<(), NetworkError> {

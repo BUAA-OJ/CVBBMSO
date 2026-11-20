@@ -6,7 +6,7 @@
 //! has nothing to undo, and the watchdog only covers the macOS adapter.
 #![allow(unsafe_code, reason = "WFP has no safe binding")]
 
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -14,14 +14,14 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_ACTION_TYPE, FWP_CONDITION_VALUE0,
     FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_UINT8, FWP_UINT16, FWP_V4_ADDR_AND_MASK,
     FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0,
-    FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_IP_LOCAL_PORT, FWPM_CONDITION_IP_PROTOCOL,
-    FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0,
-    FWPM_FILTER_CONDITION0, FWPM_FILTER_FLAG_DISABLED, FWPM_FILTER0,
-    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-    FWPM_LAYER_OUTBOUND_TRANSPORT_V4, FWPM_LAYER_OUTBOUND_TRANSPORT_V6, FWPM_SESSION_FLAG_DYNAMIC,
-    FWPM_SESSION0, FWPM_SUBLAYER0, FWPM_TXN_READ_ONLY, FwpmEngineClose0, FwpmEngineOpen0,
-    FwpmFilterAdd0, FwpmFilterDeleteById0, FwpmFilterGetById0, FwpmFreeMemory0, FwpmSubLayerAdd0,
-    FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
+    FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_IP_PROTOCOL, FWPM_CONDITION_IP_REMOTE_ADDRESS,
+    FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0, FWPM_FILTER_CONDITION0,
+    FWPM_FILTER_FLAG_DISABLED, FWPM_FILTER0, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_LAYER_OUTBOUND_TRANSPORT_V4,
+    FWPM_LAYER_OUTBOUND_TRANSPORT_V6, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SESSION0, FWPM_SUBLAYER0,
+    FWPM_TXN_READ_ONLY, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteById0,
+    FwpmFilterGetById0, FwpmFreeMemory0, FwpmSubLayerAdd0, FwpmTransactionAbort0,
+    FwpmTransactionBegin0, FwpmTransactionCommit0,
 };
 use windows_sys::Win32::Security::{
     GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
@@ -44,7 +44,6 @@ const PERMIT_WEIGHT: u8 = 5;
 const PROTOCOL_TCP: u8 = 6;
 /// IP protocol numbers used in conditions.
 const PROTOCOL_UDP: u8 = 17;
-const PROTOCOL_ICMPV6: u8 = 58;
 const ALE_LAYERS: [GUID; 2] = [
     FWPM_LAYER_ALE_AUTH_CONNECT_V4,
     FWPM_LAYER_ALE_AUTH_CONNECT_V6,
@@ -307,8 +306,6 @@ enum ConditionSpec {
     Protocol(u8),
     /// Matches a remote port.
     Port(u16),
-    /// Matches the ICMP type, which aliases the local port at transport.
-    IcmpType(u16),
 }
 
 /// Adds one filter owned by the guard sublayer.
@@ -422,15 +419,6 @@ impl OwnedCondition {
                     _mask_v6: None,
                 }
             }
-            ConditionSpec::IcmpType(kind) => {
-                let mut condition = condition_of(FWPM_CONDITION_IP_LOCAL_PORT, FWP_UINT16);
-                condition.conditionValue.Anonymous = FWP_CONDITION_VALUE0_0 { uint16: *kind };
-                Self {
-                    condition,
-                    _mask_v4: None,
-                    _mask_v6: None,
-                }
-            }
         }
     }
 }
@@ -468,46 +456,72 @@ fn prefix_mask_v4(prefix: u8) -> u32 {
 fn filter_specs(plan: &Plan) -> Vec<FilterSpec> {
     // Receiving a TCP SYN is authorized at RECV_ACCEPT, so its SYN-ACK and
     // later replies need per-packet filtering even when ALE_CONNECT is absent.
-    [ALE_LAYERS, TRANSPORT_LAYERS]
-        .into_iter()
-        .flat_map(|layers| layer_filters(plan, layers))
-        .chain(neighbor_discovery())
-        .collect()
+    let mut specifications = Vec::new();
+    for layer in ALE_LAYERS {
+        specifications.push(block(layer, Vec::new()));
+    }
+    // Keep the platform's IPv6 control traffic, including neighbor detection
+    // to on-link unicast addresses, outside the new per-packet checks.
+    for layer in TRANSPORT_LAYERS {
+        for protocol in [PROTOCOL_TCP, PROTOCOL_UDP] {
+            specifications.push(block(layer, vec![ConditionSpec::Protocol(protocol)]));
+        }
+    }
+    specifications.extend(layer_permits(plan, ALE_LAYERS, &[None]));
+    specifications.extend(layer_permits(
+        plan,
+        TRANSPORT_LAYERS,
+        &[Some(PROTOCOL_TCP), Some(PROTOCOL_UDP)],
+    ));
+    specifications
 }
 
-fn layer_filters(plan: &Plan, layers: [GUID; 2]) -> Vec<FilterSpec> {
-    let [ipv4, ipv6] = layers;
-    let mut specifications = layers
-        .into_iter()
-        .map(|layer| FilterSpec {
-            layer,
-            weight: BLOCK_WEIGHT,
-            action: FWP_ACTION_BLOCK,
-            conditions: Vec::new(),
-        })
-        .collect::<Vec<_>>();
+fn block(layer: GUID, conditions: Vec<ConditionSpec>) -> FilterSpec {
+    FilterSpec {
+        layer,
+        weight: BLOCK_WEIGHT,
+        action: FWP_ACTION_BLOCK,
+        conditions,
+    }
+}
 
+fn layer_permits(
+    plan: &Plan,
+    layers: [GUID; 2],
+    loopback_protocols: &[Option<u8>],
+) -> Vec<FilterSpec> {
+    let [ipv4, ipv6] = layers;
     // Loopback for local IPC.
-    specifications.push(permit(
-        ipv4,
-        ConditionSpec::AddressV4(LOOPBACK_V4.0, LOOPBACK_V4.1),
-        Vec::new(),
-    ));
-    specifications.push(permit(
-        ipv6,
-        ConditionSpec::AddressV6(LOOPBACK_V6.0, LOOPBACK_V6.1),
-        Vec::new(),
-    ));
-    specifications.push(permit(
-        ipv6,
-        ConditionSpec::AddressV6(
-            std::net::Ipv4Addr::from(LOOPBACK_V4.0)
-                .to_ipv6_mapped()
-                .octets(),
-            128,
-        ),
-        Vec::new(),
-    ));
+    let mut specifications = Vec::new();
+    for protocol in loopback_protocols {
+        let conditions = || {
+            protocol
+                .iter()
+                .copied()
+                .map(ConditionSpec::Protocol)
+                .collect()
+        };
+        specifications.push(permit(
+            ipv4,
+            ConditionSpec::AddressV4(LOOPBACK_V4.0, LOOPBACK_V4.1),
+            conditions(),
+        ));
+        specifications.push(permit(
+            ipv6,
+            ConditionSpec::AddressV6(LOOPBACK_V6.0, LOOPBACK_V6.1),
+            conditions(),
+        ));
+        specifications.push(permit(
+            ipv6,
+            ConditionSpec::AddressV6(
+                std::net::Ipv4Addr::from(LOOPBACK_V4.0)
+                    .to_ipv6_mapped()
+                    .octets(),
+                128,
+            ),
+            conditions(),
+        ));
+    }
 
     for service in &plan.services {
         let protocol = match service.transport {
@@ -569,32 +583,6 @@ fn permit_address(
     )])
 }
 
-fn neighbor_discovery() -> impl Iterator<Item = FilterSpec> {
-    let all_routers = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
-    let all_nodes = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
-    let solicited_node = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 1, 0xff00, 0);
-    let link_local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0);
-    [
-        (133, all_routers, 128),
-        (135, solicited_node, 104),
-        (135, link_local, 10),
-        (136, all_nodes, 128),
-        (136, link_local, 10),
-    ]
-    .into_iter()
-    .map(|(kind, destination, prefix)| {
-        permit(
-            TRANSPORT_LAYERS[1],
-            ConditionSpec::AddressV6(destination.octets(), prefix),
-            vec![
-                ConditionSpec::Protocol(PROTOCOL_ICMPV6),
-                ConditionSpec::IcmpType(kind),
-                ConditionSpec::Port(0),
-            ],
-        )
-    })
-}
-
 fn permit(layer: GUID, address: ConditionSpec, mut conditions: Vec<ConditionSpec>) -> FilterSpec {
     conditions.insert(0, address);
     FilterSpec {
@@ -645,7 +633,7 @@ fn require_elevated() -> Result<(), NetworkError> {
 mod tests {
     use super::*;
     use crate::egress::policy::{Plan, Target};
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn plan() -> Plan {
         Plan::new(
@@ -659,12 +647,24 @@ mod tests {
     #[test]
     fn a_block_filter_exists_for_both_families_at_connect_and_transport() {
         let specifications = filter_specs(&plan());
-        for layer in ALE_LAYERS.into_iter().chain(TRANSPORT_LAYERS) {
+        for layer in ALE_LAYERS {
             assert!(specifications.iter().any(|specification| {
                 same_layer(specification.layer, layer)
                     && specification.action == FWP_ACTION_BLOCK
                     && specification.conditions.is_empty()
             }));
+        }
+        for layer in TRANSPORT_LAYERS {
+            let blocks = specifications
+                .iter()
+                .filter(|spec| same_layer(spec.layer, layer) && spec.action == FWP_ACTION_BLOCK)
+                .collect::<Vec<_>>();
+            assert_eq!(blocks.len(), 2);
+            for protocol in [PROTOCOL_TCP, PROTOCOL_UDP] {
+                assert!(blocks.iter().any(|spec| matches!(
+                    &spec.conditions[..], [ConditionSpec::Protocol(found)] if *found == protocol
+                )));
+            }
         }
     }
 
@@ -702,20 +702,35 @@ mod tests {
     }
 
     #[test]
-    fn transport_neighbor_discovery_uses_scoped_zero_code_types() {
-        let specs = neighbor_discovery().collect::<Vec<_>>();
-        assert_eq!(specs.len(), 5);
-        for spec in specs {
-            assert!(same_layer(spec.layer, TRANSPORT_LAYERS[1]));
-            assert!(matches!(
-                &spec.conditions[..],
-                [
-                    ConditionSpec::AddressV6(_, 10 | 104 | 128),
-                    ConditionSpec::Protocol(PROTOCOL_ICMPV6),
-                    ConditionSpec::IcmpType(133 | 135 | 136),
-                    ConditionSpec::Port(0)
-                ]
-            ));
+    fn transport_leaves_neighbor_discovery_to_the_host_and_ale_is_unchanged() {
+        let specs = filter_specs(&plan());
+        for (layer, expected) in [
+            (TRANSPORT_LAYERS[1], None),
+            (ALE_LAYERS[1], Some(FWP_ACTION_BLOCK)),
+        ] {
+            for address in [
+                "2001:db8::10",
+                "fd00::10",
+                "fe80::10",
+                "ff02::1:ff00:10",
+                "2001:db8:1::10",
+            ] {
+                let address = address.parse::<Ipv6Addr>().unwrap().octets();
+                let matched = specs
+                    .iter()
+                    .filter(|spec| {
+                        same_layer(spec.layer, layer)
+                            && spec.conditions.iter().all(|condition| match condition {
+                                ConditionSpec::Protocol(protocol) => *protocol == 58,
+                                ConditionSpec::AddressV6(destination, 128) => {
+                                    *destination == address
+                                }
+                                _ => false,
+                            })
+                    })
+                    .max_by_key(|spec| spec.weight);
+                assert_eq!(matched.map(|spec| spec.action), expected);
+            }
         }
     }
 

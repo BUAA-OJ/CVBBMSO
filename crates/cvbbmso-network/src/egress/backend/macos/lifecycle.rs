@@ -8,19 +8,22 @@ use std::time::Duration;
 
 use crate::NetworkError;
 use crate::egress::backend::InstallResult;
-use crate::egress::cleanup;
-use crate::egress::commands::{Commands, SystemCommands};
+use crate::egress::cleanup::Job;
+use crate::egress::commands::{Commands, Diagnostic, SystemCommands};
 use crate::egress::policy::Plan;
-use crate::egress::state::{self, GuardState};
+use crate::egress::state::{self, Generation, GuardState};
 
 use super::{
     PfGuard, has_enable_record, install_with, local_addresses, recover_with, verify_deployment,
 };
 
 pub(crate) const HELPER: &str = "/Library/PrivilegedHelperTools/com.cvbbmso.egress-watchdog";
+const CAPABILITIES: &str = "--capabilities";
+const LEASE_CAPABILITY: &str = "cvbbmso-egress-leases-v2";
 
 pub(crate) struct Prepared {
     lock: File,
+    versioned_helper: bool,
 }
 
 impl Prepared {
@@ -33,7 +36,9 @@ impl Prepared {
             state::check_protected(Path::new(path), true)?;
         }
         state::check_protected(Path::new(HELPER), false)?;
-        verify_deployment(&SystemCommands::new(None))?;
+        let commands = SystemCommands::new(None);
+        let versioned_helper = supports_versioned_leases(&commands)?;
+        verify_deployment(&commands)?;
         let lock = state::lock()?;
         let commands = SystemCommands::new(Some(&lock));
         verify_deployment(&commands)?;
@@ -43,24 +48,32 @@ impl Prepared {
             return Err(NetworkError::Platform);
         }
         recover(&commands)?;
-        Ok(Self { lock })
+        Ok(Self {
+            lock,
+            versioned_helper,
+        })
     }
 
     pub(crate) fn install(self, plan: &Plan) -> Result<InstallResult, NetworkError> {
         let commands = SystemCommands::new(Some(&self.lock));
-        let mut guard_state = GuardState::new(std::process::id());
+        let generation = self
+            .versioned_helper
+            .then(|| Generation::allocate(&commands))
+            .transpose()?;
+        let mut guard_state = GuardState::new(std::process::id(), generation.clone());
+        let job = Job::new(generation);
         state::write(&commands, &guard_state)?;
-        let mut watchdog = match Watchdog::start() {
+        let mut watchdog = match Watchdog::start(job.clone()) {
             Ok(watchdog) => watchdog,
             Err(error) => {
-                recover(&commands)?;
+                recover_job(&commands, &job)?;
                 return Err(error);
             }
         };
         guard_state.watchdog = watchdog.child.id();
         let result = (|| {
             state::write(&commands, &guard_state)?;
-            cleanup::schedule(&commands)?;
+            job.schedule(&commands)?;
             install_with(&commands, plan, &local_addresses()?)
         })();
         match result {
@@ -69,7 +82,7 @@ impl Prepared {
                 watchdog: Mutex::new(Some(watchdog)),
             })),
             Err(error) => {
-                recover(&commands)?;
+                recover_job(&commands, &job)?;
                 watchdog.stop();
                 Err(error)
             }
@@ -77,25 +90,52 @@ impl Prepared {
     }
 }
 
+fn supports_versioned_leases(commands: &dyn Commands) -> Result<bool, NetworkError> {
+    match commands.diagnostic(HELPER, &[CAPABILITIES])? {
+        Diagnostic::Success(output) if output.trim() == LEASE_CAPABILITY => Ok(true),
+        Diagnostic::Rejected(output) if output.trim() == NetworkError::Policy.to_string() => {
+            Ok(false)
+        }
+        _ => Err(NetworkError::Platform),
+    }
+}
+
 pub(super) fn recover(commands: &dyn Commands) -> Result<(), NetworkError> {
+    if let Some(state) = state::read(commands)? {
+        recover_job(commands, &Job::new(state.generation))
+    } else if let Some(pending) = Job::pending(commands)? {
+        pending.finish_cleanup(commands)
+    } else {
+        recover_job(commands, &Job::Legacy)
+    }
+}
+
+pub(super) fn recover_job(commands: &dyn Commands, job: &Job) -> Result<(), NetworkError> {
     recover_with(commands)?;
+    job.record_cleanup(commands)?;
     state::remove(commands)?;
-    cleanup::cancel(commands)
+    job.finish_cleanup(commands)
 }
 
 pub(super) struct Watchdog {
     child: Child,
+    pub(super) job: Job,
 }
 
 impl Watchdog {
-    fn start() -> Result<Self, NetworkError> {
-        let child = std::process::Command::new(HELPER)
-            .args(["--watch", &std::process::id().to_string()])
+    fn start(job: Job) -> Result<Self, NetworkError> {
+        let parent = std::process::id().to_string();
+        let mut command = std::process::Command::new(HELPER);
+        match &job {
+            Job::Legacy => command.args(["--watch", &parent]),
+            Job::Lease(generation) => command.args(["--watch-lease", &parent, generation.as_str()]),
+        };
+        let child = command
             .env_clear()
             .stdin(Stdio::piped())
             .spawn()
             .map_err(|_| NetworkError::Io)?;
-        Ok(Self { child })
+        Ok(Self { child, job })
     }
 
     pub(super) fn owns_state(&self) -> Result<bool, NetworkError> {
@@ -119,7 +159,9 @@ impl Watchdog {
     }
 
     fn owns(&self, state: &GuardState) -> bool {
-        state.parent == std::process::id() && state.watchdog == self.child.id()
+        state.parent == std::process::id()
+            && state.watchdog == self.child.id()
+            && matches_job(state, &self.job)
     }
 
     pub(super) fn stop(&mut self) {
@@ -141,11 +183,27 @@ fn process_alive(pid: u32) -> bool {
 pub(crate) fn watchdog_entry() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let result = match args.as_slice() {
-        [flag] if flag == "--recover" => recovery_tick(None).map(drop),
+        [flag] if flag == CAPABILITIES => {
+            println!("{LEASE_CAPABILITY}");
+            Ok(())
+        }
+        [flag] if flag == "--recover" => recovery_tick(&Job::Legacy, None).map(drop),
+        [flag, generation] if flag == "--recover-lease" => {
+            Generation::try_from(generation.to_owned())
+                .and_then(|generation| recovery_tick(&Job::Lease(generation), None))
+                .map(drop)
+        }
         [flag, parent] if flag == "--watch" => parent
             .parse::<u32>()
             .map_err(|_| NetworkError::Policy)
-            .map(watch_until_recovered),
+            .map(|parent| watch_until_recovered(&Job::Legacy, parent)),
+        [flag, parent, generation] if flag == "--watch-lease" => {
+            Generation::try_from(generation.to_owned()).and_then(|generation| {
+                let parent = parent.parse::<u32>().map_err(|_| NetworkError::Policy)?;
+                watch_until_recovered(&Job::Lease(generation), parent);
+                Ok(())
+            })
+        }
         _ => Err(NetworkError::Policy),
     };
     if let Err(error) = result {
@@ -156,10 +214,10 @@ pub(crate) fn watchdog_entry() -> ExitCode {
     }
 }
 
-fn watch_until_recovered(parent: u32) {
+fn watch_until_recovered(job: &Job, parent: u32) {
     let mut reported = false;
     loop {
-        match recovery_tick(Some(parent)) {
+        match recovery_tick(job, Some(parent)) {
             Ok(true) => return,
             Ok(false) => reported = false,
             Err(error) if !reported => {
@@ -172,12 +230,23 @@ fn watch_until_recovered(parent: u32) {
     }
 }
 
-fn recovery_tick(parent: Option<u32>) -> Result<bool, NetworkError> {
+fn recovery_tick(job: &Job, parent: Option<u32>) -> Result<bool, NetworkError> {
     let lock = state::lock()?;
     let commands = SystemCommands::new(Some(&lock));
-    let Some(state) = state::read(&commands)? else {
-        return recover_without_owner(&commands, parent);
+    recovery_tick_with(&commands, job, parent)
+}
+
+fn recovery_tick_with(
+    commands: &dyn Commands,
+    job: &Job,
+    parent: Option<u32>,
+) -> Result<bool, NetworkError> {
+    let Some(state) = state::read(commands)? else {
+        return recover_without_owner(commands, job, parent);
     };
+    if !matches_job(&state, job) {
+        return retire_if_scheduled(commands, job, parent);
+    }
     // SAFETY: getppid has no preconditions. The kernel reparents an orphan
     // instead of associating it with an unrelated process that reuses a PID.
     let real_parent = u32::try_from(unsafe { libc::getppid() }).ok();
@@ -193,21 +262,47 @@ fn recovery_tick(parent: Option<u32>) -> Result<bool, NetworkError> {
         None => state.expired() || !process_alive(state.parent),
     };
     if recover_now {
-        recover(&commands)?;
+        recover_job(commands, job)?;
     }
     Ok(recover_now)
 }
 
 fn recover_without_owner(
     commands: &dyn Commands,
+    job: &Job,
     parent: Option<u32>,
 ) -> Result<bool, NetworkError> {
-    if cleanup::pending(commands)? {
+    if let Some(pending) = Job::pending(commands)? {
         // PF and its owner record were already cleared. The watchdog or
         // the next scheduled run can finish just the outstanding bootout.
-        cleanup::cancel(commands)?;
+        if pending == *job {
+            pending.finish_cleanup(commands)?;
+        } else {
+            return retire_if_scheduled(commands, job, parent);
+        }
+    } else if *job != Job::Legacy {
+        return retire_if_scheduled(commands, job, parent);
     } else if parent.is_none() || has_enable_record(commands)? {
-        recover(commands)?;
+        recover_job(commands, job)?;
+    }
+    Ok(true)
+}
+
+fn matches_job(state: &GuardState, job: &Job) -> bool {
+    match (job, &state.generation) {
+        (Job::Legacy, None) => true,
+        (Job::Lease(expected), Some(active)) => expected == active,
+        _ => false,
+    }
+}
+
+fn retire_if_scheduled(
+    commands: &dyn Commands,
+    job: &Job,
+    parent: Option<u32>,
+) -> Result<bool, NetworkError> {
+    if matches!(job, Job::Lease(_)) && parent.is_none() {
+        job.unload(commands)?;
     }
     Ok(true)
 }
@@ -243,15 +338,131 @@ mod tests {
     const DOMAIN: &str = "system/com.cvbbmso.egress-cleanup";
 
     #[test]
+    fn only_the_recognized_legacy_helper_allows_downgrade() {
+        let recorder = Recorder::default();
+        recorder.reply(&[CAPABILITIES], Ok(LEASE_CAPABILITY));
+        assert_eq!(supports_versioned_leases(&recorder), Ok(true));
+        recorder.rejected(&[CAPABILITIES], &NetworkError::Policy.to_string());
+        assert_eq!(supports_versioned_leases(&recorder), Ok(false));
+        recorder.rejected(&[CAPABILITIES], "Permission denied");
+        assert_eq!(
+            supports_versioned_leases(&recorder),
+            Err(NetworkError::Platform)
+        );
+        recorder.reply(&[CAPABILITIES], Err(NetworkError::Io));
+        assert_eq!(supports_versioned_leases(&recorder), Err(NetworkError::Io));
+        assert!(
+            recorder
+                .calls()
+                .iter()
+                .all(|call| matches!(call, Call::Output(program, _) if program == HELPER))
+        );
+    }
+
+    #[test]
+    fn delayed_helpers_and_unloads_cannot_recover_another_lease() {
+        for first in [
+            Job::Legacy,
+            Job::Lease(
+                Generation::try_from("10000000000000000000000000000000".to_owned()).unwrap(),
+            ),
+        ] {
+            let recorder = Recorder::default();
+            let (first_path, first_domain, absence) = match &first {
+                Job::Legacy => (
+                    "/Library/LaunchDaemons/com.cvbbmso.egress-cleanup.plist".to_owned(),
+                    DOMAIN.to_owned(),
+                    "Could not find service \"com.cvbbmso.egress-cleanup\" in domain for system"
+                        .to_owned(),
+                ),
+                Job::Lease(generation) => {
+                    let label = format!("com.cvbbmso.egress-cleanup.v2.{}", generation.as_str());
+                    (
+                        format!("/Library/LaunchDaemons/{label}.plist"),
+                        format!("system/{label}"),
+                        format!("Could not find service \"{label}\" in domain for system"),
+                    )
+                }
+            };
+            state::write(
+                &recorder,
+                &GuardState::new(
+                    1234,
+                    match &first {
+                        Job::Legacy => None,
+                        Job::Lease(generation) => Some(generation.clone()),
+                    },
+                ),
+            )
+            .unwrap();
+            recorder.reply(&["bootstrap", "system", &first_path], Err(NetworkError::Io));
+            assert_eq!(first.schedule(&recorder), Err(NetworkError::Io));
+            recorder.reply(&["bootout", &first_domain], Err(NetworkError::Io));
+            assert_eq!(recover(&recorder), Err(NetworkError::Io));
+            assert_eq!(Job::pending(&recorder).unwrap(), Some(first.clone()));
+            assert!(state::read(&recorder).unwrap().is_none());
+            assert!(recorder.contents(&first_path).is_none());
+            recorder.rejected(&["bootout", &first_domain], "Boot-out failed");
+            recorder.rejected(&["print", &first_domain], &absence);
+            recover(&recorder).unwrap();
+
+            let generation = Generation::allocate(&recorder).unwrap();
+            let next = Job::Lease(generation.clone());
+            state::write(
+                &recorder,
+                &GuardState::new(u32::MAX, Some(generation.clone())),
+            )
+            .unwrap();
+            next.schedule(&recorder).unwrap();
+            recorder.write(RULES, "next lease owns PF").unwrap();
+            let next_label = format!("com.cvbbmso.egress-cleanup.v2.{}", generation.as_str());
+            let next_domain = format!("system/{next_label}");
+            let next_path = format!("/Library/LaunchDaemons/{next_label}.plist");
+            assert_ne!(first_domain, next_domain);
+            assert_ne!(first_path, next_path);
+            // Replay the two timed-out RPCs after the new job is live. Bootstrap
+            // cannot read its old definition and bootout only names the old job.
+            let mut loaded = std::collections::BTreeSet::from([next_domain.as_str()]);
+            assert!(recorder.contents(&first_path).is_none());
+            loaded.remove(first_domain.as_str());
+            assert!(loaded.contains(next_domain.as_str()));
+
+            recorder.calls.borrow_mut().clear();
+            assert_eq!(recovery_tick_with(&recorder, &first, Some(1234)), Ok(true));
+            assert_eq!(recovery_tick_with(&recorder, &first, None), Ok(true));
+            assert!(
+                recorder
+                    .calls()
+                    .iter()
+                    .all(|call| matches!(call, Call::Run(program, args)
+                if program == "/bin/launchctl" && args == &["bootout", first_domain.as_str()]))
+            );
+            assert_eq!(
+                recorder.contents(RULES).as_deref(),
+                Some("next lease owns PF")
+            );
+            assert!(recorder.contents(&next_path).is_some());
+            assert_eq!(
+                state::read(&recorder).unwrap().unwrap().generation,
+                Some(generation)
+            );
+        }
+    }
+
+    #[test]
     fn a_new_helper_can_resume_after_the_old_helper_clears_the_anchor_and_owner() {
         for (capture, expected_release, result) in [
-            ("pf enabled\nToken : 42\n", true, Ok(true)),
+            (
+                "Capture PID: 0000000202\npf enabled\nToken : 42\n",
+                true,
+                Ok(true),
+            ),
             ("pf enabled\nToken : 4", false, Err(NetworkError::Io)),
         ] {
             let recorder = Recorder::with_file(ENABLE_CAPTURE, capture);
             recorder.write(ENABLE_BASELINE, "[4]").unwrap();
             recorder.write(RULES, "block drop out quick all").unwrap();
-            state::write(&recorder, &GuardState::new(1234)).unwrap();
+            state::write(&recorder, &GuardState::new(1234, None)).unwrap();
 
             // The old helper has no token at its legacy path. It flushes the
             // anchor and clears the owner and job using only its own files.
@@ -273,7 +484,10 @@ mod tests {
                     "101 Host Firewall 4 0 days 00:00:03\n",
                 )),
             );
-            assert_eq!(recover_without_owner(&recorder, Some(1234)), result);
+            assert_eq!(
+                recover_without_owner(&recorder, &Job::Legacy, Some(1234)),
+                result
+            );
             let releases = recorder
                 .calls()
                 .into_iter()
@@ -296,19 +510,19 @@ mod tests {
     fn surviving_recovery_retries_bootout_after_the_guard_state_is_removed() {
         for parent in [Some(1234), None] {
             let recorder = Recorder::default();
-            state::write(&recorder, &GuardState::new(1234)).unwrap();
+            state::write(&recorder, &GuardState::new(1234, None)).unwrap();
             recorder.reply(&["bootout", DOMAIN], Err(NetworkError::Io));
             assert_eq!(recover(&recorder), Err(NetworkError::Io));
             assert!(state::read(&recorder).unwrap().is_none());
-            assert!(cleanup::pending(&recorder).unwrap());
+            assert_eq!(Job::pending(&recorder).unwrap(), Some(Job::Legacy));
 
             recorder.calls.borrow_mut().clear();
             recorder.reply(&["bootout", DOMAIN], Err(NetworkError::Io));
             assert_eq!(
-                recover_without_owner(&recorder, parent),
+                recover_without_owner(&recorder, &Job::Legacy, parent),
                 Err(NetworkError::Io)
             );
-            assert!(cleanup::pending(&recorder).unwrap());
+            assert_eq!(Job::pending(&recorder).unwrap(), Some(Job::Legacy));
 
             // The original RPC may have removed the task after the timeout.
             recorder.rejected(&["bootout", DOMAIN], "Boot-out failed");
@@ -316,8 +530,11 @@ mod tests {
                 &["print", DOMAIN],
                 "Could not find service \"com.cvbbmso.egress-cleanup\" in domain for system",
             );
-            assert_eq!(recover_without_owner(&recorder, parent), Ok(true));
-            assert!(!cleanup::pending(&recorder).unwrap());
+            assert_eq!(
+                recover_without_owner(&recorder, &Job::Legacy, parent),
+                Ok(true)
+            );
+            assert_eq!(Job::pending(&recorder).unwrap(), None);
             assert!(recorder.calls().iter().all(|call| match call {
                 Call::Run(program, _) | Call::Output(program, _) => program == "/bin/launchctl",
             }));
