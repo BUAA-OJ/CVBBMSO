@@ -66,7 +66,7 @@ jobs:
         run: cargo test --locked -p cvbbmso-network --lib egress::backend::windows
       - name: Test macOS egress with substitutes and PF syntax checks
         if: matrix.os == 'macos-latest'
-        run: cargo test --locked -p cvbbmso-network --lib egress::
+        run: cargo test --locked -p cvbbmso-network --lib 'egress::'
 
   deny:
     name: Dependency policy
