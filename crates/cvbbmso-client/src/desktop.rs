@@ -1,5 +1,6 @@
 use std::{io, path::PathBuf};
 
+mod exam;
 #[cfg(test)]
 mod smoke;
 
@@ -34,6 +35,8 @@ struct Desktop {
     monitor: Result<Monitor, MonitorError>,
     #[cfg(test)]
     blocked: Option<tokio::sync::mpsc::UnboundedSender<(&'static str, Url)>>,
+    #[cfg(test)]
+    fixture_exam_admission: bool,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -65,6 +68,8 @@ impl Desktop {
             monitor: Monitor::new(origin),
             #[cfg(test)]
             blocked: None,
+            #[cfg(test)]
+            fixture_exam_admission: false,
         })
     }
 }
@@ -73,8 +78,15 @@ pub fn run() -> tauri::Result<()> {
     #[cfg(test)]
     {
         match std::env::args().nth(1).as_deref() {
-            Some("--native-smoke") => return smoke::run(false),
-            Some("--native-smoke-detected") => return smoke::run(true),
+            Some("--native-smoke") => return smoke::run(false, None),
+            Some("--native-smoke-detected") => return smoke::run(true, None),
+            Some("--native-exam-smoke") => return smoke::exams::launch(),
+            Some("--native-exam-smoke-child") => {
+                let identity = std::env::args_os().nth(2).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "Missing fixture TLS identity")
+                })?;
+                return smoke::run(false, Some(PathBuf::from(identity)));
+            }
             Some("--native-vm-probe") => {
                 let start = std::time::Instant::now();
                 let verdict = async_runtime::block_on(host_probe::detect());
@@ -92,17 +104,21 @@ pub fn run() -> tauri::Result<()> {
         Ok(())
     }
     #[cfg(not(test))]
-    builder()
-        .setup(|app| {
-            let data_dir = app.path().app_local_data_dir()?;
-            app.manage(Desktop::deployed(
-                data_dir,
-                option_env!("CVBBMSO_SERVER_ORIGIN"),
-            )?);
-            build_ui(app.handle())?;
-            Ok(())
-        })
-        .run(tauri::generate_context!())
+    {
+        builder()
+            .setup(|app| {
+                let data_dir = app.path().app_local_data_dir()?;
+                app.manage(Desktop::deployed(
+                    data_dir,
+                    option_env!("CVBBMSO_SERVER_ORIGIN"),
+                )?);
+                build_ui(app.handle())?;
+                Ok(())
+            })
+            .build(tauri::generate_context!())?
+            .run(|app, event| exam::handle_exit(app, &event));
+        Ok(())
+    }
 }
 
 fn builder() -> tauri::Builder<Wry> {
@@ -111,7 +127,10 @@ fn builder() -> tauri::Builder<Wry> {
             vm_preflight,
             open_accoding,
             inspect_session,
-            list_exams
+            list_exams,
+            exam::open_exam,
+            exam::get_exam_status,
+            exam::close_exam,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -130,6 +149,7 @@ fn builder() -> tauri::Builder<Wry> {
 
 fn build_ui(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     app.manage(Preflight::new());
+    exam::ExamSession::launch(app);
     schedule_preflight(app, false);
     WebviewWindowBuilder::new(app, UI, WebviewUrl::App("index.html".into()))
         .title("CVBBMSO")

@@ -9,7 +9,7 @@ use url::{Origin, Url};
 pub(crate) const MAX_EXAM_LIST_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct Monitor {
-    endpoint: Url,
+    base: Url,
     client: Client,
 }
 
@@ -55,9 +55,8 @@ impl Monitor {
         let origin = origin
             .filter(|origin| matches!(origin, Origin::Tuple(scheme, ..) if scheme == "https"))
             .ok_or(MonitorError::Configuration)?;
-        let mut endpoint =
+        let base =
             Url::parse(&origin.ascii_serialization()).map_err(|_| MonitorError::Configuration)?;
-        endpoint.set_path("/api/exams");
 
         let client = builder
             .https_only(true)
@@ -66,16 +65,22 @@ impl Monitor {
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(MonitorError::Initialization)?;
-        Ok(Self { endpoint, client })
+        Ok(Self { base, client })
+    }
+
+    pub(crate) fn server_base(&self) -> &Url {
+        &self.base
     }
 
     pub(crate) async fn list_exams(
         &self,
         cookies: &AccodingCookies,
     ) -> Result<Vec<ExamSummary>, MonitorError> {
+        let mut endpoint = self.server_base().clone();
+        endpoint.set_path("/api/exams");
         let response = self
             .client
-            .get(self.endpoint.clone())
+            .get(endpoint)
             .header(header::ACCEPT, "application/json")
             .header(header::COOKIE, cookies.header_value())
             .send()

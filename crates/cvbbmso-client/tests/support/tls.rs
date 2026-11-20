@@ -5,7 +5,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use axum::{Router, serve::Listener};
 use rustls::{
     ServerConfig,
-    pki_types::{CertificateDer, PrivatePkcs8KeyDer},
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -40,22 +40,33 @@ impl Listener for TlsFixture {
 }
 
 pub(crate) async fn serve(app: Router) -> (SocketAddr, CertificateDer<'static>, JoinHandle<()>) {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-    let addr = listener.local_addr().unwrap();
     let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(["127.0.0.1".to_owned()]).unwrap();
     let cert = cert.der().clone();
+    let (addr, server) = serve_with_identity(
+        app,
+        cert.clone(),
+        PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+    )
+    .await;
+    (addr, cert, server)
+}
+
+pub(crate) async fn serve_with_identity(
+    app: Router,
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+) -> (SocketAddr, JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
     let tls = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(
-            vec![cert.clone()],
-            PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
-        )
+        .with_single_cert(vec![cert], key)
         .unwrap();
     let listener = TlsFixture {
         acceptor: TlsAcceptor::from(Arc::new(tls)),
         tcp: listener,
     };
     let server = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
-    (addr, cert, server)
+    (addr, server)
 }

@@ -1,6 +1,6 @@
 {
   "identifier": "student-ui",
-  "description": "Local student controls and addressed session observations",
+  "description": "Local student controls and addressed session and exam status",
   "webviews": [
     "student"
   ],
@@ -9,6 +9,9 @@
     "allow-open-accoding",
     "allow-inspect-session",
     "allow-list-exams",
+    "allow-open-exam",
+    "allow-get-exam-status",
+    "allow-close-exam",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "core:window:allow-close"

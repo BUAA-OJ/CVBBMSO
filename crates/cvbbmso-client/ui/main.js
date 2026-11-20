@@ -54,6 +54,18 @@ open.addEventListener("click", () => submit(open, "open_accoding"));
 const refreshExams = document.querySelector("#refresh-exams");
 const examStatus = document.querySelector("#exam-status");
 const examList = document.querySelector("#exams");
+const examFeedback = document.querySelector("#exam-session-feedback");
+const currentExam = document.querySelector("#current-exam");
+const currentExamTitle = document.querySelector("#current-exam-title");
+const currentExamStatus = document.querySelector("#current-exam-status");
+const closeExam = document.querySelector("#close-exam");
+let exams = [];
+let examView = null;
+let examSelection = null;
+let examBusy = false;
+let examEventsReady = false;
+let statusRevision = 0;
+
 const examErrors = new Map([
   ["preflight_blocked", "设备检查通过后才能继续。"],
   ["sign_in_required", "请在 Accoding 窗口登录或重新登录，再刷新列表。"],
@@ -62,6 +74,28 @@ const examErrors = new Map([
   ["connection_failed", "无法连接监考服务，请检查网络后重试。"],
   ["service_unavailable", "监考服务暂时无法核验身份，请稍后重试。"],
   ["unexpected_response", "监考服务返回了异常响应，请稍后重试。"],
+]);
+const examSessionErrors = new Map([
+  ["admission_unavailable", "考试准入检查尚未就绪，暂不能进入考试。"],
+  ["session_busy", "已有考试会话，请先退出当前考试。"],
+  ["session_closed", "考试会话已关闭，请重新选择。"],
+  ["not_enrolled", "监考服务未核验到本场考试的报名。"],
+  ["storage_failed", "无法读取或保存本地考试数据。"],
+  ["recording_failed", "无法初始化本场考试的录像数据。"],
+  ["shutdown_failed", "考试会话已结束，但本地收尾失败，请联系考试管理员。"],
+]);
+const executionStates = new Map([
+  ["ready", "等待开始"],
+  ["recording", "考试中"],
+  ["finalizing", "正在收尾"],
+  ["finished", "已结束"],
+]);
+const recordingStates = new Map([
+  ["idle", "待命"],
+  ["capturing", "录制中"],
+  ["finalizing", "正在收尾"],
+  ["complete", "已完成"],
+  ["failed", "失败"],
 ]);
 const examPhases = new Map([
   ["scheduled", "未开始"],
@@ -93,17 +127,91 @@ function renderExam(exam) {
   phase.textContent = examPhases.get(exam.phase);
   const times = document.createElement("p");
   times.append(renderTime(exam.start_at), " 至 ", renderTime(exam.end_at));
-  item.append(title, phase, times);
+  const enter = document.createElement("button");
+  enter.type = "button";
+  enter.className = "open-exam";
+  enter.textContent = "进入考试";
+  enter.disabled = !examEventsReady || examBusy || examView !== null;
+  enter.addEventListener("click", () => changeExamSession(exam));
+  item.append(title, phase, times, enter);
   return item;
 }
 
+function renderExamSession() {
+  for (const button of examList.querySelectorAll(".open-exam")) {
+    button.disabled = !examEventsReady || examBusy || examView !== null;
+  }
+  closeExam.disabled = examBusy;
+  currentExam.hidden = examView === null;
+  if (!examView) {
+    currentExamTitle.textContent = "";
+    currentExamStatus.textContent = "";
+    return;
+  }
+  const { exam_id, connected, state, last_error_code } = examView;
+  const exam = examSelection?.id === exam_id ? examSelection : exams.find(({ id }) => id === exam_id);
+  currentExamTitle.textContent = exam?.title ?? exam_id;
+  const status = [
+    connected ? "已连接监考服务" : "未连接监考服务",
+    executionStates.get(state.execution),
+    `录像${recordingStates.get(state.recording)}`,
+  ];
+  if (last_error_code) status.push(`错误 ${last_error_code}`);
+  currentExamStatus.textContent = status.join(" · ");
+}
+
+async function refreshExamSession() {
+  if (examBusy) return;
+  const revision = ++statusRevision;
+  try {
+    const view = await core.invoke("get_exam_status");
+    if (revision === statusRevision) {
+      examView = view;
+      renderExamSession();
+    }
+  } catch {
+    if (revision === statusRevision && !examFeedback.textContent) {
+      examFeedback.textContent = "无法读取当前考试状态。";
+    }
+  }
+}
+
+async function changeExamSession(exam) {
+  if (examBusy || (exam && examView) || (!exam && !examView)) return;
+  examBusy = true;
+  ++statusRevision;
+  renderExamSession();
+  examFeedback.textContent = exam ? "正在连接考试…" : "正在退出考试…";
+  try {
+    if (exam) {
+      examSelection = exam;
+      await core.invoke("open_exam", { exam_id: exam.id });
+    } else {
+      await core.invoke("close_exam");
+      examView = null;
+      examSelection = null;
+    }
+    examFeedback.textContent = "";
+  } catch (error) {
+    examFeedback.textContent = examSessionErrors.get(error) ?? examErrors.get(error) ?? "考试操作失败，请重试。";
+  } finally {
+    examBusy = false;
+    await refreshExamSession();
+    renderExamSession();
+  }
+}
+
+closeExam.addEventListener("click", () => changeExamSession(null));
+
 refreshExams.addEventListener("click", async () => {
   refreshExams.disabled = true;
+  exams = [];
   examList.replaceChildren();
   examList.setAttribute("aria-busy", "true");
   examStatus.textContent = "正在加载报名列表…";
   try {
     const items = await core.invoke("list_exams");
+    exams = items;
     const rows = document.createDocumentFragment();
     for (const exam of items) {
       rows.append(renderExam(exam));
@@ -134,3 +242,14 @@ try {
 } catch {
   session.textContent = "会话检查暂不可用。";
 }
+
+try {
+  // Treat events as notifications. A WebView may deliver an already queued
+  // event after closing or reopening the same exam.
+  await event.listen("cvbbmso-status", refreshExamSession);
+  examEventsReady = true;
+  await refreshExamSession();
+} catch {
+  examFeedback.textContent = "考试状态通知暂不可用。";
+}
+renderExamSession();

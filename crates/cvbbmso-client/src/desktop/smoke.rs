@@ -4,6 +4,7 @@ use std::{
     collections::VecDeque,
     io,
     net::SocketAddr,
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -11,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+pub(super) mod exams;
 #[path = "../../tests/support/tls.rs"]
 mod tls;
 
@@ -51,10 +53,12 @@ impl FakeProbe {
     }
 }
 
-pub(super) fn run(detected: bool) -> tauri::Result<()> {
+pub(super) fn run(detected: bool, exam_identity: Option<PathBuf>) -> tauri::Result<()> {
     let data = tempfile::tempdir()?;
     let data_dir = data.path().to_owned();
     let (completed, result) = std::sync::mpsc::channel();
+    let (exit_peer, exit_peer_result) = std::sync::mpsc::channel();
+    let exam_smoke = exam_identity.is_some();
     let app = builder()
         .setup(move |app| {
             let deployed = Desktop::deployed(data_dir.clone(), None)?;
@@ -70,30 +74,17 @@ pub(super) fn run(detected: bool) -> tauri::Result<()> {
             let requests = Arc::new(AtomicUsize::new(0));
             let (fixture, foreign, hits) =
                 async_runtime::block_on(start_fixture(requests.clone()))?;
-            let monitor_requests = requests.clone();
-            let (monitor_addr, cert, _) = async_runtime::block_on(tls::serve(Router::new().route(
-                "/api/exams",
-                get(move |headers: HeaderMap| {
-                    let requests = monitor_requests.clone();
-                    async move {
-                        requests.fetch_add(1, Ordering::Relaxed);
-                        exam_list(&headers)
-                    }
-                }),
-            )));
-            let monitor_origin = Url::parse(&format!("https://{monitor_addr}"))?.origin();
-            let monitor = Monitor::with_root_certificate(
-                monitor_origin,
-                reqwest::Certificate::from_der(cert.as_ref())?,
-            );
+            let (monitor, exam_connections) =
+                start_monitor(requests.clone(), exam_identity.as_deref())?;
             let base = Url::parse(&format!("http://{fixture}/"))?;
             let (blocked, mut decisions) = mpsc::unbounded_channel();
             app.manage(Desktop {
                 login: base.join("user/login")?,
                 identity: base.join("api/users/me")?,
                 data_dir,
-                monitor,
+                monitor: Ok(monitor),
                 blocked: Some(blocked),
+                fixture_exam_admission: exam_smoke,
             });
             let outcomes = if detected {
                 VecDeque::from([Verdict::Detected(Diagnostic::GuestIdentity)])
@@ -114,7 +105,13 @@ pub(super) fn run(detected: bool) -> tauri::Result<()> {
                             .eval("document.querySelector('#vm-quit').click()")
                             .map_err(Into::into);
                     }
-                    exercise(&app, &ui, &deployed, &base, foreign, &hits, &mut decisions).await?;
+                    if let Some(connections) = exam_connections {
+                        let closed = exams::exercise(&app, &ui, connections).await?;
+                        exit_peer.send(closed)?;
+                    } else {
+                        exercise(&app, &ui, &deployed, &base, foreign, &hits, &mut decisions)
+                            .await?;
+                    }
                     ui.close().map_err(Into::into)
                 }
                 .await;
@@ -130,14 +127,24 @@ pub(super) fn run(detected: bool) -> tauri::Result<()> {
         })
         .build(tauri::generate_context!())?;
     app.run_return(move |app, event| {
+        exam::handle_exit(app, &event);
         if matches!(event, tauri::RunEvent::ExitRequested { code: Some(0), .. })
+            && exam::exit_drained(app)
             && app.get_webview_window(OJ).is_some() != detected
         {
             let _ = completed.send(());
         }
     });
     if result.try_recv().is_ok() {
-        if detected {
+        if exam_smoke {
+            let peer = exit_peer_result.try_recv().map_err(io::Error::other)?;
+            async_runtime::block_on(async { timeout(DEADLINE, peer).await })
+                .map_err(io::Error::other)?
+                .map_err(io::Error::other)?;
+            println!(
+                "Exiting with an active exam drained the runtime and closed its monitor socket."
+            );
+        } else if detected {
             println!("The VM blocking screen exited without opening Accoding.");
         } else {
             println!("Closing the control window exited with Accoding open.");
@@ -147,6 +154,36 @@ pub(super) fn run(detected: bool) -> tauri::Result<()> {
     } else {
         Err(io::Error::other("Native desktop smoke did not complete successfully").into())
     }
+}
+
+fn start_monitor(
+    requests: Arc<AtomicUsize>,
+    exam_identity: Option<&Path>,
+) -> io::Result<(Monitor, Option<mpsc::Receiver<exams::Connection>>)> {
+    let exam_smoke = exam_identity.is_some();
+    let router = Router::new().route(
+        "/api/exams",
+        get(move |headers: HeaderMap| {
+            let requests = requests.clone();
+            async move {
+                requests.fetch_add(1, Ordering::Relaxed);
+                exam_list(&headers, exam_smoke)
+            }
+        }),
+    );
+    let (addr, cert, connections) = if let Some(identity) = exam_identity {
+        let (addr, cert, connections) = async_runtime::block_on(exams::serve(router, identity))?;
+        (addr, cert, Some(connections))
+    } else {
+        let (addr, cert, _) = async_runtime::block_on(tls::serve(router));
+        (addr, cert, None)
+    };
+    let origin = Url::parse(&format!("https://{addr}"))
+        .map_err(io::Error::other)?
+        .origin();
+    let cert = reqwest::Certificate::from_der(cert.as_ref()).map_err(io::Error::other)?;
+    let monitor = Monitor::with_root_certificate(origin, cert).map_err(io::Error::other)?;
+    Ok((monitor, connections))
 }
 
 async fn start_fixture(
@@ -246,7 +283,7 @@ async fn start_fixture(
     Ok((fixture_addr, foreign_addr, hits))
 }
 
-fn exam_list(headers: &HeaderMap) -> Response {
+fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
     let cookie = headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -258,16 +295,14 @@ fn exam_list(headers: &HeaderMap) -> Response {
         ["_aux=synthetic", "connect.sid=synthetic-v2"] => {
             let start_at = OffsetDateTime::from_unix_timestamp(1_797_729_600).unwrap();
             let end_at = OffsetDateTime::from_unix_timestamp(1_797_733_200).unwrap();
-            vec![
-                ExamSummary::new(
-                    Uuid::from_u128(0x10),
-                    EXAM_TITLE.into(),
-                    start_at,
-                    end_at,
-                    ExamPhase::Scheduled,
-                )
-                .unwrap(),
-            ]
+            let summary = |id, title: &str| {
+                ExamSummary::new(id, title.into(), start_at, end_at, ExamPhase::Scheduled).unwrap()
+            };
+            let mut items = vec![summary(exams::FIRST, EXAM_TITLE)];
+            if include_second_exam {
+                items.push(summary(exams::SECOND, "Second fixture exam"));
+            }
+            items
         }
         ["_aux=synthetic", "connect.sid=unavailable"] => {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -344,8 +379,9 @@ async fn check_blocked_preflight(
             invoke('open_accoding'),
             invoke('inspect_session'),
             invoke('list_exams'),
+            invoke('open_exam', { exam_id: '00000000-0000-0000-0000-000000000010' }),
           ]);
-          const denied = ['设备检查通过后才能继续。', '设备检查通过后才能继续。', 'preflight_blocked'];
+          const denied = ['设备检查通过后才能继续。', '设备检查通过后才能继续。', 'preflight_blocked', 'preflight_blocked'];
           window.blockedCommands = results.every(
             (result, index) => result.status === 'rejected' && result.reason === denied[index]
           ) ? 'rejected' : 'unexpected';
@@ -414,24 +450,7 @@ async fn exercise(
     hits: &AtomicUsize,
     decisions: &mut mpsc::UnboundedReceiver<(&'static str, Url)>,
 ) -> Result<(), Error> {
-    wait_for(
-        ui,
-        "document.querySelector('#inspect')?.disabled === false",
-        "local UI event subscription",
-    )
-    .await?;
-    ui.eval("document.querySelector('#open').click()")?;
-    let oj = timeout(DEADLINE, async {
-        loop {
-            if let Some(oj) = app.get_webview_window(OJ) {
-                return oj;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .map_err(|_| io::Error::other("Local command did not open the Accoding window"))?;
-    wait_for(&oj, "document.title === 'Fixture login'", "remote fixture").await?;
+    let oj = open_fixture_browser(app, ui).await?;
     println!(
         "Native WebView user agent: {}",
         evaluate(&oj, "navigator.userAgent").await?
@@ -460,6 +479,19 @@ async fn exercise(
     check_reopen(ui, &oj).await?;
     expect_cookie(&oj, base, "connect.sid=synthetic-v2").await?;
     check_exam_refresh(ui, &oj, base).await?;
+    wait_for(
+        ui,
+        "!document.querySelector('.open-exam')?.disabled",
+        "exam selection in the admitted UI",
+    )
+    .await?;
+    ui.eval("document.querySelector('.open-exam').click()")?;
+    wait_for(
+        ui,
+        "document.querySelector('#exam-session-feedback').textContent === '考试准入检查尚未就绪，暂不能进入考试。' && document.querySelector('#current-exam').hidden",
+        "exam admission still blocked without the remaining checks",
+    )
+    .await?;
     oj.eval("location.assign('/redirect')")?;
     expect_denial(decisions, "navigation", &foreign_url).await?;
     if hits.load(Ordering::Relaxed) != 0 {
@@ -489,6 +521,28 @@ async fn exercise(
     }
     println!("Accoding login form loaded.");
     Ok(())
+}
+
+async fn open_fixture_browser(app: &AppHandle, ui: &WebviewWindow) -> Result<WebviewWindow, Error> {
+    wait_for(
+        ui,
+        "document.querySelector('#inspect')?.disabled === false",
+        "local UI event subscription",
+    )
+    .await?;
+    ui.eval("document.querySelector('#open').click()")?;
+    let oj = timeout(DEADLINE, async {
+        loop {
+            if let Some(oj) = app.get_webview_window(OJ) {
+                return oj;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| io::Error::other("Local command did not open the Accoding window"))?;
+    wait_for(&oj, "document.title === 'Fixture login'", "remote fixture").await?;
+    Ok(oj)
 }
 
 async fn refresh_exams(ui: &WebviewWindow, status: &str, exam: Option<&str>) -> Result<(), Error> {
@@ -605,11 +659,19 @@ async fn check_ipc(ui: &WebviewWindow, oj: &WebviewWindow) -> Result<(), Error> 
                 invoke("vm_preflight", { retry: true }),
                 invoke("inspect_session"),
                 invoke("list_exams"),
+                invoke("open_exam", { exam_id: "00000000-0000-0000-0000-000000000010" }),
+                invoke("get_exam_status"),
+                invoke("close_exam"),
                 invoke("plugin:event|listen", {
                     event: "accoding-session",
                     target: { kind: "Any" },
                     handler: window.__TAURI_INTERNALS__.transformCallback(() => {})
-                })
+                }),
+                invoke("plugin:event|listen", {
+                    event: "cvbbmso-status",
+                    target: { kind: "Webview", label: "student" },
+                    handler: window.__TAURI_INTERNALS__.transformCallback(() => {})
+                }),
             ]);
             window.boundaryResult = results.every(({status}) => status === "rejected")
                 ? "blocked" : "exposed";

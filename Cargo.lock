@@ -664,8 +664,10 @@ name = "cvbbmso-client"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "block2",
  "cvbbmso-accoding",
+ "cvbbmso-exam",
  "cvbbmso-protocol",
  "futures-util",
  "objc2-foundation",
