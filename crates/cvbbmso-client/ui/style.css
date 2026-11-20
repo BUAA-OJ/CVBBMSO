@@ -108,3 +108,17 @@ button:disabled {
   margin: 0.3rem 0 0;
   font-size: 0.85rem;
 }
+
+.open-exam {
+  margin-block-start: 0.65rem;
+}
+
+#exam-session-feedback:empty {
+  min-height: 0;
+  margin: 0;
+}
+
+#current-exam {
+  margin-block-start: 0.75rem;
+  overflow-wrap: anywhere;
+}

@@ -100,6 +100,7 @@ jobs:
           defaults read /System/Library/Frameworks/WebKit.framework/Resources/Info CFBundleVersion
       - name: Record the native probe result on the hosted runner
         run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-vm-probe
+      - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-exam-smoke
       - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke
       - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke-detected
       - name: Build Windows x64 Release for VM acceptance
