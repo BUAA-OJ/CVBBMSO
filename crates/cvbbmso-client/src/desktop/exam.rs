@@ -19,7 +19,11 @@ use tokio::{
 use url::{Origin, Url};
 use uuid::Uuid;
 
-use super::{Desktop, ReadSessionError, UI, current_cookies};
+use super::{
+    Desktop, ReadSessionError, UI,
+    admission::{Admission, Failure, Status},
+    current_cookies,
+};
 use crate::{monitor::MonitorError, policy::denied_target_origin, preflight::Preflight};
 
 const STATUS_EVENT: &str = "cvbbmso-status";
@@ -90,12 +94,10 @@ fn check_admission(app: &AppHandle) -> Result<(), ExamCommandError> {
     if !app.state::<Preflight>().is_admitted() {
         return Err(ExamCommandError::PreflightBlocked);
     }
-    #[cfg(test)]
-    if app.state::<Desktop>().fixture_exam_admission {
-        return Ok(());
+    if !app.state::<Admission>().is_ready() {
+        return Err(ExamCommandError::AdmissionUnavailable);
     }
-    // The network guard and remaining admission checks are not implemented.
-    Err(ExamCommandError::AdmissionUnavailable)
+    Ok(())
 }
 
 #[tauri::command]
@@ -189,6 +191,7 @@ pub(super) fn handle_exit(app: &AppHandle, event: &RunEvent) {
             return;
         }
         api.prevent_exit();
+        app.state::<Admission>().begin_exit(app);
         sessions.exit.send_if_modified(|state| {
             if *state == Exit::Running {
                 *state = Exit::Requested(code.unwrap_or(0));
@@ -325,6 +328,9 @@ async fn run(
     let mut opening: Option<Opening> = None;
     let mut active: Option<Active> = None;
     let sessions = app.state::<ExamSession>();
+    let admission = app.state::<Admission>();
+    let mut admission_updates = admission.subscribe();
+    let mut guard_close_failed = false;
     loop {
         let (view_updates, delivery) = active.as_mut().map_or((None, None), |active| {
             (
@@ -338,12 +344,24 @@ async fn run(
                 let requested = *exit.borrow();
                 if let Exit::Requested(code) = requested {
                     let result = clear(&sessions, &mut opening, &mut active, &snapshot).await;
+                    let guard_closed = admission.shutdown().await;
                     sessions.exit.send_replace(Exit::Drained);
-                    app.exit(if result.is_err() && code == 0 { 1 } else { code });
+                    let failed = result.is_err() || !guard_closed || guard_close_failed;
+                    app.exit(if failed && code == 0 { 1 } else { code });
                 }
                 return;
             }
+            _ = admission_updates.changed() => {
+                let status = *admission_updates.borrow_and_update();
+                if status == Status::Blocked(Failure::GuardLost) {
+                    guard_close_failed |= clear(&sessions, &mut opening, &mut active, &snapshot)
+                        .await.is_err();
+                }
+            }
             request = requests.recv() => match request {
+                Some(Request::Open(_, reply)) if !admission.is_ready() => {
+                    let _ = reply.send(Err(ExamCommandError::AdmissionUnavailable));
+                }
                 Some(Request::Open(_, reply)) if opening.is_some() || active.is_some() => {
                     let _ = reply.send(Err(ExamCommandError::SessionBusy));
                 }
@@ -363,6 +381,13 @@ async fn run(
             },
             result = joining(&mut opening) => {
                 if let Some(Opening { reply, .. }) = opening.take() {
+                    if !admission.is_ready() {
+                        if let Ok((handle, _)) = result {
+                            guard_close_failed |= handle.shutdown().await.is_err();
+                        }
+                        let _ = reply.send(Err(ExamCommandError::AdmissionUnavailable));
+                        continue;
+                    }
                     let result = result.map(|(handle, cookies)| {
                         let mut updates = handle.subscribe();
                         let view = updates.borrow_and_update().clone();

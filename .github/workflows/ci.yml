@@ -108,6 +108,7 @@ jobs:
       - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-exam-smoke
       - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke
       - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke-detected
+      - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-admission-exit
       - name: Build Windows x64 Release for VM acceptance
         if: runner.os == 'Windows'
         run: |

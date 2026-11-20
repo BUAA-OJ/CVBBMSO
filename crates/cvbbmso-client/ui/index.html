@@ -20,29 +20,36 @@
         </div>
       </section>
       <div id="student-controls" hidden>
-        <h2>Accoding 登录</h2>
-        <p>在 Accoding 窗口登录后，可回到这里检查会话。</p>
-        <div class="actions">
-          <button id="open" type="button">打开 Accoding</button>
-          <button id="inspect" type="button" disabled>检查会话</button>
-        </div>
-        <p id="session" role="status"></p>
-        <section class="exam-panel" aria-labelledby="exam-heading">
-          <div class="exam-heading">
-            <h2 id="exam-heading">报名考试</h2>
-            <button id="refresh-exams" type="button" disabled>加载列表</button>
-          </div>
-          <p id="exam-status" role="status">登录 Accoding 后加载报名列表。</p>
-          <ul id="exams" class="exam-list"></ul>
-          <p id="exam-session-feedback" role="status"></p>
-          <div id="current-exam" hidden>
-            <div class="exam-heading">
-              <h3 id="current-exam-title"></h3>
-              <button id="close-exam" type="button">退出当前考试</button>
-            </div>
-            <p id="current-exam-status" role="status"></p>
-          </div>
+        <section id="admission-panel" aria-labelledby="admission-heading">
+          <h2 id="admission-heading">考试环境检查</h2>
+          <p id="admission-status" role="status">正在检查考试环境…</p>
+          <button id="admission-retry" type="button" hidden>重试考试环境检查</button>
         </section>
+        <div id="admitted-controls" hidden>
+          <h2>Accoding 登录</h2>
+          <p>在 Accoding 窗口登录后，可回到这里检查会话。</p>
+          <div class="actions">
+            <button id="open" type="button">打开 Accoding</button>
+            <button id="inspect" type="button" disabled>检查会话</button>
+          </div>
+          <p id="session" role="status"></p>
+          <section class="exam-panel" aria-labelledby="exam-heading">
+            <div class="exam-heading">
+              <h2 id="exam-heading">报名考试</h2>
+              <button id="refresh-exams" type="button" disabled>加载列表</button>
+            </div>
+            <p id="exam-status" role="status">登录 Accoding 后加载报名列表。</p>
+            <ul id="exams" class="exam-list"></ul>
+            <p id="exam-session-feedback" role="status"></p>
+            <div id="current-exam" hidden>
+              <div class="exam-heading">
+                <h3 id="current-exam-title"></h3>
+                <button id="close-exam" type="button">退出当前考试</button>
+              </div>
+              <p id="current-exam-status" role="status"></p>
+            </div>
+          </section>
+        </div>
       </div>
     </main>
   </body>

@@ -1,4 +1,4 @@
-use std::{io, sync::mpsc, time::Duration};
+use std::{io, ptr::null_mut, sync::mpsc, time::Duration};
 
 use tauri::WebviewWindow;
 use url::Url;
@@ -7,6 +7,28 @@ use webview2_com::{
     Microsoft::Web::WebView2::Win32::{ICoreWebView2_18, ICoreWebView2Settings3},
 };
 use windows_core::Interface;
+use windows_sys::Win32::Security::{
+    CheckTokenMembership, CreateWellKnownSid, SECURITY_MAX_SID_SIZE, WinBuiltinAdministratorsSid,
+};
+
+pub(super) fn is_elevated() -> bool {
+    let mut sid = [0_u32; SECURITY_MAX_SID_SIZE as usize / size_of::<u32>()];
+    let mut length = SECURITY_MAX_SID_SIZE;
+    let mut member = 0;
+    // SAFETY: sid is a writable, DWORD-aligned SECURITY_MAX_SID_SIZE buffer.
+    // CheckTokenMembership reads it only after CreateWellKnownSid succeeded.
+    // Its null handle requests the effective current thread/process token.
+    unsafe {
+        CreateWellKnownSid(
+            WinBuiltinAdministratorsSid,
+            null_mut(),
+            sid.as_mut_ptr().cast(),
+            &raw mut length,
+        ) != 0
+            && CheckTokenMembership(null_mut(), sid.as_mut_ptr().cast(), &raw mut member) != 0
+            && member != 0
+    }
+}
 
 pub(super) fn lock_down(browser: &WebviewWindow) -> tauri::Result<()> {
     let (send, receive) = mpsc::channel();

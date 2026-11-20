@@ -12,7 +12,7 @@
 
 同源弹窗链接在现有 Accoding 窗口打开。客户端根据身份接口 URL 读取原生 Cookie Store，并保留适用的 HttpOnly 会话和附加 Cookie。界面只显示是否读取到会话，Cookie 原值仅供 Rust 使用。
 
-运行 `cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke` 可在交互式桌面验证预检失败后的重试、两类 WebView 的权限隔离、导航、Release 调试设置、合成 Cookie 更新以及关闭并重新打开 Accoding 窗口后的会话保留。该测试也会打开真实 Accoding 登录页，无需登录。将末尾参数换为 `--native-smoke-detected` 可验证检测到虚拟机后的本地阻断与退出。两组冒烟都验证直接调用受限命令不会创建远程 WebView 或外发请求。协议替身绑定回环地址，以临时 TLS 证书和合成凭据验证 HTTPS 接口、WSS 握手及首帧。
+运行 `cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke` 可在交互式桌面验证预检失败后的重试、两类 WebView 的权限隔离、导航、Release 调试设置、合成 Cookie 更新以及关闭并重新打开 Accoding 窗口后的会话保留。该测试使用模拟 Accoding 登录页和合成会话。将末尾参数换为 `--native-smoke-detected` 可验证检测到虚拟机后的本地阻断与退出。两组冒烟都验证直接调用受限命令不会创建远程 WebView 或外发请求。协议替身绑定回环地址，以临时 TLS 证书和合成凭据验证 HTTPS 接口、WSS 握手及首帧。
 
 将末尾参数换为 `--native-exam-smoke`，可用回环 HTTPS/WSS 服务和合成 Cookie 验证实际考试运行时的入场、重登、断线恢复、导航事件和关闭。测试子进程使用临时证书，不修改系统信任库。测试中的准入替身仅编译到测试程序。
 
@@ -23,6 +23,8 @@
 | Tauri command | 入参 | 返回数据 | 语义 |
 | --- | --- | --- | --- |
 | `vm_preflight` | `{ retry: bool }` | `{ status, reason }` | 读取设备检查结果。仅在上次结果为 `unknown` 时响应重试 |
+| `admission_status` | `{ retry: bool }` | `{ status, reason? }` | 读取正式准入状态，或重试可恢复的失败。仅本地控制窗可调用 |
+| `admission-status` 事件 | 无 | `{ status, reason? }` | 定向通知本地控制窗正式准入状态变化 |
 | `list_exams` | 无 | `ExamSummary[]` | 使用当前 Cookie 调用 `GET /api/exams` |
 | `open_exam` | `{ exam_id: uuid }` | `{ "connected": true }` | 调用 `Exam::connect`；等待初始 `sync` 后返回。网络、出站守卫和权限预检已在启动时完成 |
 | `get_exam_status` | 无 | `ClientView` 或 `null` | 读取当前考试状态快照 |
@@ -69,7 +71,11 @@ impl AppState {
 4. 调用 `cvbbmso-network::EgressGuard::install`，传入 Accoding Origin 和监考服务器 Origin。守卫保持到应用退出，期间系统只放行允许的出站流量。安装失败时同样停留在考试外。
 5. macOS 上由本 crate 的平台适配层探测屏幕录制权限，未授权时发起系统授权请求。仍无权限或授权后需要重启应用时，展示明确指引并阻止进入考试。Windows 视为已授权。
 
-当前桌面底座已接入第 1 步。提权、网络预检、出站守卫和录屏授权接入前，正式构建的 `open_exam` 先执行虚拟机准入校验，通过后仍返回 `admission_unavailable`，不连接考试运行时。
+虚拟机检查通过后，Rust 启动其余准入步骤。只有 `admission_status` 返回 `ready` 时才开放登录窗口、会话检查、报名列表和考试入场。虚拟机检查通过后，即使其余准入步骤尚未通过，未配置监考服务地址时 `list_exams` 也返回 `monitor_unconfigured`。控制窗可重试代理、可达性、守卫安装和屏幕权限失败。管理员权限、部署配置、录屏权限要求重启或运行期守卫失效时，界面显示对应的操作指引。
+
+出站守卫归应用所有。录屏权限失败后的重试复用已安装的守卫，单次检查期间的并发重试共用同一次启动流程。客户端每 30 秒校验守卫。运行期校验失败时，Rust 阻止新入场并结束活动考试，界面提示联系监考人员后重新启动客户端。退出会等待正在安装的守卫返回，并在考试运行时收尾后撤销守卫。正常退出一场考试不撤销守卫。
+
+Release 桌面冒烟使用测试替身验证准入重试和守卫失效。`--native-admission-exit` 验证安装尚未返回时退出的顺序。真实 PF、WFP 和特权部署在隔离环境中验收。
 
 ### 虚拟机预检
 

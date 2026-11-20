@@ -114,17 +114,22 @@ pub(in crate::desktop) fn launch() -> tauri::Result<()> {
 
     // Both runtime TLS clients read native roots. Scope the fixture root to a
     // dedicated test process rather than changing the system trust store.
-    let child = Command::new(std::env::current_exe()?)
-        .arg("--native-exam-smoke-child")
-        .arg(directory.path())
-        .env("SSL_CERT_FILE", root)
-        .env_remove("SSL_CERT_DIR")
-        .status()?;
-    if child.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!("Native exam smoke process exited with {child}")).into())
+    for mode in ["normal", "guard-loss"] {
+        let child = Command::new(std::env::current_exe()?)
+            .arg("--native-exam-smoke-child")
+            .arg(directory.path())
+            .arg(mode)
+            .env("SSL_CERT_FILE", &root)
+            .env_remove("SSL_CERT_DIR")
+            .status()?;
+        if !child.success() {
+            return Err(io::Error::other(format!(
+                "Native exam smoke ({mode}) exited with {child}"
+            ))
+            .into());
+        }
     }
+    Ok(())
 }
 
 struct Connection {

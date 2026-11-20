@@ -32,6 +32,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use super::admission::fixture::Admission as FakeAdmission;
 use super::*;
 use crate::monitor::MAX_EXAM_LIST_BYTES;
 use crate::preflight::Diagnostic;
@@ -53,30 +54,50 @@ impl FakeProbe {
     }
 }
 
-pub(super) fn run(detected: bool, exam_identity: Option<PathBuf>) -> tauri::Result<()> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Case {
+    Desktop,
+    Detected,
+    Exam,
+    GuardLoss,
+    ExitDuringInstall,
+}
+
+pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<()> {
+    let detected = case == Case::Detected;
     let data = tempfile::tempdir()?;
     let data_dir = data.path().to_owned();
     let (completed, result) = std::sync::mpsc::channel();
     let (exit_peer, exit_peer_result) = std::sync::mpsc::channel();
-    let exam_smoke = exam_identity.is_some();
     let app = builder()
         .setup(move |app| {
-            let deployed = check_deployment(&data_dir)?;
+            check_deployment(&data_dir)?;
             let requests = Arc::new(AtomicUsize::new(0));
             let (fixture, foreign, hits) =
                 async_runtime::block_on(start_fixture(requests.clone()))?;
-            let (monitor, exam_connections) =
-                start_monitor(requests.clone(), exam_identity.as_deref())?;
+            let (monitor, exam_connections) = if case == Case::ExitDuringInstall {
+                (Monitor::new(None), None)
+            } else {
+                let (monitor, connections) =
+                    start_monitor(requests.clone(), exam_identity.as_deref())?;
+                (Ok(monitor), connections)
+            };
             let base = Url::parse(&format!("http://{fixture}/"))?;
             let (blocked, mut decisions) = mpsc::unbounded_channel();
             app.manage(Desktop {
                 login: base.join("user/login")?,
                 identity: base.join("api/users/me")?,
                 data_dir,
-                monitor: Ok(monitor),
+                monitor,
                 blocked: Some(blocked),
-                fixture_exam_admission: exam_smoke,
             });
+            let admission = FakeAdmission::default();
+            match case {
+                Case::Desktop => admission.require_retry(),
+                Case::ExitDuringInstall => admission.pause(),
+                _ => {}
+            }
+            app.manage(admission.clone());
             let outcomes = if detected {
                 VecDeque::from([Verdict::Detected(Diagnostic::GuestIdentity)])
             } else {
@@ -96,14 +117,23 @@ pub(super) fn run(detected: bool, exam_identity: Option<PathBuf>) -> tauri::Resu
                             .eval("document.querySelector('#vm-quit').click()")
                             .map_err(Into::into);
                     }
+                    if case == Case::ExitDuringInstall {
+                        return check_exit_during_install(&app, &ui, &admission).await;
+                    }
                     if let Some(connections) = exam_connections {
                         let closed =
                             exams::exercise(&app, &ui, connections, foreign, &hits, &mut decisions)
                                 .await?;
-                        exit_peer.send(closed)?;
+                        assert_eq!(admission.installs(), 1);
+                        assert_eq!(admission.shutdowns(), 0);
+                        if case == Case::GuardLoss {
+                            check_guard_loss(&ui, &admission, closed).await?;
+                        } else {
+                            exit_peer.send(closed)?;
+                        }
                     } else {
-                        exercise(&app, &ui, &deployed, &base, foreign, &hits, &mut decisions)
-                            .await?;
+                        check_admission_retry(&ui, &admission).await?;
+                        exercise(&app, &ui, &base, foreign, &hits, &mut decisions).await?;
                     }
                     ui.close().map_err(Into::into)
                 }
@@ -121,35 +151,163 @@ pub(super) fn run(detected: bool, exam_identity: Option<PathBuf>) -> tauri::Resu
         .build(tauri::generate_context!())?;
     app.run_return(move |app, event| {
         exam::handle_exit(app, &event);
+        let expect_browser = !matches!(case, Case::Detected | Case::ExitDuringInstall);
         if matches!(event, tauri::RunEvent::ExitRequested { code: Some(0), .. })
             && exam::exit_drained(app)
-            && app.get_webview_window(OJ).is_some() != detected
+            && app.get_webview_window(OJ).is_some() == expect_browser
+            && app.state::<FakeAdmission>().shutdowns() == usize::from(!detected)
         {
             let _ = completed.send(());
         }
     });
-    if result.try_recv().is_ok() {
-        if exam_smoke {
-            let peer = exit_peer_result.try_recv().map_err(io::Error::other)?;
-            async_runtime::block_on(async { timeout(DEADLINE, peer).await })
-                .map_err(io::Error::other)?
-                .map_err(io::Error::other)?;
-            println!(
-                "Exiting with an active exam drained the runtime and closed its monitor socket."
-            );
-        } else if detected {
-            println!("The VM blocking screen exited without opening Accoding.");
-        } else {
-            println!("Closing the control window exited with Accoding open.");
-        }
-        println!("Desktop smoke passed.");
-        Ok(())
-    } else {
-        Err(io::Error::other("Native desktop smoke did not complete successfully").into())
+    result
+        .try_recv()
+        .map_err(|_| io::Error::other("Native desktop smoke did not complete successfully"))?;
+    if case == Case::Exam {
+        check_exit_peer(&exit_peer_result)?;
     }
+    println!("Desktop smoke passed.");
+    Ok(())
 }
 
-fn check_deployment(data_dir: &Path) -> Result<Desktop, Box<dyn std::error::Error>> {
+fn check_exit_peer(peer: &std::sync::mpsc::Receiver<oneshot::Receiver<()>>) -> io::Result<()> {
+    let peer = peer.try_recv().map_err(io::Error::other)?;
+    async_runtime::block_on(async { timeout(DEADLINE, peer).await })
+        .map_err(io::Error::other)?
+        .map_err(io::Error::other)?;
+    println!("Exiting with an active exam drained the runtime and closed its monitor socket.");
+    Ok(())
+}
+
+async fn check_admission_retry(ui: &WebviewWindow, admission: &FakeAdmission) -> Result<(), Error> {
+    wait_for(ui, "!document.querySelector('#admission-retry').hidden && document.querySelector('#admission-status').textContent.includes('代理')", "proxy preflight denial").await?;
+    ui.eval("document.querySelector('#admission-retry').click()")?;
+    timeout(DEADLINE, admission.install_started()).await?;
+    ui.eval(r"
+        window.admissionProbe = 'pending';
+        const invoke = window.__TAURI__.core.invoke;
+        Promise.all(Array.from({length: 4}, () => invoke('admission_status', {retry: true})))
+          .then(results => { window.admissionProbe = results.every(result => result.status === 'checking'); });
+    ")?;
+    wait_for(
+        ui,
+        "window.admissionProbe === true && document.querySelector('#admitted-controls').hidden",
+        "concurrent retries sharing one installation",
+    )
+    .await?;
+    check_environment_gate(ui).await?;
+    assert_eq!(admission.installs(), 1);
+    admission.resume();
+
+    wait_for(ui, "!document.querySelector('#admission-retry').hidden && document.querySelector('#admission-status').textContent.includes('录制屏幕')", "screen permission denial").await?;
+    ui.eval("document.querySelector('#admission-retry').click()")?;
+    wait_for(
+        ui,
+        "!document.querySelector('#admitted-controls').hidden",
+        "admission after retry",
+    )
+    .await?;
+    assert_eq!(admission.installs(), 1);
+    assert_eq!(admission.shutdowns(), 0);
+    println!(
+        "Concurrent admission retries installed one guard; screen permission reused that guard."
+    );
+    Ok(())
+}
+
+async fn check_environment_gate(ui: &WebviewWindow) -> Result<(), Error> {
+    ui.eval(
+        r"
+        window.gatedRequests = 'pending';
+        (async () => {
+            const invoke = window.__TAURI__.core.invoke;
+            const results = await Promise.allSettled([
+                invoke('open_accoding'), invoke('inspect_session'), invoke('list_exams'),
+                invoke('open_exam', {exam_id: '00000000-0000-0000-0000-000000000010'})
+            ]);
+            window.gatedRequests = results.every(result => result.status === 'rejected')
+                && results[2].reason === 'preflight_blocked'
+                && results[3].reason === 'admission_unavailable';
+        })();
+    ",
+    )?;
+    wait_for(
+        ui,
+        "window.gatedRequests === true",
+        "Rust rejecting direct IPC while admission is blocked",
+    )
+    .await
+}
+
+async fn check_exit_during_install(
+    app: &AppHandle,
+    ui: &WebviewWindow,
+    admission: &FakeAdmission,
+) -> Result<(), Error> {
+    timeout(DEADLINE, admission.install_started()).await?;
+    ui.eval(
+        r"
+        window.missingMonitor = 'pending';
+        window.__TAURI__.core.invoke('list_exams').then(
+            () => { window.missingMonitor = 'unexpected_success'; },
+            error => { window.missingMonitor = error; },
+        );
+    ",
+    )?;
+    wait_for(
+        ui,
+        "window.missingMonitor === 'monitor_unconfigured'",
+        "list_exams reporting the missing monitor after VM preflight",
+    )
+    .await?;
+    ui.close()?;
+    wait_for(
+        ui,
+        "document.querySelector('#admission-status').textContent.includes('关闭客户端')",
+        "exit waiting for the in-flight guard",
+    )
+    .await?;
+    assert!(!exam::exit_drained(app));
+    assert_eq!(admission.shutdowns(), 0);
+    admission.resume();
+    println!("Exit deferred until the in-flight install returned its guard.");
+    Ok(())
+}
+
+async fn check_guard_loss(
+    ui: &WebviewWindow,
+    admission: &FakeAdmission,
+    peer: oneshot::Receiver<()>,
+) -> Result<(), Error> {
+    assert!(admission.verifies() > 0);
+    admission.lose_guard();
+    wait_for(ui, "document.querySelector('#admission-status').textContent.includes('联系监考人员') && document.querySelector('#admitted-controls').hidden", "terminal guard loss").await?;
+    check_environment_gate(ui).await?;
+    timeout(DEADLINE, peer).await??;
+    ui.eval(r"
+        window.guardLost = false;
+        Promise.all([
+            window.__TAURI__.core.invoke('get_exam_status'),
+            window.__TAURI__.core.invoke('admission_status', {retry: true})
+        ]).then(([exam, admission]) => {
+            window.guardLost = exam === null && admission.status === 'blocked' && admission.reason === 'guard_lost';
+        });
+    ")?;
+    wait_for(
+        ui,
+        "window.guardLost",
+        "guard loss draining the exam and refusing retry",
+    )
+    .await?;
+    assert_eq!(admission.installs(), 1);
+    assert_eq!(admission.shutdowns(), 0);
+    println!(
+        "Guard failure blocked direct IPC, drained the active exam, and retained the guard until app exit."
+    );
+    Ok(())
+}
+
+fn check_deployment(data_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let deployed = Desktop::deployed(data_dir.to_path_buf(), None)?;
     assert!(matches!(deployed.monitor, Err(MonitorError::Configuration)));
     for invalid in ["", "http://monitor.example.org"] {
@@ -160,7 +318,7 @@ fn check_deployment(data_dir: &Path) -> Result<Desktop, Box<dyn std::error::Erro
         );
     }
     println!("Missing monitor configuration is allowed; invalid origins fail startup.");
-    Ok(deployed)
+    Ok(())
 }
 
 fn start_monitor(
@@ -491,7 +649,6 @@ async fn expect_cookie(oj: &WebviewWindow, base: &Url, session: &str) -> Result<
 async fn exercise(
     app: &AppHandle,
     ui: &WebviewWindow,
-    deployed: &Desktop,
     base: &Url,
     foreign: SocketAddr,
     hits: &AtomicUsize,
@@ -526,54 +683,18 @@ async fn exercise(
     check_reopen(ui, &oj).await?;
     expect_cookie(&oj, base, "connect.sid=synthetic-v2").await?;
     check_exam_refresh(ui, &oj, base).await?;
-    wait_for(
-        ui,
-        "!document.querySelector('.open-exam')?.disabled",
-        "exam selection in the admitted UI",
-    )
-    .await?;
-    ui.eval("document.querySelector('.open-exam').click()")?;
-    wait_for(
-        ui,
-        "document.querySelector('#exam-session-feedback').textContent === '考试准入检查尚未就绪，暂不能进入考试。' && document.querySelector('#current-exam').hidden",
-        "exam admission still blocked without the remaining checks",
-    )
-    .await?;
     oj.eval("location.assign('/redirect')")?;
     expect_denial(decisions, "navigation", &foreign_url).await?;
     if hits.load(Ordering::Relaxed) != 0 {
         return Err(io::Error::other("Cross-origin navigation reached the listener").into());
     }
-    oj.destroy()?;
-    timeout(DEADLINE, async {
-        while app.get_webview_window(OJ).is_some() {
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await?;
-
-    open_browser(app, deployed)?;
-    let oj = app
-        .get_webview_window(OJ)
-        .ok_or_else(|| io::Error::other("Accoding window missing"))?;
-    if let Err(error) = wait_for(
-        &oj,
-        "location.origin === 'https://accoding.buaa.edu.cn' && Boolean(document.querySelector('input[type=password]'))",
-        "Accoding login form",
-    ).await {
-        if let Ok(url) = oj.url() {
-            eprintln!("Accoding WebView location: {}{}", url.origin().ascii_serialization(), url.path());
-        }
-        return Err(error);
-    }
-    println!("Accoding login form loaded.");
     Ok(())
 }
 
 async fn open_fixture_browser(app: &AppHandle, ui: &WebviewWindow) -> Result<WebviewWindow, Error> {
     wait_for(
         ui,
-        "document.querySelector('#inspect')?.disabled === false",
+        "document.querySelector('#inspect')?.disabled === false && !document.querySelector('#admitted-controls').hidden",
         "local UI event subscription",
     )
     .await?;
@@ -704,6 +825,7 @@ async fn check_ipc(ui: &WebviewWindow, oj: &WebviewWindow) -> Result<(), Error> 
             }
             const results = await Promise.allSettled([
                 invoke("vm_preflight", { retry: true }),
+                invoke("admission_status", { retry: true }),
                 invoke("inspect_session"),
                 invoke("list_exams"),
                 invoke("open_exam", { exam_id: "00000000-0000-0000-0000-000000000010" }),

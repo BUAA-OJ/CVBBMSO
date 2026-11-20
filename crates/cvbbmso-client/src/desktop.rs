@@ -1,5 +1,6 @@
 use std::{io, path::PathBuf};
 
+mod admission;
 mod exam;
 #[cfg(test)]
 mod smoke;
@@ -35,8 +36,6 @@ struct Desktop {
     monitor: Result<Monitor, MonitorError>,
     #[cfg(test)]
     blocked: Option<tokio::sync::mpsc::UnboundedSender<(&'static str, Url)>>,
-    #[cfg(test)]
-    fixture_exam_admission: bool,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -68,8 +67,6 @@ impl Desktop {
             monitor: Monitor::new(origin),
             #[cfg(test)]
             blocked: None,
-            #[cfg(test)]
-            fixture_exam_admission: false,
         })
     }
 }
@@ -78,14 +75,24 @@ pub fn run() -> tauri::Result<()> {
     #[cfg(test)]
     {
         match std::env::args().nth(1).as_deref() {
-            Some("--native-smoke") => return smoke::run(false, None),
-            Some("--native-smoke-detected") => return smoke::run(true, None),
+            Some("--native-smoke") => return smoke::run(smoke::Case::Desktop, None),
+            Some("--native-smoke-detected") => return smoke::run(smoke::Case::Detected, None),
+            Some("--native-admission-exit") => {
+                return smoke::run(smoke::Case::ExitDuringInstall, None);
+            }
             Some("--native-exam-smoke") => return smoke::exams::launch(),
             Some("--native-exam-smoke-child") => {
                 let identity = std::env::args_os().nth(2).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "Missing fixture TLS identity")
                 })?;
-                return smoke::run(false, Some(PathBuf::from(identity)));
+                let case = if std::env::args_os().nth(3).as_deref()
+                    == Some(std::ffi::OsStr::new("guard-loss"))
+                {
+                    smoke::Case::GuardLoss
+                } else {
+                    smoke::Case::Exam
+                };
+                return smoke::run(case, Some(PathBuf::from(identity)));
             }
             Some("--native-vm-probe") => {
                 let start = std::time::Instant::now();
@@ -125,6 +132,7 @@ fn builder() -> tauri::Builder<Wry> {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             vm_preflight,
+            admission::admission_status,
             open_accoding,
             inspect_session,
             list_exams,
@@ -149,9 +157,9 @@ fn builder() -> tauri::Builder<Wry> {
 
 fn build_ui(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     app.manage(Preflight::new());
+    admission::Admission::launch(app);
     exam::ExamSession::launch(app);
-    schedule_preflight(app, false);
-    WebviewWindowBuilder::new(app, UI, WebviewUrl::App("index.html".into()))
+    let window = WebviewWindowBuilder::new(app, UI, WebviewUrl::App("index.html".into()))
         .title("CVBBMSO")
         .inner_size(560.0, 540.0)
         .min_inner_size(340.0, 320.0)
@@ -168,7 +176,9 @@ fn build_ui(app: &AppHandle) -> tauri::Result<WebviewWindow> {
                 && matches!(url.path(), "" | "/" | "/index.html")
         })
         .on_new_window(|_, _| NewWindowResponse::Deny)
-        .build()
+        .build()?;
+    schedule_preflight(app, false);
+    Ok(window)
 }
 
 fn schedule_preflight(app: &AppHandle, retry: bool) {
@@ -184,7 +194,11 @@ fn schedule_preflight(app: &AppHandle, retry: bool) {
         }
     };
     if let Some(work) = app.state::<Preflight>().schedule(retry, probe) {
-        async_runtime::spawn(work);
+        let app = app.clone();
+        async_runtime::spawn(async move {
+            work.await;
+            app.state::<admission::Admission>().start(&app, false);
+        });
     }
 }
 
@@ -204,10 +218,13 @@ async fn open_accoding(app: AppHandle) -> Result<(), &'static str> {
     if !app.state::<Preflight>().is_admitted() {
         return Err(PREFLIGHT_BLOCKED);
     }
-    async_runtime::spawn_blocking(move || open_browser(&app, &app.state::<Desktop>()))
-        .await
-        .map_err(|_| ERROR)?
-        .map_err(|_| ERROR)
+    app.state::<admission::Admission>().require_ready()?;
+    async_runtime::spawn_blocking(move || {
+        app.state::<admission::Admission>().require_ready()?;
+        open_browser(&app, &app.state::<Desktop>()).map_err(|_| ERROR)
+    })
+    .await
+    .map_err(|_| ERROR)?
 }
 
 fn open_browser(app: &AppHandle, desktop: &Desktop) -> tauri::Result<()> {
@@ -321,6 +338,7 @@ async fn inspect_session(app: AppHandle) -> Result<(), &'static str> {
     if !app.state::<Preflight>().is_admitted() {
         return Err(PREFLIGHT_BLOCKED);
     }
+    app.state::<admission::Admission>().require_ready()?;
     let retry = app.state::<exam::ExamSession>().cookie_retry();
     let observation = match current_cookies(&app).await {
         Ok(cookies) => {
@@ -373,7 +391,13 @@ async fn list_exams(app: AppHandle) -> Result<Vec<ExamSummary>, ListExamsError> 
         return Err(ListExamsError::PreflightBlocked);
     }
     let desktop = app.state::<Desktop>();
-    let monitor = desktop.monitor.as_ref().map_err(ListExamsError::from)?;
+    let monitor = match desktop.monitor.as_ref() {
+        Err(MonitorError::Configuration) => return Err(ListExamsError::MonitorUnconfigured),
+        _ if !app.state::<admission::Admission>().is_ready() => {
+            return Err(ListExamsError::PreflightBlocked);
+        }
+        monitor => monitor.map_err(ListExamsError::from)?,
+    };
     let cookies = current_cookies(&app).await.map_err(|error| match error {
         ReadSessionError::BrowserClosed
         | ReadSessionError::Invalid(AccodingError::MissingSession) => {
