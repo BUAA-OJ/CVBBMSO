@@ -29,6 +29,7 @@ use axum::{
     routing::get,
 };
 use cvbbmso_accoding::AccodingCookies;
+use cvbbmso_exam::ExamError;
 use cvbbmso_protocol::{
     AccodingUser, ClientHello, ClientMessage, ClientState, ExamListResponse, ExamPhase,
     ExamSummary, ExecutionState, Platform, RecordingPolicy, RecordingState, ServerMessage,
@@ -247,6 +248,7 @@ async fn monitor_validates_the_https_exam_list_and_returns_only_items() {
         .origin();
     let root = reqwest::Certificate::from_der(cert.as_ref()).unwrap();
     let monitor = Monitor::with_root_certificate(origin.clone(), root).unwrap();
+    assert_eq!(monitor.server_base().as_str(), format!("https://{addr}/"));
 
     let items = monitor.list_exams(&cookie("enrolled")).await.unwrap();
     assert_eq!(
@@ -266,25 +268,27 @@ async fn monitor_validates_the_https_exam_list_and_returns_only_items() {
     );
     assert!(matches!(
         monitor.list_exams(&cookie("expired")).await,
-        Err(MonitorError::SignInRequired)
+        Err(MonitorError::Request(ExamError::Auth))
     ));
     assert!(matches!(
         monitor.list_exams(&cookie("upstream-down")).await,
-        Err(MonitorError::Unavailable)
+        Err(MonitorError::Request(ExamError::HttpStatus(
+            StatusCode::SERVICE_UNAVAILABLE
+        )))
     ));
     assert!(matches!(
         monitor.list_exams(&cookie("malformed")).await,
-        Err(MonitorError::InvalidResponse(_))
+        Err(MonitorError::Request(ExamError::InvalidExamList(Some(_))))
     ));
     assert!(matches!(
         monitor.list_exams(&cookie("positional-list")).await,
-        Err(MonitorError::NonObjectResponse)
+        Err(MonitorError::Request(ExamError::InvalidExamList(None)))
     ));
 
     let untrusted = Monitor::new(Some(origin)).unwrap();
     assert!(matches!(
         untrusted.list_exams(&cookie("enrolled")).await,
-        Err(MonitorError::Connection(_))
+        Err(MonitorError::Request(ExamError::Http(Some(_))))
     ));
     assert!(matches!(
         Monitor::new(None),
@@ -329,7 +333,7 @@ async fn monitor_accepts_the_size_limit_and_stops_reading_chunked_overflow() {
         timeout(LIMIT, monitor.list_exams(&cookie("oversized")))
             .await
             .expect("the monitor transport must stop before the body ends"),
-        Err(MonitorError::ResponseTooLarge)
+        Err(MonitorError::Request(ExamError::InvalidExamList(None)))
     ));
     server.abort();
 }
@@ -360,9 +364,9 @@ async fn monitor_refuses_redirects_even_within_the_configured_origin() {
     let monitor = Monitor::with_root_certificate(origin, root).unwrap();
     assert!(matches!(
         monitor.list_exams(&cookie("enrolled")).await,
-        Err(MonitorError::UnexpectedStatus(
+        Err(MonitorError::Request(ExamError::HttpStatus(
             StatusCode::TEMPORARY_REDIRECT
-        ))
+        )))
     ));
     assert_eq!(target_hits.load(Ordering::Relaxed), 0);
     server.abort();

@@ -47,6 +47,7 @@ tauri-build.workspace = true
 axum = { workspace = true, features = ["http1", "json", "tokio", "ws"] }
 base64.workspace = true
 cvbbmso-accoding.workspace = true
+cvbbmso-exam.workspace = true
 cvbbmso-protocol.workspace = true
 futures-util.workspace = true
 rcgen.workspace = true

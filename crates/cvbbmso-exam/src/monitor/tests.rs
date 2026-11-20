@@ -7,7 +7,7 @@ use wiremock::{
     matchers::{header, method, path},
 };
 
-use super::{MAX_EXAM_LIST_BYTES, Monitor};
+use super::Monitor;
 use crate::ExamError;
 
 const EXAM: Uuid = Uuid::from_u128(0x10);
@@ -42,7 +42,7 @@ async fn monitor_answering(response: ResponseTemplate) -> (MockServer, Monitor) 
         .respond_with(response)
         .mount(&server)
         .await;
-    let monitor = Monitor::new(Url::parse(&server.uri()).unwrap()).unwrap();
+    let monitor = Monitor::for_test(Url::parse(&server.uri()).unwrap()).unwrap();
     (server, monitor)
 }
 
@@ -65,8 +65,14 @@ async fn an_exam_missing_from_the_list_is_not_enrolled() {
 }
 
 #[tokio::test]
-async fn statuses_map_to_runtime_categories() {
-    for (status, expected) in [(401, "auth"), (403, "not_enrolled"), (503, "http")] {
+async fn responses_map_to_runtime_categories() {
+    for (status, expected) in [
+        (201, "http"),
+        (401, "auth"),
+        (403, "not_enrolled"),
+        (404, "http"),
+        (503, "http"),
+    ] {
         let (_server, monitor) = monitor_answering(ResponseTemplate::new(status)).await;
 
         let error = monitor.enrollment(&cookies(), EXAM).await.unwrap_err();
@@ -74,29 +80,27 @@ async fn statuses_map_to_runtime_categories() {
         let actual = match error {
             ExamError::Auth => "auth",
             ExamError::NotEnrolled => "not_enrolled",
-            ExamError::Http(_) => "http",
+            ExamError::Http(None) => "http",
             other => panic!("unexpected {other:?}"),
         };
         assert_eq!(actual, expected, "status {status}");
     }
-}
 
-#[tokio::test]
-async fn malformed_or_oversized_bodies_are_rejected() {
-    let oversized = format!("{{\"padding\":\"{}\"}}", "x".repeat(MAX_EXAM_LIST_BYTES));
-    for body in ["[]".to_owned(), "{\"user\":{}}".to_owned(), oversized] {
-        let (_server, monitor) =
-            monitor_answering(ResponseTemplate::new(200).set_body_string(body)).await;
-
-        let error = monitor.enrollment(&cookies(), EXAM).await.unwrap_err();
-
-        assert!(matches!(error, ExamError::Http(None)), "{error:?}");
-    }
+    let (_server, monitor) =
+        monitor_answering(ResponseTemplate::new(200).set_body_json(json!({"user": {}}))).await;
+    assert!(matches!(
+        monitor.enrollment(&cookies(), EXAM).await,
+        Err(ExamError::Http(None))
+    ));
 }
 
 #[test]
 fn the_socket_request_targets_the_exam_and_carries_the_session() {
-    let monitor = Monitor::new(Url::parse("https://monitor.example.org:8443/").unwrap()).unwrap();
+    let monitor = Monitor::new(
+        Url::parse("https://monitor.example.org:8443/").unwrap(),
+        None,
+    )
+    .unwrap();
 
     let request = monitor.socket_request(&cookies(), EXAM).unwrap();
 
@@ -108,8 +112,9 @@ fn the_socket_request_targets_the_exam_and_carries_the_session() {
 }
 
 #[test]
-fn only_http_origins_are_accepted() {
+fn only_https_origins_are_accepted() {
     for base in [
+        "http://monitor.example.org/",
         "ftp://monitor.example.org/",
         "data:text/plain,monitor",
         "https://monitor.example.org/path",
@@ -117,6 +122,9 @@ fn only_http_origins_are_accepted() {
         "https://monitor.example.org/#fragment",
         "https://user:password@monitor.example.org/",
     ] {
-        assert!(Monitor::new(Url::parse(base).unwrap()).is_err(), "{base}");
+        assert!(
+            Monitor::new(Url::parse(base).unwrap(), None).is_err(),
+            "{base}"
+        );
     }
 }
