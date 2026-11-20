@@ -6,6 +6,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      windows_candidate_origin:
+        description: HTTPS monitor origin for a Windows x64 candidate. Leave empty for desktop smoke.
+        required: false
+        type: string
   workflow_call:
 
 permissions:
@@ -69,7 +74,7 @@ jobs:
 
   desktop-smoke:
     name: Desktop Release smoke (${{ matrix.os }})
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_candidate_origin == ''
     strategy:
       fail-fast: false
       matrix:
@@ -116,6 +121,45 @@ jobs:
           name: cvbbmso-client-windows-x64-acceptance
           path: target/release/cvbbmso-client.exe
           if-no-files-found: error
+          retention-days: 7
+
+  windows-candidate:
+    name: Windows x64 installer candidate
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_candidate_origin != ''
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x64-installer
+      - name: Build the candidate MSI
+        env:
+          MONITOR_ORIGIN: ${{ inputs.windows_candidate_origin }}
+        run: ./scripts/windows/build-candidate.ps1 -MonitorOrigin $env:MONITOR_ORIGIN -OutputDirectory "$env:RUNNER_TEMP/cvbbmso-candidate"
+      - name: Verify installation, imports and uninstall
+        run: ./scripts/windows/test-candidate-install.ps1 -CandidateDirectory "$env:RUNNER_TEMP/cvbbmso-candidate"
+      - name: Store the candidate for acceptance
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvbbmso-windows-x64-candidate-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/cvbbmso-candidate/*.msi
+            ${{ runner.temp }}/cvbbmso-candidate/candidate.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Store MSI diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvbbmso-windows-x64-msi-logs
+          path: ${{ runner.temp }}/cvbbmso-candidate/*.log
           retention-days: 7
 
   deny:
