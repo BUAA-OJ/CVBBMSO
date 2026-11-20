@@ -14,7 +14,12 @@ use uuid::Uuid;
 
 use crate::hub::{Connection, Hub, OUTBOUND_CAPACITY, Peer, SocketError, StudentKey};
 
-pub(crate) const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+pub(crate) fn message_limit(exam_duration: ::time::Duration) -> usize {
+    // Budget at least one segment per second, including fractional timestamps,
+    // and leave room for extra segments during capture recovery and finalizing.
+    let seconds = usize::try_from(exam_duration.whole_seconds()).unwrap_or(usize::MAX);
+    (2 * 1024 * 1024).max(seconds.saturating_add(60).saturating_mul(256))
+}
 
 pub(crate) async fn run(
     socket: WebSocket,
@@ -74,7 +79,7 @@ async fn session(mut socket: WebSocket, hub: Hub, connection: Connection, timeou
     let write = write_frames(&mut writer, outgoing, closing, timeout);
     let read = async {
         if let Ok(deadline) = admission.await {
-            read_frames(&mut reader, &hub, connection, timeout, deadline).await;
+            read_frames(&mut reader, &hub, connection, deadline).await;
         }
     };
     tokio::pin!(write);
@@ -100,7 +105,6 @@ async fn read_frames(
     reader: &mut (impl Stream<Item = Result<Message, axum::Error>> + Unpin),
     hub: &Hub,
     connection: Connection,
-    timeout: Duration,
     mut deadline: Instant,
 ) {
     let (reason, error) = loop {
@@ -109,12 +113,10 @@ async fn read_frames(
                 break (DisconnectReason::Closed, Some(SocketError::PROTOCOL_ERROR));
             }
             Ok(Some((message, received_at))) => {
-                if matches!(message, ClientMessage::Heartbeat) {
-                    deadline = received_at + timeout;
-                }
-                if !hub.receive(connection, message, received_at).await {
+                let Some(renewed) = hub.receive(connection, message, received_at).await else {
                     return;
-                }
+                };
+                deadline = renewed;
             }
             Ok(None) => break (DisconnectReason::Closed, None),
             Err(ReadError::Timeout) => break (DisconnectReason::HeartbeatTimeout, None),

@@ -2,15 +2,15 @@ use cvbbmso_protocol::{
     ClientState, CommandName, CommandStatus, ExamPhase, ExecutionState, RecordingState,
     ServerMessage, error_code,
 };
-use sea_orm::{DatabaseTransaction, EntityTrait, Set};
-use serde::Serialize;
+use sea_orm::{ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QuerySelect, Set};
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
     DomainError,
     db::{self, Runtime, StudentKey},
-    entity::command::{ActiveModel, Entity},
+    entity::command::{ActiveModel, Column, Entity},
     events,
     exam::update_state,
 };
@@ -35,11 +35,34 @@ pub(crate) fn due(
     })
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct CommandResult {
     status: CommandStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     error_code: Option<String>,
+}
+
+pub(crate) async fn has_end_result(
+    tx: &DatabaseTransaction,
+    key: &StudentKey,
+    recording: RecordingState,
+) -> Result<bool, DomainError> {
+    let expected = end_status(recording);
+    let results = Entity::find()
+        .filter(Column::ExamId.eq(key.exam.as_str()))
+        .filter(Column::OjUserId.eq(key.user))
+        .filter(Column::Name.eq("end_exam"))
+        .select_only()
+        .column(Column::Result)
+        .into_tuple::<String>()
+        .all(tx)
+        .await?;
+    for result in results {
+        if db::decode::<CommandResult>(&result)?.status == expected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) async fn record(
@@ -53,11 +76,15 @@ pub(crate) async fn record(
     if !valid_result(name, status, error_code.as_deref()) {
         return Err(DomainError::Conflict);
     }
-    let runtime = Runtime::get(tx, &key).await?;
-    if !runtime.connected {
-        return Err(DomainError::Conflict);
-    }
+    let runtime = Runtime::connected(tx, &key).await?;
+    let state = runtime.state()?;
     if name == CommandName::EndExam {
+        if state.execution == ExecutionState::Finished
+            && status != end_status(state.recording)
+            && has_end_result(tx, &key, state.recording).await?
+        {
+            return Err(DomainError::Conflict);
+        }
         if events::has_gap(tx, &key, runtime.ack_event_through).await? {
             return Err(DomainError::Conflict);
         }
@@ -79,10 +106,18 @@ pub(crate) async fn record(
     })
     .exec_without_returning(tx)
     .await?;
-    if let Some(state) = resulting_state(name, status, runtime.state()?) {
+    if let Some(state) = resulting_state(name, status, state) {
         update_state(tx, &key, state).await?;
     }
     Ok(())
+}
+
+fn end_status(recording: RecordingState) -> CommandStatus {
+    if recording == RecordingState::Complete {
+        CommandStatus::Completed
+    } else {
+        CommandStatus::Failed
+    }
 }
 
 fn valid_result(name: CommandName, status: CommandStatus, code: Option<&str>) -> bool {

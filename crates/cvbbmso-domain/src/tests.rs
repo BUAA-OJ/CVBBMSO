@@ -263,9 +263,21 @@ async fn enrollment_is_rechecked_and_removal_preserves_prior_evidence() {
         f.service.connect(f.exam, USER, hello.clone()).await,
         Err(DomainError::NotEnrolled)
     ));
-    assert!(f.runtime().await.connected);
-    f.receive(incident_event(2, time(START - 1))).await;
-    assert_eq!(f.incidents().await.len(), 2);
+    assert!(!f.runtime().await.connected);
+    assert!(matches!(
+        f.service
+            .receive(f.exam, USER, incident_event(2, time(START - 1)))
+            .await,
+        Err(DomainError::NotEnrolled)
+    ));
+    assert_eq!(
+        f.incidents()
+            .await
+            .iter()
+            .filter(|incident| incident.kind == "navigation_denied")
+            .count(),
+        1
+    );
     f.set(START);
     assert!(f.service.due_commands().await.unwrap().is_empty());
     f.admin(AdminOperation::ParticipantsAdd {
@@ -273,7 +285,13 @@ async fn enrollment_is_rechecked_and_removal_preserves_prior_evidence() {
         oj_user_id: USER,
     })
     .await;
-    sync(&f.connect(hello).await, ExamPhase::Running, 2);
+    assert!(matches!(
+        f.service
+            .receive(f.exam, USER, ClientMessage::Heartbeat)
+            .await,
+        Err(DomainError::NotEnrolled)
+    ));
+    sync(&f.connect(hello).await, ExamPhase::Running, 1);
 }
 
 #[tokio::test]
@@ -442,6 +460,22 @@ async fn out_of_order_events_preserve_ack_and_reject_conflicting_manifests() {
     };
     assert_eq!(incidents.len(), 1);
     assert_eq!(incidents[0].occurred_at, occurred_at);
+    let recordings = AdminOperation::RecordingsShow {
+        exam_id: f.exam,
+        oj_user_id: USER,
+    };
+    let admin = f.service.admin();
+    let query = || admin.execute("tester".into(), recordings.clone());
+    assert!(matches!(query().await, Err(DomainError::NotFound)));
+    f.receive(ClientMessage::Status {
+        state: state(ExecutionState::Finalizing, RecordingState::Failed),
+    })
+    .await;
+    assert!(matches!(query().await, Err(DomainError::NotFound)));
+    f.receive(ClientMessage::Status {
+        state: state(ExecutionState::Finalizing, RecordingState::Complete),
+    })
+    .await;
     let AdminOutput::Recording(recording) = f
         .admin(AdminOperation::RecordingsShow {
             exam_id: f.exam,
@@ -517,6 +551,31 @@ async fn end_success_requires_the_contiguous_manifest() {
         .connect(hello(ExecutionState::Finalizing, RecordingState::Complete))
         .await;
     let end = command(&outcome.commands[0], CommandName::EndExam, END);
+    let finished = |recording| {
+        f.service
+            .connect(f.exam, USER, hello(ExecutionState::Finished, recording))
+    };
+    assert!(matches!(
+        finished(RecordingState::Complete).await,
+        Err(DomainError::Conflict)
+    ));
+    // The previous server could persist a finished hello without an end result.
+    let database = f.service.admin().0.database;
+    crate::entity::runtime::Entity::update(crate::entity::runtime::ActiveModel {
+        exam_id: Set(f.exam.to_string()),
+        oj_user_id: Set(USER),
+        execution: Set("finished".into()),
+        ..Default::default()
+    })
+    .exec_without_returning(&database)
+    .await
+    .unwrap();
+    assert!(matches!(
+        finished(RecordingState::Complete).await,
+        Err(DomainError::Conflict)
+    ));
+    f.connect(hello(ExecutionState::Finalizing, RecordingState::Complete))
+        .await;
     let report = || f.report(end, CommandName::EndExam, CommandStatus::Completed, None);
     assert!(matches!(report().await, Err(DomainError::Conflict)));
     let (finalized, _) = recording_event(2, 'b');
@@ -543,12 +602,35 @@ async fn end_success_requires_the_contiguous_manifest() {
     f.receive(incident_event(1, time(END))).await;
     report().await.unwrap();
     assert_eq!(f.runtime().await.execution, ExecutionState::Finished);
+    let replay = f
+        .connect(hello(ExecutionState::Finalizing, RecordingState::Failed))
+        .await;
+    let replay = command(&replay.commands[0], CommandName::EndExam, END);
+    assert!(matches!(
+        f.report(
+            replay,
+            CommandName::EndExam,
+            CommandStatus::Failed,
+            Some(error_code::RECORDING_FINISH_FAILED)
+        )
+        .await,
+        Err(DomainError::Conflict)
+    ));
+    assert!(matches!(
+        finished(RecordingState::Failed).await,
+        Err(DomainError::Conflict)
+    ));
     f.service
         .disconnect(f.exam, USER, DisconnectReason::Closed)
         .await
         .unwrap();
     assert!(!f.runtime().await.connected);
     assert_eq!(f.incidents().await.len(), 1);
+    sync(
+        &finished(RecordingState::Complete).await.unwrap(),
+        ExamPhase::Ended,
+        2,
+    );
 }
 
 #[tokio::test]

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use cvbbmso_protocol::{
-    ExamEvent, ExamSummary, ExecutionState, RecordingManifest, RecordingPolicy,
+    ExamEvent, ExamSummary, ExecutionState, RecordingManifest, RecordingPolicy, RecordingState,
 };
 use sea_orm::{
     ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QueryTrait, Set,
@@ -11,10 +11,10 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    DomainError, Service,
+    DisconnectReason, DomainError, Service,
     db::{self, Runtime, StudentKey},
     entity::{audit as stored_audit, enrollment, event, exam, incident, runtime},
-    events as stored_events,
+    events as stored_events, exam as exam_service,
 };
 
 /// A management operation to perform against the shared exam database.
@@ -283,6 +283,9 @@ async fn mutate(
             let deleted = enrollment::Entity::delete_by_id(key.id()).exec(tx).await?;
             if deleted.rows_affected == 0 {
                 return Err(DomainError::NotFound);
+            }
+            if let Some(runtime) = Runtime::find(tx, &key).await? {
+                exam_service::disconnect(tx, &runtime, DisconnectReason::Closed, now).await?;
             }
             AdminOutput::ParticipantRemoved
         }
@@ -567,6 +570,9 @@ impl IncidentFilter {
 }
 
 async fn recording(tx: &DatabaseTransaction, key: &StudentKey) -> Result<AdminOutput, DomainError> {
+    if Runtime::get(tx, key).await?.state()?.recording != RecordingState::Complete {
+        return Err(DomainError::NotFound);
+    }
     let (_, manifest) = stored_events::recording(tx, key)
         .await?
         .ok_or(DomainError::NotFound)?;

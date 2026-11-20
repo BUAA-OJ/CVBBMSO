@@ -126,7 +126,7 @@ impl ExamService {
         db::exams(&self.0.database, Some(oj_user_id), self.0.now()).await
     }
 
-    /// Checks whether the Accoding user is enrolled in the exam.
+    /// Checks enrollment and returns the scheduled exam duration.
     ///
     /// # Errors
     ///
@@ -137,10 +137,26 @@ impl ExamService {
         &self,
         exam_id: Uuid,
         oj_user_id: i64,
-    ) -> Result<(), DomainError> {
+    ) -> Result<time::Duration, DomainError> {
         let key = StudentKey::new(exam_id, oj_user_id)?;
         db::transaction(&self.0.database, |tx| {
-            Box::pin(async move { db::enrollment(tx, &key).await.map(|_| ()) })
+            Box::pin(async move {
+                let (start, end) = db::enrollment(tx, &key).await?.times()?;
+                Ok(end - start)
+            })
+        })
+        .await
+    }
+
+    /// Checks that the student's existing connection can still receive acknowledgements.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the student is no longer enrolled or connected, or storage fails.
+    pub async fn check_connected(&self, exam_id: Uuid, oj_user_id: i64) -> Result<(), DomainError> {
+        let key = StudentKey::new(exam_id, oj_user_id)?;
+        db::transaction(&self.0.database, |tx| {
+            Box::pin(async move { Runtime::connected(tx, &key).await.map(|_| ()) })
         })
         .await
     }
@@ -181,9 +197,7 @@ impl ExamService {
     ) -> Result<(), DomainError> {
         let key = StudentKey::new(exam_id, oj_user_id)?;
         let now = self.0.now();
-        db::write(&self.0.database, |tx| {
-            let key = key.clone();
-            let message = message.clone();
+        db::transaction(&self.0.database, |tx| {
             Box::pin(async move { receive(tx, &key, message, now).await })
         })
         .await
@@ -209,14 +223,9 @@ impl ExamService {
         error_code: Option<String>,
     ) -> Result<(), DomainError> {
         let key = StudentKey::new(exam_id, oj_user_id)?;
-        db::write(&self.0.database, |tx| {
+        db::transaction(&self.0.database, |tx| {
             Box::pin(commands::record(
-                tx,
-                key.clone(),
-                command_id,
-                name,
-                status,
-                error_code.clone(),
+                tx, key, command_id, name, status, error_code,
             ))
         })
         .await
@@ -285,11 +294,25 @@ async fn connect(
     use runtime::Column;
 
     let exam = db::enrollment(tx, key).await?;
-    let mut ack_event_through = 0;
-    if let Some(old) = Runtime::find(tx, key).await? {
-        restore_connection(tx, key, &old, hello, now).await?;
-        ack_event_through = old.ack_event_through;
+    let old = Runtime::find(tx, key).await?;
+    let mut committed = old
+        .as_ref()
+        .map(Runtime::state)
+        .transpose()?
+        .filter(|state| state.execution == ExecutionState::Finished);
+    if let Some(state) = committed
+        && !commands::has_end_result(tx, key, state.recording).await?
+    {
+        committed = None;
     }
+    if hello.state.execution == ExecutionState::Finished && committed != Some(hello.state) {
+        return Err(DomainError::Conflict);
+    }
+    if let Some(old) = &old {
+        restore_connection(tx, key, old, hello, now).await?;
+    }
+    let ack_event_through = old.map_or(0, |runtime| runtime.ack_event_through);
+    let state = committed.unwrap_or(hello.state);
 
     runtime::Entity::insert(runtime::ActiveModel {
         exam_id: Set(key.exam.clone()),
@@ -297,8 +320,8 @@ async fn connect(
         device_id: Set(hello.device_id.to_string()),
         instance_id: Set(hello.instance_id.to_string()),
         connected: Set(true),
-        execution: Set(db::enum_name(hello.state.execution)?),
-        recording: Set(db::enum_name(hello.state.recording)?),
+        execution: Set(db::enum_name(state.execution)?),
+        recording: Set(db::enum_name(state.recording)?),
         last_seen_at: Set(db::stored_time(now)?),
         ack_event_through: Set(ack_event_through),
     })
@@ -319,7 +342,13 @@ async fn connect(
 
     let (start_at, end_at) = exam.times()?;
     let phase = db::phase(start_at, end_at, now);
-    let commands = commands::due(hello.state, start_at, end_at, now)
+    // A client that missed the ACK must be able to report the end result again.
+    let command_state = if hello.state.execution == ExecutionState::Finalizing {
+        hello.state
+    } else {
+        state
+    };
+    let commands = commands::due(command_state, start_at, end_at, now)
         .into_iter()
         .collect();
     Ok(ConnectOutcome {
@@ -373,10 +402,7 @@ async fn receive(
     message: ClientMessage,
     now: OffsetDateTime,
 ) -> Result<(), DomainError> {
-    let runtime = Runtime::get(tx, key).await?;
-    if !runtime.connected {
-        return Err(DomainError::NotFound);
-    }
+    let runtime = Runtime::connected(tx, key).await?;
     match message {
         ClientMessage::Heartbeat => {
             runtime::Entity::update(runtime::ActiveModel {
@@ -421,7 +447,7 @@ pub(crate) async fn update_state(
     Ok(())
 }
 
-async fn disconnect(
+pub(crate) async fn disconnect(
     tx: &DatabaseTransaction,
     runtime: &Runtime,
     reason: DisconnectReason,

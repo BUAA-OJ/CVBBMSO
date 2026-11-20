@@ -72,10 +72,15 @@ struct Fixture {
     _files: tempfile::TempDir,
     tasks: Vec<JoinHandle<()>>,
     clients: mpsc::UnboundedSender<DuplexStream>,
+    write_retries: Arc<tokio::sync::Notify>,
 }
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_exam(END, 30).await
+    }
+
+    async fn with_exam(end: i64, segment_seconds: u32) -> Self {
         let clock = Arc::new(AtomicI64::new(START - 1));
         let injected_clock = Arc::clone(&clock);
         let files = tempfile::tempdir().unwrap();
@@ -95,8 +100,8 @@ impl Fixture {
                 AdminOperation::ExamsCreate {
                     title: "Final exam".into(),
                     start_at: instant(START),
-                    end_at: instant(END),
-                    policy: RecordingPolicy::new(30, 15).unwrap(),
+                    end_at: instant(end),
+                    policy: RecordingPolicy::new(segment_seconds, 15).unwrap(),
                 },
             )
             .await
@@ -115,6 +120,7 @@ impl Fixture {
             .await
             .unwrap();
         let (hub, manager) = Manager::new(Arc::clone(&exam), TIMEOUT);
+        let write_retries = Arc::clone(&manager.write_retries);
         let state = AppState {
             exam,
             verifier: Arc::new(IdentityVerifier::Test(Box::new(|cookies| {
@@ -149,6 +155,7 @@ impl Fixture {
             _files: files,
             tasks,
             clients,
+            write_retries,
         }
     }
 
@@ -399,11 +406,143 @@ async fn validates_first_message_and_rechecks_enrollment_after_upgrade() {
 }
 
 #[tokio::test]
+async fn revoking_enrollment_rejects_events_on_the_existing_socket() {
+    let fixture = Fixture::new().await;
+    let state = hello(ExecutionState::Ready, RecordingState::Idle);
+    let mut socket = open_socket(&fixture, &state, 0).await;
+    send(&mut socket, &navigation(1, "before")).await;
+    close_socket(&fixture, &mut socket).await;
+    let mut socket = open_socket(&fixture, &state, 1).await;
+    fixture
+        .admin(AdminOperation::ParticipantsRemove {
+            exam_id: fixture.exam_id,
+            oj_user_id: STUDENT,
+        })
+        .await;
+    send(&mut socket, &navigation(2, "after")).await;
+    socket_error(&mut socket, error_code::NOT_ENROLLED).await;
+
+    fixture
+        .admin(AdminOperation::ParticipantsAdd {
+            exam_id: fixture.exam_id,
+            oj_user_id: STUDENT,
+        })
+        .await;
+    let mut socket = open_socket(&fixture, &state, 1).await;
+    fixture
+        .admin(AdminOperation::ParticipantsRemove {
+            exam_id: fixture.exam_id,
+            oj_user_id: STUDENT,
+        })
+        .await;
+    fixture
+        .admin(AdminOperation::ParticipantsAdd {
+            exam_id: fixture.exam_id,
+            oj_user_id: STUDENT,
+        })
+        .await;
+    send(&mut socket, &navigation(2, "after re-enrolling")).await;
+    socket_error(&mut socket, error_code::NOT_ENROLLED).await;
+    assert_eq!(events(&fixture).await.len(), 1);
+}
+
+#[tokio::test]
+async fn sqlite_contention_keeps_a_second_socket_open() {
+    use sea_orm::{ConnectionTrait, Database, TransactionTrait};
+    use tokio::time::timeout;
+
+    let fixture = Fixture::new().await;
+    fixture
+        .admin(AdminOperation::ParticipantsAdd {
+            exam_id: fixture.exam_id,
+            oj_user_id: OTHER_STUDENT,
+        })
+        .await;
+    let state = hello(ExecutionState::Ready, RecordingState::Idle);
+    let mut first = open_socket(&fixture, &state, 0).await;
+    let mut other = fixture
+        .upgrade(&fixture.path(), "connect.sid=other")
+        .await
+        .unwrap();
+    send(&mut other, &state).await;
+    assert!(matches!(
+        message(&mut other).await,
+        ServerMessage::Sync { .. }
+    ));
+
+    let writer = Database::connect(&fixture.database_url).await.unwrap();
+    let lock = writer.begin().await.unwrap();
+    lock.execute_unprepared("UPDATE exams SET title = title")
+        .await
+        .unwrap();
+    close_socket(&fixture, &mut first).await;
+
+    send(&mut other, &ClientMessage::Heartbeat).await;
+    timeout(TIMEOUT, fixture.write_retries.notified())
+        .await
+        .unwrap();
+    send(&mut other, &navigation(1, "during lock")).await;
+    lock.rollback().await.unwrap();
+
+    send(&mut other, &navigation(2, "after unlock")).await;
+    close_socket(&fixture, &mut other).await;
+    let stored = fixture
+        .admin(AdminOperation::EventsList {
+            exam_id: fixture.exam_id,
+            oj_user_id: OTHER_STUDENT,
+        })
+        .await;
+    assert!(
+        matches!(stored, AdminOutput::Events(rows) if rows.iter().map(|row| row.seq).eq([1, 2]))
+    );
+    fixture.state.hub.trigger_schedule().await;
+    fixture.state.hub.barrier().await;
+    assert_eq!(
+        incidents(&fixture)
+            .await
+            .iter()
+            .filter(|incident| incident.kind == "connection_lost" && incident.oj_user_id == STUDENT)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn disconnect_storage_failure_is_reconciled() {
+    use sea_orm::{ConnectionTrait, Database};
+
+    let fixture = Fixture::new().await;
+    let state = hello(ExecutionState::Ready, RecordingState::Idle);
+    let mut socket = open_socket(&fixture, &state, 0).await;
+    let db = Database::connect(&fixture.database_url).await.unwrap();
+    db.execute_unprepared("CREATE TRIGGER reject_disconnect BEFORE UPDATE OF connected ON student_runtimes WHEN NEW.connected = 0 BEGIN SELECT RAISE(ABORT, 'test failure'); END")
+        .await.unwrap();
+    close_socket(&fixture, &mut socket).await;
+    let mut replacement = fixture.upgrade(&fixture.path(), COOKIE).await.unwrap();
+    send(&mut replacement, &state).await;
+    socket_error(&mut replacement, error_code::INTERNAL_ERROR).await;
+    db.execute_unprepared("DROP TRIGGER reject_disconnect")
+        .await
+        .unwrap();
+    fixture.state.hub.trigger_schedule().await;
+    fixture.state.hub.barrier().await;
+    let stored = fixture
+        .admin(AdminOperation::StudentsShow {
+            exam_id: fixture.exam_id,
+            oj_user_id: STUDENT,
+        })
+        .await;
+    assert!(matches!(stored, AdminOutput::Student(runtime) if !runtime.connected));
+    assert_eq!(incidents(&fixture).await.len(), 1);
+}
+
+#[tokio::test]
 async fn limits_the_total_size_of_a_fragmented_message() {
     let fixture = Fixture::new().await;
     let mut socket = fixture.upgrade(&fixture.path(), COOKIE).await.unwrap();
     for (opcode, final_frame) in [(Data::Text, false), (Data::Continue, true)] {
-        let bytes = vec![b' '; socket::MAX_MESSAGE_BYTES / 2 + 1];
+        let limit = socket::message_limit(time::Duration::seconds(END - START));
+        let bytes = vec![b' '; limit / 2 + 1];
         socket
             .send(Message::Frame(Frame::message(
                 bytes,
@@ -417,6 +556,38 @@ async fn limits_the_total_size_of_a_fragmented_message() {
     let state = hello(ExecutionState::Ready, RecordingState::Idle);
     let mut socket = open_socket(&fixture, &state, 0).await;
     close_socket(&fixture, &mut socket).await;
+}
+
+#[tokio::test]
+async fn accepts_a_two_hour_manifest_with_one_second_segments() {
+    let end = START + 7_200;
+    let fixture = Fixture::with_exam(end, 1).await;
+    fixture.clock.store(end, Ordering::Relaxed);
+    let state = hello(ExecutionState::Finalizing, RecordingState::Complete);
+    let mut socket = open_socket(&fixture, &state, 0).await;
+    let id = command(&mut socket, CommandName::EndExam, end).await;
+    let digest = Sha256Digest::parse(&"b".repeat(64)).unwrap();
+    let segments = (1..=7_200)
+        .map(|index| {
+            let end = instant(START + i64::from(index));
+            SegmentMeta::new(index, end - time::Duration::SECOND, end, digest.clone()).unwrap()
+        })
+        .collect();
+    let manifest = RecordingManifest::new(segments, digest).unwrap();
+    let event = ClientMessage::Event {
+        seq: 1,
+        event: ExamEvent::RecordingFinalized(manifest.clone()),
+    };
+    assert!(serde_json::to_vec(&event).unwrap().len() > 1024 * 1024);
+    send(&mut socket, &event).await;
+    confirm(&mut socket, id).await;
+    let stored = fixture
+        .admin(AdminOperation::RecordingsShow {
+            exam_id: fixture.exam_id,
+            oj_user_id: STUDENT,
+        })
+        .await;
+    assert!(matches!(stored, AdminOutput::Recording(found) if found == manifest));
 }
 
 async fn confirm(socket: &mut TestSocket, command_id: Uuid) {
@@ -801,6 +972,7 @@ async fn replacement_ignores_old_close_timeout_and_event_notices() {
             .hub
             .receive(previous, navigation(1, "stale"), Instant::now())
             .await
+            .is_none()
     );
     fixture.state.hub.barrier().await;
     assert!(events(&fixture).await.is_empty());
@@ -885,6 +1057,7 @@ async fn heartbeat_renews_the_exact_deadline_and_timeout_is_recorded_once() {
             .hub
             .receive(connection, ClientMessage::Heartbeat, received_at)
             .await
+            .is_some()
     );
     fixture.state.hub.barrier().await;
     time::advance(original_deadline - Instant::now()).await;

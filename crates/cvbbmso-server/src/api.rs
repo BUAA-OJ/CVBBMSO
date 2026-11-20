@@ -129,11 +129,12 @@ async fn upgrade(
     let upgrade = upgrade.map_err(|_| HttpError::INVALID_REQUEST)?;
     validate_upgrade_headers(&headers)?;
     let user = state.authenticate(&headers).await?;
-    state
+    let duration = state
         .exam
         .check_enrollment(exam_id, user.id)
         .await
         .map_err(|error| HttpError::domain(&error))?;
+    let message_limit = socket::message_limit(duration);
     let key = StudentKey {
         exam_id,
         oj_user_id: user.id,
@@ -141,8 +142,8 @@ async fn upgrade(
     let request_span = Span::current();
     let failure_span = request_span.clone();
     Ok(upgrade
-        .max_frame_size(socket::MAX_MESSAGE_BYTES)
-        .max_message_size(socket::MAX_MESSAGE_BYTES)
+        .max_frame_size(message_limit)
+        .max_message_size(message_limit)
         .on_failed_upgrade(move |_| {
             failure_span.in_scope(|| tracing::warn!("WebSocket upgrade failed"));
         })

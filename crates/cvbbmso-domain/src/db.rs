@@ -227,6 +227,14 @@ pub(crate) async fn enrollment(
     key: &StudentKey,
 ) -> Result<StoredExam, DomainError> {
     let exam = exam(db, &key.exam).await?;
+    require_enrollment(db, key).await?;
+    Ok(exam)
+}
+
+pub(crate) async fn require_enrollment(
+    db: &impl ConnectionTrait,
+    key: &StudentKey,
+) -> Result<(), DomainError> {
     if enrollment::Entity::find_by_id(key.id())
         .one(db)
         .await?
@@ -234,7 +242,7 @@ pub(crate) async fn enrollment(
     {
         return Err(DomainError::NotEnrolled);
     }
-    Ok(exam)
+    Ok(())
 }
 
 pub(crate) fn phase(
@@ -264,6 +272,18 @@ impl Runtime {
         key: &StudentKey,
     ) -> Result<Self, DomainError> {
         Self::find(db, key).await?.ok_or(DomainError::NotFound)
+    }
+
+    pub(crate) async fn connected(
+        db: &impl ConnectionTrait,
+        key: &StudentKey,
+    ) -> Result<Self, DomainError> {
+        require_enrollment(db, key).await?;
+        let runtime = Self::get(db, key).await?;
+        if !runtime.connected {
+            return Err(DomainError::NotEnrolled);
+        }
+        Ok(runtime)
     }
 
     pub(crate) async fn online(db: &impl ConnectionTrait) -> Result<Vec<Self>, DomainError> {

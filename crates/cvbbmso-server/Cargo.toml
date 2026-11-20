@@ -23,6 +23,7 @@ tracing-subscriber = { workspace = true, features = ["json"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
+sea-orm = { workspace = true, features = ["runtime-tokio", "sqlx-sqlite"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { workspace = true, features = ["handshake"] }

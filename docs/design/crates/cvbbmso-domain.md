@@ -55,8 +55,13 @@ impl ExamService {
         &self, oj_user_id: i64,
     ) -> Result<Vec<cvbbmso_protocol::ExamSummary>, DomainError>;
 
-    /// 在同一只读快照中先检查考试存在，再检查报名。
+    /// 在同一只读快照中先检查考试存在，再检查报名，并返回考试时长。
     pub async fn check_enrollment(
+        &self, exam_id: uuid::Uuid, oj_user_id: i64,
+    ) -> Result<time::Duration, DomainError>;
+
+    /// 确认报名前置检查通过，且现有连接仍可接收回执。
+    pub async fn check_connected(
         &self, exam_id: uuid::Uuid, oj_user_id: i64,
     ) -> Result<(), DomainError>;
 
@@ -123,7 +128,7 @@ impl AdminService {
 
 `ExamService::check_enrollment` 接收正数用户 ID。参数无效返回 `InvalidInput`，考试缺失返回 `NotFound`，考试存在但未报名返回 `NotEnrolled`，数据库读取失败返回 `Storage`。WS 升级后由 `connect` 在写事务内重新验证。
 
-`ExamService::connect` 验证报名资格，并在相同 `(exam_id, oj_user_id)` 上恢复既有状态。`hello.state` 是客户端连接时刻的真实状态；服务端据此校正持久状态并决定是否生成命令。
+`ExamService::connect` 验证报名资格，并在相同 `(exam_id, oj_user_id)` 上恢复既有状态。服务端根据 `hello.state` 决定是否生成命令。`hello` 上报 `finished` 时，服务端核对已持久化的完成状态和对应的 `end_exam` 终态回执。
 
 `connect` 记录异常的条件：
 
@@ -224,7 +229,7 @@ pub struct IncidentRecord {
 
 `actor` 由 CLI 提供，缺省为当前操作系统用户名。审计记录包含整数 `audit_id`、`actor`、序列化的操作类型与参数，以及 `occurred_at`；创建考试的审计包含生成的 `exam_id`。`AdminOperation` 的输入先经过域层校验：`start_at < end_at`，`RecordingPolicy` 参数大于零，`oj_user_id` 为正整数，CSV 导入去重。报名只能在 `now < start_at` 时撤销，时间检查与删除在同一事务内完成。错误以 `DomainError` 返回，由 server 或 CLI 映射为对外错误。
 
-`RecordingsShow` 从 `recording_finalized` 事件读取已上报的 `RecordingManifest`。没有摘要事件时返回 `NotFound`。
+`RecordingsShow` 在录像状态为 `complete` 时从 `recording_finalized` 事件读取 `RecordingManifest`。尚未 finalize、finalize 失败或没有摘要事件时返回 `NotFound`。
 
 ## 数据所有权
 

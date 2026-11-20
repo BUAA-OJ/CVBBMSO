@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, VecDeque, hash_map::Entry},
     sync::Arc,
     time::Duration,
 };
@@ -11,7 +11,7 @@ use cvbbmso_protocol::{
 use time::OffsetDateTime;
 use tokio::{
     sync::{mpsc, oneshot},
-    time::{Instant, MissedTickBehavior, interval},
+    time::{Instant, MissedTickBehavior, interval, sleep},
 };
 use uuid::Uuid;
 
@@ -19,6 +19,13 @@ const INBOUND_CAPACITY: usize = 256;
 pub(crate) const OUTBOUND_CAPACITY: usize = 32;
 const SCHEDULE_INTERVAL: Duration = Duration::from_secs(1);
 const DISCONNECT_RETRY_BATCH: usize = 16;
+const WRITE_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+enum ReceiveOutcome {
+    Continue(Instant),
+    Retry(ClientMessage),
+    Stop,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct StudentKey {
@@ -52,7 +59,7 @@ enum Request {
         connection: Connection,
         message: ClientMessage,
         received_at: Instant,
-        processed: oneshot::Sender<()>,
+        processed: oneshot::Sender<ReceiveOutcome>,
     },
     End {
         connection: Connection,
@@ -84,10 +91,28 @@ impl Hub {
     pub(crate) async fn receive(
         &self,
         connection: Connection,
+        mut message: ClientMessage,
+        received_at: Instant,
+    ) -> Option<Instant> {
+        loop {
+            // Keep retries local to the reader so it cannot reorder or pile up messages.
+            match self.receive_once(connection, message, received_at).await? {
+                ReceiveOutcome::Continue(deadline) => return Some(deadline),
+                ReceiveOutcome::Stop => return None,
+                ReceiveOutcome::Retry(retry) => {
+                    message = retry;
+                    sleep(WRITE_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+
+    async fn receive_once(
+        &self,
+        connection: Connection,
         message: ClientMessage,
         received_at: Instant,
-    ) -> bool {
-        // Let each reader contribute at most one application message to the shared queue.
+    ) -> Option<ReceiveOutcome> {
         let (processed, completion) = oneshot::channel();
         self.0
             .send(Request::Receive {
@@ -97,8 +122,8 @@ impl Hub {
                 processed,
             })
             .await
-            .is_ok()
-            && completion.await.is_ok()
+            .ok()?;
+        completion.await.ok()
     }
 
     pub(crate) async fn end(
@@ -206,7 +231,7 @@ impl Current {
         let result = (status, error_code);
         match &command.result {
             Some(previous) if previous != &result => return Err(DomainError::Conflict),
-            Some(_) => {}
+            Some(_) => exam.check_connected(exam_id, oj_user_id).await?,
             None => {
                 exam.record_command_result(
                     exam_id,
@@ -238,8 +263,10 @@ pub(crate) struct Manager {
     exam: Arc<ExamService>,
     requests: mpsc::Receiver<Request>,
     current: HashMap<StudentKey, Current>,
-    lost: HashMap<StudentKey, LostConnection>,
+    lost: VecDeque<LostConnection>,
     timeout: Duration,
+    #[cfg(test)]
+    pub(crate) write_retries: Arc<tokio::sync::Notify>,
 }
 
 impl Manager {
@@ -251,8 +278,10 @@ impl Manager {
                 exam,
                 requests,
                 current: HashMap::new(),
-                lost: HashMap::new(),
+                lost: VecDeque::new(),
                 timeout,
+                #[cfg(test)]
+                write_retries: Arc::default(),
             },
         )
     }
@@ -273,8 +302,8 @@ impl Manager {
                     received_at,
                     processed,
                 } => {
-                    self.receive(connection, message, received_at).await;
-                    let _ = processed.send(());
+                    let outcome = self.receive(connection, message, received_at).await;
+                    let _ = processed.send(outcome);
                 }
                 Request::End {
                     connection,
@@ -297,10 +326,16 @@ impl Manager {
 
     async fn connect(&mut self, connection: Connection, hello: ClientHello, peer: Peer) {
         // Commit the previous socket's loss before marking this student connected again.
-        if !self.record_lost(connection.student).await {
-            connection
-                .span()
-                .in_scope(|| tracing::warn!("WebSocket admission deferred while SQLite is busy"));
+        if let Some(index) = self
+            .lost
+            .iter()
+            .position(|lost| lost.connection.student == connection.student)
+            && let Some(lost) = self.lost.remove(index)
+            && !self.record_lost(lost).await
+        {
+            connection.span().in_scope(|| {
+                tracing::warn!("WebSocket admission deferred until disconnect is recorded");
+            });
             let _ = peer.close.send(Some(SocketError::INTERNAL_ERROR));
             return;
         }
@@ -345,27 +380,35 @@ impl Manager {
         connection: Connection,
         message: ClientMessage,
         received_at: Instant,
-    ) {
+    ) -> ReceiveOutcome {
         let Some(current) = self
             .current
             .get_mut(&connection.student)
             .filter(|current| current.connection.id == connection.id)
         else {
-            return;
+            return ReceiveOutcome::Stop;
         };
         if received_at >= current.deadline {
             self.end(connection, DisconnectReason::HeartbeatTimeout, None)
                 .await;
-            return;
+            return ReceiveOutcome::Stop;
         }
         let heartbeat = matches!(message, ClientMessage::Heartbeat);
-        match current.receive(&self.exam, message).await {
+        match current.receive(&self.exam, message.clone()).await {
             Ok(true) => {
                 if heartbeat {
-                    current.deadline = received_at + self.timeout;
+                    current.deadline = current.deadline.max(received_at + self.timeout);
                 }
+                return ReceiveOutcome::Continue(current.deadline);
             }
             Ok(false) => self.end(connection, DisconnectReason::Closed, None).await,
+            Err(error) if error.is_storage_busy() => {
+                // The reader cannot process a newer heartbeat until this write finishes.
+                current.deadline = current.deadline.max(Instant::now() + self.timeout);
+                #[cfg(test)]
+                self.write_retries.notify_one();
+                return ReceiveOutcome::Retry(message);
+            }
             Err(error) => {
                 self.end(
                     connection,
@@ -375,6 +418,7 @@ impl Manager {
                 .await;
             }
         }
+        ReceiveOutcome::Stop
     }
 
     async fn end(
@@ -394,18 +438,13 @@ impl Manager {
             return;
         }
         let current = current.remove();
-        self.lost.insert(
-            student,
-            LostConnection {
-                connection,
-                reason,
-                observed_at: self.exam.now(),
-            },
-        );
+        let lost = LostConnection {
+            connection,
+            reason,
+            observed_at: self.exam.now(),
+        };
         let span = connection.span();
-        if !self.record_lost(student).await {
-            span.in_scope(|| tracing::warn!("SQLite is busy; deferring disconnect record"));
-        }
+        self.record_lost(lost).await;
         span.in_scope(|| {
             if let Some(error) = error {
                 tracing::warn!(code = error.code, "WebSocket message rejected");
@@ -415,40 +454,39 @@ impl Manager {
         let _ = current.close.send(error);
     }
 
-    /// Returns false when SQLite is busy and the record must be retried.
-    async fn record_lost(&mut self, student: StudentKey) -> bool {
-        let Some(lost) = self.lost.get(&student).copied() else {
-            return true;
-        };
+    /// Retains failed writes so the database can be reconciled before reconnect.
+    async fn record_lost(&mut self, lost: LostConnection) -> bool {
         let StudentKey {
             exam_id,
             oj_user_id,
-        } = student;
+        } = lost.connection.student;
         match self
             .exam
             .disconnect_at(exam_id, oj_user_id, lost.reason, lost.observed_at)
             .await
         {
-            Err(error) if error.is_storage_busy() => return false,
-            Err(error) => lost
-                .connection
-                .span()
-                .in_scope(|| tracing::error!(?error, "could not record WebSocket disconnect")),
-            Ok(()) => {}
+            Ok(()) | Err(DomainError::NotFound) => true,
+            Err(error) => {
+                if !error.is_storage_busy() {
+                    lost.connection.span().in_scope(|| {
+                        tracing::error!(
+                            ?error,
+                            "could not record WebSocket disconnect; will retry"
+                        );
+                    });
+                }
+                self.lost.push_back(lost);
+                false
+            }
         }
-        self.lost.remove(&student);
-        true
     }
 
     async fn retry_lost(&mut self) {
-        for _ in 0..DISCONNECT_RETRY_BATCH {
-            let Some(student) = self.lost.keys().next().copied() else {
+        for _ in 0..self.lost.len().min(DISCONNECT_RETRY_BATCH) {
+            let Some(lost) = self.lost.pop_front() else {
                 break;
             };
-            if !self.record_lost(student).await {
-                // A locked database applies to all pending disconnects.
-                break;
-            }
+            self.record_lost(lost).await;
         }
     }
 

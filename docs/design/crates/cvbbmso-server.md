@@ -54,7 +54,7 @@ async fn serve(config: ServerConfig) -> Result<(), ServerError>;
 
 ## WebSocket 处理
 
-协议端点为 `wss://<监考服务端>/api/exams/{exam_id}/ws`。服务端在升级前从握手 Cookie 确认考生身份，失败时按上表返回同格式的 HTTP 错误。升级成功后，客户端先发送 `hello`，服务端调用 `ExamService::connect(exam_id, oj_user_id, hello)` 返回 `sync` 和待下发的新命令。后续 `heartbeat`、`status`、`event` 交给 `ExamService::receive`；会话校验 `command_result` 后交给 `ExamService::record_command_result`。入站 WebSocket 帧和完整消息各限 1 MiB，每条连接最多有一条应用消息在共享队列中等待或处理。所有消息字段见 [cvbbmso-protocol](cvbbmso-protocol.md)。
+协议端点为 `wss://<监考服务端>/api/exams/{exam_id}/ws`。服务端在升级前从握手 Cookie 确认考生身份，失败时按上表返回同格式的 HTTP 错误。升级成功后，客户端先发送 `hello`，服务端调用 `ExamService::connect(exam_id, oj_user_id, hello)` 返回 `sync` 和待下发的新命令。后续 `heartbeat`、`status`、`event` 交给 `ExamService::receive`，会话校验 `command_result` 后交给 `ExamService::record_command_result`。入站帧和消息上限按每秒一个录像分片估算，包含 60 秒收尾余量，最低 2 MiB。每条连接最多有一条应用消息在共享队列中等待或处理。所有消息字段见 [cvbbmso-protocol](cvbbmso-protocol.md)。
 
 命令与确认规则：
 
@@ -62,7 +62,8 @@ async fn serve(config: ServerConfig) -> Result<(), ServerError>;
 - 调度器向在线连接推送 `due_commands` 返回的命令；离线考生的命令在重连时由 `connect` 生成。
 - 事件确认通过 `sync.ack_event_through` 返回；服务端持久化连续事件并在重连时通过 `sync` 返回确认位置。
 - 收到 `command_result` 后，服务端在同一事务归档终态并更新考生状态，提交后回复 `CommandAck { command_id }`。会话内重报相同结果会收到相同 ACK；命令 ID 必须由当前会话发出。非法状态组合或未知命令按 `COMMAND_STATE_CONFLICT` / `PROTOCOL_ERROR` 处理，并在协议错误时关闭连接。
-- `CommandAck` 丢失导致客户端重连时，客户端仍可能上报 `finalizing`；服务端以 `hello.state` 为准，生成新的 `end_exam` 让客户端重放收尾。
+- `CommandAck` 丢失后，客户端可用 `finalizing` 重连。服务端保留已提交的完成状态，并下发新的 `end_exam` 让客户端重报终态。
+- 考前撤销报名时，服务端将运行记录设为离线并保留此前证据。旧连接继续发送业务消息时会被关闭。
 - `status` 用于状态对齐；结束状态由 `end_exam` 的 `command_result` 判定。
 
 同一 `(exam_id, oj_user_id)` 同时保留一条有效 WebSocket。服务端维护“当前连接”：
@@ -93,7 +94,7 @@ flowchart TD
 
 - 客户端异常退出或网络中断时，服务器观测到 WebSocket 关闭或心跳超时，记录 `connection_lost`。客户端退出后保持离线时，CLI 仍能查到该记录。
 - 重连成功时，根据旧记录的在线状态和执行阶段记录失联与恢复。若新 `hello.instance_id` 与上次不同且上次状态为 `recording/finalizing`，再记录 `process_restarted`。三条记录独立保存，CLI 按 `occurred_at`、`incident_id` 排序展示。
-- 服务端启动时恢复遗留在线记录，给未完成的考生记 `connection_lost`，`detail` 为 `server_restart`。运行中遇到 SQLite 暂时锁竞争时，按考生重试断开记录，继续服务其他连接。
+- 服务端启动时恢复遗留在线记录，给未完成的考生记 `connection_lost`，`detail` 为 `server_restart`。SQLite 暂时忙时，原连接按序重试待写消息。断开写入失败时保留观察时间并重试，成功后该考生才能重新接入。
 - 正常完成考试时连接静默关闭，按正常完成处理。
 
 ## 模块协作

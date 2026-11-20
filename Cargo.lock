@@ -811,6 +811,7 @@ dependencies = [
  "cvbbmso-domain",
  "cvbbmso-protocol",
  "futures-util",
+ "sea-orm",
  "serde_json",
  "tempfile",
  "thiserror",

@@ -124,7 +124,7 @@ pub enum ExamEvent {
 | `finished` | `complete` | 正常结束 |
 | `finished` | `failed` | 结束但录像摘要失败 |
 
-`ClientHello.state` 是客户端连接时刻的真实状态，服务端据此决定生成什么命令；与持久记录不一致时以 `hello.state` 校正。`Status` 用于状态对齐；命令确认由 `CommandAck` 负责，结束由 `command_result` 驱动。
+`ClientHello.state` 描述连接时的客户端状态，服务端据此决定生成什么命令。上报 `finished` 时须与服务端已提交的 `end_exam` 终态一致。丢失 ACK 的客户端可用 `finalizing` 重连，收到新命令后重报终态。`Status` 用于状态对齐，结束由 `command_result` 驱动。
 
 ## HTTP 接口
 
