@@ -10,15 +10,20 @@ use crate::NetworkError;
 use crate::egress::backend::InstallResult;
 use crate::egress::cleanup;
 use crate::egress::commands::{Commands, SystemCommands};
+use crate::egress::managed;
 use crate::egress::policy::Plan;
 use crate::egress::state::{self, GuardState};
 
-use super::{PfGuard, install_with, local_addresses, recover_with, verify_deployment};
+use super::{
+    PfGuard, RULES, TOKEN, install_with, local_addresses, managed_pf, recover_with,
+    verify_deployment,
+};
 
-pub(crate) const HELPER: &str = "/Library/PrivilegedHelperTools/com.cvbbmso.egress-watchdog";
+const HELPER: &str = "/Library/PrivilegedHelperTools/com.cvbbmso.egress-watchdog";
 
 pub(crate) struct Prepared {
     lock: File,
+    managed: bool,
 }
 
 impl Prepared {
@@ -40,34 +45,93 @@ impl Prepared {
         {
             return Err(NetworkError::Platform);
         }
-        recover(&commands)?;
-        Ok(Self { lock })
+        recover(&commands, false)?;
+        Ok(Self {
+            lock,
+            managed: false,
+        })
+    }
+
+    pub(crate) fn managed() -> Result<Self, NetworkError> {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return Err(NetworkError::PermissionDenied);
+        }
+        let lock = state::lock()?;
+        let commands = SystemCommands(Some(&lock));
+        if state::read(&commands)?
+            .is_some_and(|state| !state.expired() && process_alive(state.parent))
+        {
+            return Err(NetworkError::MacosBusy);
+        }
+        managed::stage_recovery()?;
+        managed_pf::authorize(&commands)?;
+        if let Err(error) = verify_deployment(&commands).and_then(|()| recover(&commands, false)) {
+            let _ = managed_pf::restore(&commands);
+            return Err(error);
+        }
+        Ok(Self {
+            lock,
+            managed: true,
+        })
+    }
+
+    pub(crate) fn clean_before_resolution() -> Result<(), NetworkError> {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return Err(NetworkError::PermissionDenied);
+        }
+        let lock = state::lock()?;
+        let commands = SystemCommands(Some(&lock));
+        let previous = state::read(&commands)?;
+        if previous
+            .as_ref()
+            .is_some_and(|state| !state.expired() && process_alive(state.parent))
+        {
+            return Err(NetworkError::MacosBusy);
+        }
+        if previous.is_some() || commands.read(RULES)?.is_some() || commands.read(TOKEN)?.is_some()
+        {
+            recover(&commands, false)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn install(self, plan: &Plan) -> Result<InstallResult, NetworkError> {
         let commands = SystemCommands(Some(&self.lock));
         let mut guard_state = GuardState::new(std::process::id());
-        state::write(&commands, &guard_state)?;
-        let mut watchdog = match Watchdog::start() {
+        if let Err(error) = state::write(&commands, &guard_state) {
+            if self.managed {
+                let _ = managed_pf::restore(&commands);
+            }
+            return Err(error);
+        }
+        let helper = if self.managed {
+            managed::RECOVERY_SERVICE
+        } else {
+            HELPER
+        };
+        let mut watchdog = match Watchdog::start(helper) {
             Ok(watchdog) => watchdog,
             Err(error) => {
-                recover(&commands)?;
+                recover(&commands, self.managed)?;
                 return Err(error);
             }
         };
         guard_state.watchdog = watchdog.child.id();
         let result = (|| {
             state::write(&commands, &guard_state)?;
-            cleanup::schedule(&commands)?;
+            cleanup::schedule(&commands, helper)?;
             install_with(&commands, plan, &local_addresses()?)
         })();
         match result {
             Ok(expected) => Ok(Arc::new(PfGuard {
                 expected: Mutex::new(expected),
                 watchdog: Mutex::new(Some(watchdog)),
+                managed: self.managed,
             })),
             Err(error) => {
-                recover(&commands)?;
+                recover(&commands, self.managed)?;
                 watchdog.stop();
                 Err(error)
             }
@@ -75,10 +139,15 @@ impl Prepared {
     }
 }
 
-pub(super) fn recover(commands: &dyn Commands) -> Result<(), NetworkError> {
+pub(super) fn recover(commands: &dyn Commands, managed: bool) -> Result<(), NetworkError> {
     recover_with(commands)?;
     state::remove(commands)?;
-    cleanup::cancel(commands)
+    let restored = if managed {
+        managed_pf::restore(commands)
+    } else {
+        Ok(())
+    };
+    restored.and(cleanup::cancel(commands))
 }
 
 pub(super) struct Watchdog {
@@ -86,8 +155,8 @@ pub(super) struct Watchdog {
 }
 
 impl Watchdog {
-    fn start() -> Result<Self, NetworkError> {
-        let child = std::process::Command::new(HELPER)
+    fn start(helper: &str) -> Result<Self, NetworkError> {
+        let child = std::process::Command::new(helper)
             .args(["--watch", &std::process::id().to_string()])
             .env_clear()
             .stdin(Stdio::piped())
@@ -137,14 +206,22 @@ fn process_alive(pid: u32) -> bool {
 }
 
 pub(crate) fn watchdog_entry() -> ExitCode {
+    run_watchdog(false)
+}
+
+pub(crate) fn managed_watchdog_entry() -> ExitCode {
+    run_watchdog(true)
+}
+
+fn run_watchdog(managed: bool) -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let result = match args.as_slice() {
-        [flag] if flag == "--recover" => recovery_tick(None).map(drop),
+        [flag] if flag == "--recover" => recovery_tick(None, managed).map(drop),
         [flag, parent] if flag == "--watch" => parent
             .parse::<u32>()
             .map_err(|_| NetworkError::Policy)
             .and_then(|parent| {
-                while !recovery_tick(Some(parent))? {
+                while !recovery_tick(Some(parent), managed)? {
                     std::thread::sleep(Duration::from_secs(1));
                 }
                 Ok(())
@@ -159,7 +236,7 @@ pub(crate) fn watchdog_entry() -> ExitCode {
     }
 }
 
-fn recovery_tick(parent: Option<u32>) -> Result<bool, NetworkError> {
+fn recovery_tick(parent: Option<u32>, managed: bool) -> Result<bool, NetworkError> {
     let lock = state::lock()?;
     let commands = SystemCommands(Some(&lock));
     let state = state::read(&commands)?;
@@ -179,7 +256,7 @@ fn recovery_tick(parent: Option<u32>) -> Result<bool, NetworkError> {
         (None, state) => state.is_none_or(|state| state.expired() || !process_alive(state.parent)),
     };
     if recover_now {
-        recover(&commands)?;
+        recover(&commands, managed)?;
     }
     Ok(recover_now)
 }

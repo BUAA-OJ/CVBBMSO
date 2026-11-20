@@ -78,7 +78,7 @@ Windows 使用 WinINet、WinHTTP 与代理环境变量；macOS 使用 SystemConf
 
 ## 系统出站守卫
 
-`EgressGuard` 在 Accoding 登录前安装，保持到应用退出；安装期间要求客户端以管理员/root 运行。Windows 使用 WFP，macOS 使用 PF；规则按 IP/端口匹配，域名在安装和刷新时解析为 IP 集。
+`EgressGuard` 在 Accoding 登录前安装，保持到应用退出。调用该 API 的进程需要管理员或 root 权限。Windows 使用 WFP，macOS 使用 PF。规则按 IP 和端口匹配，域名在安装和刷新时解析为 IP 集。
 
 ### 允许的出站流量
 
@@ -111,6 +111,10 @@ Windows 使用 WinINet、WinHTTP 与代理环境变量；macOS 使用 SystemConf
 系统服务白名单按 IP、协议和端口匹配。平台未报告的加密 DNS 配置和部署证书链独有的 OCSP、CRL 或时间戳地址需要随部署验证。
 
 ### macOS 部署
+
+macOS 14 及以上的正式 DMG 提供 `MacosEgressGuard::install(policy).await`。普通用户会话完成前置检查后调用，运行特权操作的是应用内经过系统授权的 LaunchDaemon。两个 HTTPS 来源随签名版本固定，XPC 只接受固定操作。安装成功意味着守卫已校验内核规则。句柄的 `verify(&self).await` 和 `shutdown(self).await` 只对本连接的守卫生效。系统需要批准时返回 `NetworkError::MacosApprovalRequired`，客户端可在明确的用户操作后调用 `MacosEgressGuard::open_approval_settings()`，获批后重试。[macOS DMG 部署](../../deployment/macos-client.md)
+
+以下固定 helper 与宿主预部署方式用于直接调用 `EgressGuard` 的现有部署，仍可用于预先激活宿主管理的 PF 入口。
 
 部署方须在 PF 主过滤规则的第一条配置并加载这个入口。anchor 由守卫独占，初始为空，规则由守卫在安装时加载。
 

@@ -15,9 +15,10 @@ use crate::egress::commands::Commands;
 use crate::egress::{policy::Plan, state};
 
 mod lifecycle;
+mod managed_pf;
 mod rules;
 use lifecycle::Prepared;
-pub(crate) use lifecycle::{HELPER, watchdog_entry};
+pub(crate) use lifecycle::{managed_watchdog_entry, watchdog_entry};
 use rules::Rules;
 
 const ANCHOR: &str = "com.cvbbmso.egress";
@@ -33,9 +34,18 @@ pub(crate) fn install(plan: &Plan) -> Result<InstallResult, NetworkError> {
     Prepared::new()?.install(plan)
 }
 
+pub(crate) fn install_managed(plan: &Plan) -> Result<InstallResult, NetworkError> {
+    Prepared::managed()?.install(plan)
+}
+
+pub(crate) fn prepare_managed() -> Result<(), NetworkError> {
+    Prepared::clean_before_resolution()
+}
+
 struct PfGuard {
     expected: Mutex<Expected>,
     watchdog: Mutex<Option<lifecycle::Watchdog>>,
+    managed: bool,
 }
 
 struct Expected {
@@ -75,7 +85,7 @@ impl GuardBackend for PfGuard {
         let mut watchdog = self.watchdog.lock().map_err(|_| NetworkError::Platform)?;
         if let Some(running) = watchdog.as_mut() {
             if running.owns_state()? {
-                lifecycle::recover(&commands)?;
+                lifecycle::recover(&commands, self.managed)?;
             }
             running.stop();
             *watchdog = None;
@@ -448,7 +458,7 @@ mod tests {
         );
 
         recorder.reply(LIVE, Ok(BLOCK));
-        lifecycle::recover(&recorder).unwrap();
+        lifecycle::recover(&recorder, false).unwrap();
         assert_only_own_mutations(&recorder);
         assert_eq!(recorder.contents(PF_CONF).as_deref(), Some(BASE));
         assert!(recorder.contents(TOKEN).is_none());
