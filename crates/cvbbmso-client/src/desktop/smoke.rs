@@ -96,6 +96,32 @@ impl Case {
         }
         admission
     }
+
+    async fn check_startup_exit(
+        self,
+        app: &AppHandle,
+        ui: &WebviewWindow,
+        requests: &AtomicUsize,
+        admission: &FakeAdmission,
+        cleanup_checked: &AtomicBool,
+    ) -> Result<bool, Error> {
+        let detected = self == Self::Detected;
+        check_blocked_preflight(app, ui, requests, detected).await?;
+        if detected {
+            ui.eval("document.querySelector('#vm-quit').click()")?;
+            return Ok(true);
+        }
+        if !self.pauses_install() {
+            return Ok(false);
+        }
+        check_exit_during_install(app, ui, admission).await?;
+        if self == Self::CleanupFailure {
+            check_cleanup_failure(app, ui, admission).await?;
+            cleanup_checked.store(true, Ordering::SeqCst);
+            ui.eval("document.querySelector('#admission-exit').click()")?;
+        }
+        Ok(true)
+    }
 }
 
 pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<()> {
@@ -135,19 +161,10 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
             let app = app.handle().clone();
             async_runtime::spawn(async move {
                 let exercised: Result<(), Error> = async {
-                    check_blocked_preflight(&app, &ui, &requests, detected).await?;
-                    if detected {
-                        return ui
-                            .eval("document.querySelector('#vm-quit').click()")
-                            .map_err(Into::into);
-                    }
-                    if case.pauses_install() {
-                        check_exit_during_install(&app, &ui, &admission).await?;
-                        if case == Case::CleanupFailure {
-                            check_cleanup_failure(&app, &ui, &admission).await?;
-                            checked.store(true, Ordering::SeqCst);
-                            ui.eval("document.querySelector('#admission-exit').click()")?;
-                        }
+                    if case
+                        .check_startup_exit(&app, &ui, &requests, &admission, &checked)
+                        .await?
+                    {
                         return Ok(());
                     }
                     if let Some(connections) = exam_connections {
