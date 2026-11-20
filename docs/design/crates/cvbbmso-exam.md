@@ -113,7 +113,7 @@ stateDiagram-v2
 
 ## 生命周期、离线与认证
 
-- **正常完成**：收到 `end_exam` 后停止采集并执行 `finish`。先保存并发送收尾分片事件及录像摘要（成功时）或失败事件，再发送 `command_result` 并等待 `CommandAck`。收尾结论确定后停止接收新的导航异常，确保结束结果是本次握手的最后一条业务消息。收到 ACK 后进入 `finished`、关闭 WebSocket。等待 ACK 超时按断线重连处理。
+- **正常完成**：收到 `end_exam` 后停止采集并执行 `finish`。成功时按录像摘要中的分片索引补记尚未入队的分片事件，先保存并发送这些事件和录像摘要。失败时先保存并发送失败事件。随后发送 `command_result` 并等待 `CommandAck`。收尾结论确定后停止接收新的导航异常，确保结束结果是本次握手的最后一条业务消息。收到 ACK 后进入 `finished`、关闭 WebSocket。等待 ACK 超时按断线重连处理。
 - **finalize 失败**：`finish` 进行有限重试；仍失败时上报 `recording_failed`，发送 `command_result(failed, RECORDING_FINISH_FAILED)`，收到 `CommandAck` 后以 `finished/failed` 关闭。没有可收尾分片（`NoSegments`）同样走失败路径；`recording_finalized` 只在成功时发送。
 - **主动关闭**：`ExamHandle::shutdown` 调用 `Recorder::stop` 停止采集并封存当前片段，关闭 WebSocket；合并与 manifest 由后续 `finish` 完成。已封存分片保留，下次 `Recorder::open` 恢复。服务端按普通断开记录 `connection_lost`。
 - **断网跨过结束时间**：客户端使用 `sync.server_time` 计算服务端时钟偏移；到达 `end_at + 60s` 后调用 `Recorder::stop` 封存当前片段，进入 `finalizing/finalizing`，等待 `end_exam`。重连后按服务端下发的 `end_exam` 执行 `finish` 并完成收尾。
