@@ -16,15 +16,6 @@ pub(crate) fn install(_plan: &crate::egress::policy::Plan) -> Result<InstallResu
     Err(NetworkError::Platform)
 }
 
-/// Reports success because there is nothing to clean up.
-///
-/// # Errors
-///
-/// Never returns an error on this target.
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "the signature is shared with the platform adapters"
-)]
-pub(crate) fn recover() -> Result<(), NetworkError> {
-    Ok(())
+pub(crate) fn prepare() -> Result<(), NetworkError> {
+    Err(NetworkError::Platform)
 }

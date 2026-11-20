@@ -8,46 +8,66 @@
 
 mod allow_set;
 mod backend;
+#[cfg(target_os = "macos")]
 mod cleanup;
+#[cfg(target_os = "macos")]
 mod commands;
 mod policy;
 mod resolver;
+mod services;
+#[cfg(target_os = "macos")]
 mod state;
-mod watchdog;
 
-use std::net::IpAddr;
-use std::sync::{Mutex, PoisonError};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use self::allow_set::AllowSet;
 use self::backend::GuardBackend;
-use self::policy::{Plan, Target, ValidatedPolicy};
+use self::policy::{Plan, Service, Target, ValidatedPolicy};
 use self::resolver::{Resolver, SystemResolver};
+use self::services::Services;
 use crate::NetworkError;
 
 pub use self::policy::EgressPolicy;
 
 /// How long an address that disappeared from DNS stays allowed.
 const ADDRESS_GRACE: Duration = Duration::from_secs(120);
-/// Guard lifetime without renewal; [`EgressGuard::verify`] renews it.
-const GUARD_TTL: Duration = Duration::from_secs(15 * 60);
 /// Interval at which the allowed addresses are resolved again.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-/// Certificate status hosts the platform trust stack needs.
-const CERTIFICATE_HOSTS: [&str; 3] = ["ocsp.apple.com", "ocsp2.apple.com", "crl.apple.com"];
+// https://support.apple.com/101555 and the Windows Root Certificate Program
+// specify these endpoints and ports for their respective trust stores.
+#[cfg(target_os = "macos")]
+const CERTIFICATE_HOSTS: &[(&str, u16)] = &[
+    ("certs.apple.com", 80),
+    ("certs.apple.com", 443),
+    ("crl.apple.com", 80),
+    ("crl3.digicert.com", 80),
+    ("crl4.digicert.com", 80),
+    ("ocsp.apple.com", 80),
+    ("ocsp.digicert.cn", 80),
+    ("ocsp.digicert.com", 80),
+    ("ocsp2.apple.com", 443),
+    ("valid.apple.com", 443),
+];
+#[cfg(windows)]
+const CERTIFICATE_HOSTS: &[(&str, u16)] = &[("ctldl.windowsupdate.com", 80)];
+#[cfg(not(any(windows, target_os = "macos")))]
+const CERTIFICATE_HOSTS: &[(&str, u16)] = &[];
 
 /// Active system-level egress guard.
 ///
-/// Dropping the guard without calling [`EgressGuard::shutdown`] leaves the rules
-/// to the watchdog helper, which reverts them once this process or the recorded
-/// lifetime ends.
+/// Use [`EgressGuard::shutdown`] to remove the filter when the app exits.
 pub struct EgressGuard {
-    backend: std::sync::Arc<dyn GuardBackend>,
-    watchdog: watchdog::Watchdog,
+    backend: Arc<dyn GuardBackend>,
     endpoints: ValidatedPolicy,
-    allowed: Mutex<AllowSet>,
-    last_refresh: Mutex<Instant>,
-    expires_at: Mutex<Instant>,
+    runtime: Arc<Mutex<Runtime>>,
+}
+
+struct Runtime {
+    allowed: AllowSet,
+    config: Services,
+    last_refresh: Option<Instant>,
 }
 
 impl EgressGuard {
@@ -59,17 +79,20 @@ impl EgressGuard {
     /// [`NetworkError::Resolution`] when an origin currently has no address,
     /// [`NetworkError::PermissionDenied`] without administrator or root rights,
     /// and [`NetworkError::Platform`] or [`NetworkError::Io`] when the platform
-    /// filter or one of the supporting files cannot be installed. Every error
-    /// leaves the system without guard rules.
+    /// filter or its supporting files cannot be installed.
     pub async fn install(policy: EgressPolicy) -> Result<Self, NetworkError> {
         let endpoints = policy.validate()?;
-        remove_stale_state()?;
+        let config = tokio::task::spawn_blocking(|| {
+            backend::platform::prepare()?;
+            Services::discover()
+        })
+        .await
+        .map_err(|_| NetworkError::Platform)??;
 
         let resolved = resolve_endpoints(&SystemResolver, &endpoints).await;
         if resolved.accoding.is_empty() || resolved.server.is_empty() {
             return Err(NetworkError::Resolution);
         }
-
         let now = Instant::now();
         let mut allowed = AllowSet::new(ADDRESS_GRACE);
         allowed.refresh(
@@ -78,231 +101,178 @@ impl EgressGuard {
             resolved.certificate,
             now,
         )?;
-        let plan = make_plan(&endpoints, &allowed, now);
-
-        // Registering the watchdog and the TTL task comes before the rules, so a
-        // crash between the two steps still leaves cleanup behind.
-        let state_path = state::path();
-        let watchdog = watchdog::Watchdog::start(&state_path)?;
-        let mut guard_state = state::GuardState::new(GUARD_TTL);
-        guard_state.set_watchdog(watchdog.pid());
-        if let Err(error) = state::write(&guard_state) {
-            watchdog.stop();
-            return Err(error);
-        }
-        if let Err(error) = schedule_cleanup().await {
-            watchdog.stop();
-            let _ = state::remove();
-            return Err(error);
-        }
-
-        let backend = match apply_to_platform(plan).await {
-            Ok(backend) => backend,
-            Err(error) => {
-                watchdog.stop();
-                let _ = cleanup::cancel();
-                let _ = state::remove();
-                return Err(error);
-            }
-        };
-
+        let destinations = config.resolve(&SystemResolver).await;
+        let plan = make_plan(&endpoints, &allowed, destinations, now);
+        let backend = tokio::task::spawn_blocking(move || backend::platform::install(&plan))
+            .await
+            .map_err(|_| NetworkError::Platform)??;
         Ok(Self {
             backend,
-            watchdog,
             endpoints,
-            allowed: Mutex::new(allowed),
-            last_refresh: Mutex::new(now),
-            expires_at: Mutex::new(now + GUARD_TTL),
+            runtime: Arc::new(Mutex::new(Runtime {
+                allowed,
+                config,
+                last_refresh: Some(now),
+            })),
         })
     }
 
-    /// Confirms that the filter is still installed, refreshes the allowed
-    /// addresses when they are due, and renews the recorded lifetime.
+    /// Confirms that the filter is still installed and refreshes the allowed
+    /// addresses when they are due.
     ///
     /// # Errors
     ///
-    /// [`NetworkError::Platform`] when the rules disappeared, and the same
-    /// errors as [`EgressGuard::install`] when addresses cannot be refreshed.
+    /// Returns [`NetworkError::Platform`] when the rules disappeared, or a
+    /// platform, I/O or resolution error when verification cannot complete.
     pub async fn verify(&self) -> Result<(), NetworkError> {
-        let backend = std::sync::Arc::clone(&self.backend);
-        tokio::task::spawn_blocking(move || backend.verify())
-            .await
-            .map_err(|_| NetworkError::Platform)??;
+        let backend = Arc::clone(&self.backend);
+        let endpoints = self.endpoints.clone();
+        let runtime = Arc::clone(&self.runtime);
+        let refresh = tokio::task::spawn_blocking(move || {
+            backend.verify()?;
+            let config = Services::discover()?;
+            let mut runtime = runtime.lock().map_err(|_| NetworkError::Platform)?;
+            if runtime.config != config {
+                // The new resolver must be reachable before DNS queries can
+                // refresh the origins after a network change.
+                let plan = make_plan(
+                    &endpoints,
+                    &runtime.allowed,
+                    config.rules().to_vec(),
+                    Instant::now(),
+                );
+                backend.apply(&plan)?;
+                runtime.config = config;
+                runtime.last_refresh = None;
+            }
+            Ok::<_, NetworkError>(runtime.refresh_due().then(|| runtime.config.clone()))
+        })
+        .await
+        .map_err(|_| NetworkError::Platform)??;
+        let Some(config) = refresh else {
+            return Ok(());
+        };
 
-        self.refresh_addresses().await?;
-        self.renew_lifetime();
-        Ok(())
+        let (resolved, destinations) = tokio::join!(
+            resolve_endpoints(&SystemResolver, &self.endpoints),
+            config.resolve(&SystemResolver)
+        );
+        let backend = Arc::clone(&self.backend);
+        let endpoints = self.endpoints.clone();
+        let runtime = Arc::clone(&self.runtime);
+        tokio::task::spawn_blocking(move || {
+            let mut runtime = runtime.lock().map_err(|_| NetworkError::Platform)?;
+            if runtime.config == config && runtime.refresh_due() {
+                runtime.refresh(
+                    backend.as_ref(),
+                    &endpoints,
+                    resolved,
+                    destinations,
+                    Instant::now(),
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| NetworkError::Platform)?
     }
 
-    /// Removes the filter, stops the watchdog and the TTL task.
+    /// Removes the filter and its platform cleanup resources.
     ///
     /// # Errors
     ///
-    /// Returns the first failure of the individual removal steps; every step is
-    /// attempted regardless.
+    /// Returns an error if the platform could not complete cleanup.
     pub async fn shutdown(self) -> Result<(), NetworkError> {
-        let backend = std::sync::Arc::clone(&self.backend);
-        let reverted = tokio::task::spawn_blocking(move || backend.revert())
+        tokio::task::spawn_blocking(move || self.backend.revert())
             .await
-            .map_err(|_| NetworkError::Platform);
-        self.watchdog.stop();
-        let cleanup_removed = cleanup::cancel();
-        let state_removed = state::remove();
-        reverted??;
-        cleanup_removed?;
-        state_removed
+            .map_err(|_| NetworkError::Platform)?
+    }
+}
+
+impl Runtime {
+    fn refresh_due(&self) -> bool {
+        self.last_refresh
+            .is_none_or(|last| last.elapsed() >= REFRESH_INTERVAL)
     }
 
-    /// Re-resolves the policy addresses when the refresh interval elapsed.
-    async fn refresh_addresses(&self) -> Result<(), NetworkError> {
-        let due = {
-            let last = *self
-                .last_refresh
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            last.elapsed() >= REFRESH_INTERVAL
-        };
-        if !due {
-            return Ok(());
-        }
-
-        let resolved = resolve_endpoints(&SystemResolver, &self.endpoints).await;
-        let now = Instant::now();
-        let plan = {
-            let mut allowed = self.allowed.lock().unwrap_or_else(PoisonError::into_inner);
-            allowed.prune(now);
-            allowed.refresh(
-                resolved.accoding,
-                resolved.server,
-                resolved.certificate,
-                now,
-            )?;
-            make_plan(&self.endpoints, &allowed, now)
-        };
-        *self
-            .last_refresh
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = now;
-
-        let backend = std::sync::Arc::clone(&self.backend);
-        tokio::task::spawn_blocking(move || backend.apply(&plan))
-            .await
-            .map_err(|_| NetworkError::Platform)??;
+    fn refresh(
+        &mut self,
+        backend: &dyn GuardBackend,
+        endpoints: &ValidatedPolicy,
+        resolved: Resolved,
+        destinations: Vec<Service>,
+        now: Instant,
+    ) -> Result<(), NetworkError> {
+        let mut candidate = self.allowed.clone();
+        candidate.refresh(
+            resolved.accoding,
+            resolved.server,
+            resolved.certificate,
+            now,
+        )?;
+        backend.apply(&make_plan(endpoints, &candidate, destinations, now))?;
+        self.allowed = candidate;
+        self.last_refresh = Some(now);
         Ok(())
     }
-
-    /// Rewrites the state file so the watchdog does not treat the guard as
-    /// abandoned.
-    fn renew_lifetime(&self) {
-        let deadline = Instant::now() + GUARD_TTL;
-        *self
-            .expires_at
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = deadline;
-        if let Some(mut state) = state::read() {
-            state.renew(GUARD_TTL);
-            state.set_watchdog(self.watchdog.pid());
-            let _ = state::write(&state);
-        }
-    }
 }
 
-/// Runs the watchdog helper with the process command line.
 pub(crate) fn watchdog_entry() -> std::process::ExitCode {
-    watchdog::run_from_args(std::env::args().skip(1))
-}
-
-/// Removes state and the TTL task left behind by an earlier run.
-fn remove_stale_state() -> Result<(), NetworkError> {
-    let _ = cleanup::cancel();
-    match state::read() {
-        Some(_) => state::remove(),
-        None => Ok(()),
-    }
-}
-
-/// Applies `plan` on a blocking thread.
-async fn apply_to_platform(plan: Plan) -> Result<std::sync::Arc<dyn GuardBackend>, NetworkError> {
-    tokio::task::spawn_blocking(move || {
-        // Leftover rules from an earlier run must go before new rules arrive.
-        backend::platform::recover()?;
-        backend::platform::install(&plan)
-    })
-    .await
-    .map_err(|_| NetworkError::Platform)?
-}
-
-/// Registers the TTL fallback on a blocking thread.
-async fn schedule_cleanup() -> Result<(), NetworkError> {
-    tokio::task::spawn_blocking(|| {
-        let helper = watchdog::helper_path()?;
-        cleanup::schedule(&helper, GUARD_TTL)
-    })
-    .await
-    .map_err(|_| NetworkError::Platform)?
+    #[cfg(target_os = "macos")]
+    return backend::platform::watchdog_entry();
+    #[cfg(not(target_os = "macos"))]
+    std::process::ExitCode::FAILURE
 }
 
 /// Resolved addresses of everything the policy allows.
 struct Resolved {
     accoding: Vec<IpAddr>,
     server: Vec<IpAddr>,
-    certificate: Vec<IpAddr>,
+    certificate: Vec<SocketAddr>,
 }
 
-/// Resolves both origins and the certificate status hosts.
-async fn resolve_endpoints<R: Resolver>(resolver: &R, endpoints: &ValidatedPolicy) -> Resolved {
-    let accoding = resolver
-        .resolve(&endpoints.accoding.host, endpoints.accoding.port)
-        .await
-        .unwrap_or_default();
-    let server = resolver
-        .resolve(&endpoints.server.host, endpoints.server.port)
-        .await
-        .unwrap_or_default();
-    let mut certificate = Vec::new();
-    for host in CERTIFICATE_HOSTS {
-        certificate.extend(resolver.resolve(host, 443).await.unwrap_or_default());
-    }
-    certificate.sort();
-    certificate.dedup();
+async fn resolve_endpoints(resolver: &impl Resolver, endpoints: &ValidatedPolicy) -> Resolved {
+    let (accoding, server, certificate) = tokio::join!(
+        resolver.resolve(&endpoints.accoding.host, endpoints.accoding.port),
+        resolver.resolve(&endpoints.server.host, endpoints.server.port),
+        resolve_certificate(resolver),
+    );
     Resolved {
-        accoding,
-        server,
+        accoding: accoding.unwrap_or_default(),
+        server: server.unwrap_or_default(),
         certificate,
     }
 }
 
-/// Builds the rule set from the current allowed addresses.
-fn make_plan(endpoints: &ValidatedPolicy, allowed: &AllowSet, now: Instant) -> Plan {
+async fn resolve_certificate(resolver: &impl Resolver) -> Vec<SocketAddr> {
+    let mut certificate = Vec::new();
+    for &(host, port) in CERTIFICATE_HOSTS {
+        if let Ok(addresses) = resolver.resolve(host, port).await {
+            certificate.extend(
+                addresses
+                    .into_iter()
+                    .map(|address| SocketAddr::new(address, port)),
+            );
+        }
+    }
+    certificate.sort_unstable();
+    certificate.dedup();
+    certificate
+}
+
+fn make_plan(
+    endpoints: &ValidatedPolicy,
+    allowed: &AllowSet,
+    services: Vec<Service>,
+    now: Instant,
+) -> Plan {
     let (accoding, server, certificate) = allowed.active(now);
     Plan::new(
         Target::new(accoding, endpoints.accoding.port),
         Target::new(server, endpoints.server.port),
         certificate,
-        system_resolvers(),
+        services,
     )
-}
-
-/// Returns the addresses of the resolvers the system is configured to use.
-#[cfg(unix)]
-fn system_resolvers() -> Vec<IpAddr> {
-    let Ok(contents) = std::fs::read_to_string("/etc/resolv.conf") else {
-        return Vec::new();
-    };
-    let mut resolvers: Vec<IpAddr> = contents
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("nameserver "))
-        .filter_map(|address| address.trim().parse().ok())
-        .collect();
-    resolvers.sort();
-    resolvers.dedup();
-    resolvers
-}
-
-/// Returns an empty list because Windows exposes resolvers through its own API.
-#[cfg(not(unix))]
-fn system_resolvers() -> Vec<IpAddr> {
-    Vec::new()
 }
 
 #[cfg(test)]
@@ -329,10 +299,60 @@ mod tests {
             .refresh(vec![address], vec![address], Vec::new(), Instant::now())
             .expect("refresh succeeds");
 
-        let plan = make_plan(&endpoints, &allowed, Instant::now());
+        let plan = make_plan(&endpoints, &allowed, Vec::new(), Instant::now());
         assert_eq!(plan.accoding.port, 443);
         assert_eq!(plan.server.port, 443);
         assert_eq!(plan.accoding.addresses, vec![address]);
         assert_eq!(plan.server.addresses, vec![address]);
+    }
+
+    struct RefusingBackend;
+
+    impl super::GuardBackend for RefusingBackend {
+        fn apply(&self, _plan: &super::Plan) -> Result<(), crate::NetworkError> {
+            Err(crate::NetworkError::Platform)
+        }
+
+        fn verify(&self) -> Result<(), crate::NetworkError> {
+            Ok(())
+        }
+
+        fn revert(&self) -> Result<(), crate::NetworkError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_refresh_leaves_the_installed_address_snapshot_due_for_retry() {
+        use super::{Resolved, Runtime, Services};
+        let endpoints = policy().validate().unwrap();
+        let now = Instant::now();
+        let old = "192.0.2.1".parse::<IpAddr>().unwrap();
+        let new = "192.0.2.2".parse::<IpAddr>().unwrap();
+        let mut allowed = AllowSet::new(ADDRESS_GRACE);
+        allowed
+            .refresh(vec![old], vec![old], Vec::new(), now)
+            .unwrap();
+        let mut runtime = Runtime {
+            allowed,
+            config: Services::default(),
+            last_refresh: None,
+        };
+        assert_eq!(
+            runtime.refresh(
+                &RefusingBackend,
+                &endpoints,
+                Resolved {
+                    accoding: vec![new],
+                    server: vec![new],
+                    certificate: Vec::new(),
+                },
+                Vec::new(),
+                now
+            ),
+            Err(crate::NetworkError::Platform)
+        );
+        assert_eq!(runtime.allowed.active(now).0, vec![old]);
+        assert!(runtime.refresh_due());
     }
 }

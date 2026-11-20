@@ -1,6 +1,7 @@
 //! Host resolution for the egress guard.
 
 use std::net::IpAddr;
+use std::time::Duration;
 
 use crate::NetworkError;
 
@@ -25,11 +26,16 @@ pub(crate) struct SystemResolver;
 
 impl Resolver for SystemResolver {
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, NetworkError> {
-        let mut addresses = tokio::net::lookup_host((host, port))
-            .await
-            .map_err(|_| NetworkError::Resolution)?
-            .map(|address| address.ip())
-            .collect::<Vec<_>>();
+        let mut addresses = tokio::time::timeout(
+            Duration::from_secs(4),
+            tokio::net::lookup_host((host, port)),
+        )
+        .await
+        .map_err(|_| NetworkError::Resolution)?
+        .map_err(|_| NetworkError::Resolution)?
+        .map(|address| address.ip().to_canonical())
+        .filter(|address| super::services::is_unicast(*address))
+        .collect::<Vec<_>>();
         addresses.sort();
         addresses.dedup();
         Ok(addresses)

@@ -1,305 +1,492 @@
-//! PF adapter for macOS.
-//!
-//! The guard is a PF anchor loaded from `/etc/pf.anchors/com.cvbbmso.egress` and
-//! referenced from `/etc/pf.conf` inside a marked block. Both files are restored
-//! by [`recover`], which the watchdog and the TTL cleanup task use.
+//! macOS PF management. The main ruleset calls an outbound anchor before other
+//! filter rules. Refreshes only replace that anchor in a PF transaction.
 #![allow(
     unsafe_code,
-    reason = "the adapter reads the effective user id through libc"
+    reason = "PF needs native privilege and interface queries"
 )]
 
-use std::net::IpAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Mutex;
 
 use crate::NetworkError;
 use crate::egress::backend::{GuardBackend, InstallResult};
-use crate::egress::commands::{Commands, SystemCommands};
-use crate::egress::policy::Plan;
+use crate::egress::commands::Commands;
+use crate::egress::{
+    policy::{Plan, Transport},
+    state,
+};
 
-/// PF anchor that holds the guard rules.
+mod lifecycle;
+use lifecycle::Prepared;
+pub(crate) use lifecycle::{HELPER, watchdog_entry};
+
 const ANCHOR: &str = "com.cvbbmso.egress";
-/// File PF loads the anchor from.
-const ANCHOR_FILE: &str = "/etc/pf.anchors/com.cvbbmso.egress";
-/// Main PF configuration that must reference the anchor.
+const LEGACY_ANCHOR: &str = "/etc/pf.anchors/com.cvbbmso.egress";
+const RULES: &str = "/Library/Application Support/com.cvbbmso/pf.rules";
+const TOKEN: &str = "/Library/Application Support/com.cvbbmso/pf.enable";
 const PF_CONF: &str = "/etc/pf.conf";
-/// PF control program.
 const PFCTL: &str = "/sbin/pfctl";
-/// First marker line of the block inserted into `pf.conf`.
 const BLOCK_BEGIN: &str = "# BEGIN cvbbmso egress guard";
-/// Last marker line of the block inserted into `pf.conf`.
 const BLOCK_END: &str = "# END cvbbmso egress guard";
-/// Ports used to fetch certificate status.
-const CERTIFICATE_PORTS: [u16; 2] = [80, 443];
-/// Datagram services an exam client needs: DHCP and NTP.
-const DATAGRAM_PORTS: [u16; 3] = [67, 68, 123];
+const ROOT_RULE: &str = "anchor \"com.cvbbmso.egress\" out quick all";
+pub(crate) fn prepare() -> Result<(), NetworkError> {
+    Prepared::new().map(drop)
+}
 
-/// Installs the PF anchor and returns a handle to it.
-///
-/// # Errors
-///
-/// [`NetworkError::PermissionDenied`] without root rights, and
-/// [`NetworkError::Platform`] or [`NetworkError::Io`] when PF or the
-/// configuration files cannot be updated.
 pub(crate) fn install(plan: &Plan) -> Result<InstallResult, NetworkError> {
-    require_root()?;
-    apply_with(&SystemCommands, plan)?;
-    Ok(Arc::new(PfGuard))
+    Prepared::new()?.install(plan)
 }
 
-/// Removes every trace of the guard. Used by the watchdog and the TTL task.
-///
-/// # Errors
-///
-/// [`NetworkError::PermissionDenied`] without root rights, and
-/// [`NetworkError::Platform`] when PF cannot be reloaded.
-pub(crate) fn recover() -> Result<(), NetworkError> {
-    require_root()?;
-    recover_with(&SystemCommands)
+struct PfGuard {
+    expected: Mutex<Expected>,
+    watchdog: Mutex<Option<lifecycle::Watchdog>>,
 }
 
-/// Handle to an installed PF anchor.
-struct PfGuard;
+struct Expected {
+    rendered: String,
+    kernel: String,
+}
 
 impl GuardBackend for PfGuard {
     fn apply(&self, plan: &Plan) -> Result<(), NetworkError> {
-        apply_with(&SystemCommands, plan)
+        let lock = state::lock()?;
+        let commands = crate::egress::commands::SystemCommands(Some(&lock));
+        self.verify_owner()?;
+        let mut expected = self.expected.lock().map_err(|_| NetworkError::Platform)?;
+        verify_with(&commands, &expected.kernel)?;
+        replace_with(&commands, &mut expected, render_rules(plan))
     }
 
     fn verify(&self) -> Result<(), NetworkError> {
-        verify_with(&SystemCommands)
+        let lock = state::lock()?;
+        let commands = crate::egress::commands::SystemCommands(Some(&lock));
+        let mut watchdog = self.watchdog.lock().map_err(|_| NetworkError::Platform)?;
+        let watchdog = watchdog.as_mut().ok_or(NetworkError::Platform)?;
+        let mut guard_state = watchdog.check()?;
+        let expected = self.expected.lock().map_err(|_| NetworkError::Platform)?;
+        verify_with(&commands, &expected.kernel)?;
+        if guard_state.renewal_due() {
+            guard_state.renew();
+            state::write(&commands, &guard_state)?;
+        }
+        Ok(())
     }
 
     fn revert(&self) -> Result<(), NetworkError> {
-        recover_with(&SystemCommands)
-    }
-}
-
-/// Writes the anchor, makes `pf.conf` reference it, and reloads PF.
-fn apply_with(commands: &dyn Commands, plan: &Plan) -> Result<(), NetworkError> {
-    commands.write(ANCHOR_FILE, &render_rules(plan))?;
-
-    let conf = commands.read(PF_CONF)?.unwrap_or_default();
-    if !conf.contains(BLOCK_BEGIN) {
-        let mut updated = conf;
-        if !updated.is_empty() && !updated.ends_with('\n') {
-            updated.push('\n');
+        let lock = state::lock()?;
+        let commands = crate::egress::commands::SystemCommands(Some(&lock));
+        let mut watchdog = self.watchdog.lock().map_err(|_| NetworkError::Platform)?;
+        if let Some(running) = watchdog.as_mut() {
+            if running.owns_state()? {
+                lifecycle::recover(&commands)?;
+            }
+            running.stop();
+            *watchdog = None;
         }
-        let block = format!(
-            "{BLOCK_BEGIN}\nanchor \"{ANCHOR}\"\nload anchor \"{ANCHOR}\" from \"{ANCHOR_FILE}\"\n{BLOCK_END}\n"
-        );
-        updated.push_str(&block);
-        commands.write(PF_CONF, &updated)?;
+        Ok(())
     }
-
-    commands.run(PFCTL, &["-f", PF_CONF])
 }
 
-/// Confirms that `pf.conf` still references the anchor and that PF loaded rules.
-fn verify_with(commands: &dyn Commands) -> Result<(), NetworkError> {
-    let conf = commands.read(PF_CONF)?.unwrap_or_default();
-    if !conf.contains(BLOCK_BEGIN) {
+impl PfGuard {
+    fn verify_owner(&self) -> Result<(), NetworkError> {
+        let mut watchdog = self.watchdog.lock().map_err(|_| NetworkError::Platform)?;
+        watchdog.as_mut().ok_or(NetworkError::Platform)?.check()?;
+        Ok(())
+    }
+}
+
+fn install_with(
+    commands: &dyn Commands,
+    plan: &Plan,
+    local: &[IpAddr],
+) -> Result<Expected, NetworkError> {
+    let conf = commands.read(PF_CONF)?.ok_or(NetworkError::Io)?;
+    let expected = stage(commands, render_rules(plan))?;
+    let block = format!(
+        "{BLOCK_BEGIN}\nset require-order no\nanchor \"{ANCHOR}\" out quick\n{BLOCK_END}\n"
+    );
+    commands.write(PF_CONF, &format!("{block}{conf}"))?;
+    commands.run(PFCTL, &["-n", "-R", "-f", PF_CONF])?;
+    load_anchor(commands)?;
+    commands.run(PFCTL, &["-m", "-R", "-f", PF_CONF])?;
+    commands.capture(PFCTL, &["-E"], TOKEN)?;
+    read_token(commands)?.ok_or(NetworkError::Platform)?;
+    verify_with(commands, &expected.kernel)?;
+    // A PF state predating the anchor would otherwise pass without matching
+    // the new rules. Only remove states whose initiating address is local.
+    for ip in local.iter().filter(|ip| !ip.is_loopback()) {
+        commands.run(PFCTL, &["-k", &ip.to_string()])?;
+    }
+    Ok(expected)
+}
+
+fn stage(commands: &dyn Commands, rendered: String) -> Result<Expected, NetworkError> {
+    commands.write(RULES, &rendered)?;
+    let output = commands.output(
+        PFCTL,
+        &["-a", ANCHOR, "-n", "-v", "-o", "none", "-f", RULES],
+    )?;
+    let kernel = output.trim().to_owned();
+    if kernel.lines().last() != Some("block drop out quick all") {
         return Err(NetworkError::Platform);
     }
-    let rules = commands.output(PFCTL, &["-a", ANCHOR, "-s", "rules"])?;
-    if rules.trim().is_empty() {
+    Ok(Expected { rendered, kernel })
+}
+
+fn replace_with(
+    commands: &dyn Commands,
+    expected: &mut Expected,
+    rendered: String,
+) -> Result<(), NetworkError> {
+    if rendered != expected.rendered {
+        let next = stage(commands, rendered)?;
+        load_anchor(commands)?;
+        if let Err(error) = verify_with(commands, &next.kernel) {
+            commands.write(RULES, &expected.rendered)?;
+            load_anchor(commands)?;
+            return Err(error);
+        }
+        *expected = next;
+    }
+    Ok(())
+}
+
+fn load_anchor(commands: &dyn Commands) -> Result<(), NetworkError> {
+    commands.run(PFCTL, &["-a", ANCHOR, "-o", "none", "-f", RULES])
+}
+
+fn verify_with(commands: &dyn Commands, expected: &str) -> Result<(), NetworkError> {
+    let info = commands.output(PFCTL, &["-s", "info"])?;
+    let root = commands.output(PFCTL, &["-s", "rules"])?;
+    let live = commands.output(PFCTL, &["-a", ANCHOR, "-s", "rules"])?;
+    let interfaces = commands.output(PFCTL, &["-vv", "-s", "Interfaces"])?;
+    let reference = read_token(commands)?.ok_or(NetworkError::Platform)?;
+    let references = commands.output(PFCTL, &["-s", "References"])?;
+    let skipped = interfaces.lines().any(|line| {
+        let mut words = line.split_whitespace();
+        words.next().is_some_and(|name| name != "lo0") && words.any(|word| word == "(skip)")
+    });
+    if !info.lines().any(|line| line.starts_with("Status: Enabled"))
+        || root.lines().next().map(str::trim) != Some(ROOT_RULE)
+        || live.trim() != expected
+        || skipped
+        || !has_reference(&references, reference)
+    {
         return Err(NetworkError::Platform);
     }
     Ok(())
 }
 
-/// Flushes the anchor, removes the `pf.conf` block and the anchor file.
+fn read_token(commands: &dyn Commands) -> Result<Option<u64>, NetworkError> {
+    let Some(contents) = commands.read(TOKEN)? else {
+        return Ok(None);
+    };
+    Ok(contents.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == "Token")
+            .then(|| value.trim().parse::<u64>().ok())
+            .flatten()
+    }))
+}
+
 fn recover_with(commands: &dyn Commands) -> Result<(), NetworkError> {
-    commands.run(PFCTL, &["-a", ANCHOR, "-F", "all"])?;
-    commands.remove(ANCHOR_FILE)?;
+    let conf = commands.read(PF_CONF)?.ok_or(NetworkError::Io)?;
+    let has_block = conf.lines().any(|line| line == BLOCK_BEGIN);
+    let live = commands.output(PFCTL, &["-a", ANCHOR, "-s", "rules"])?;
+    if !live.trim().is_empty() {
+        commands.run(PFCTL, &["-a", ANCHOR, "-F", "rules"])?;
+    }
 
-    let conf = commands.read(PF_CONF)?.unwrap_or_default();
-    if conf.contains(BLOCK_BEGIN) {
-        commands.write(PF_CONF, &strip_block(&conf))?;
-        commands.run(PFCTL, &["-f", PF_CONF])?;
+    if has_block {
+        commands.write(PF_CONF, &strip_block(&conf)?)?;
+    }
+    let root = commands.output(PFCTL, &["-s", "rules"])?;
+    if root.lines().any(|line| {
+        line.trim_start()
+            .starts_with(&format!("anchor \"{ANCHOR}\""))
+    }) {
+        commands.run(PFCTL, &["-m", "-R", "-f", PF_CONF])?;
+    }
+
+    if let Some(token) = read_token(commands)?
+        && commands.run(PFCTL, &["-X", &token.to_string()]).is_err()
+    {
+        let references = commands.output(PFCTL, &["-s", "References"])?;
+        if has_reference(&references, token) {
+            return Err(NetworkError::Platform);
+        }
+    }
+    for path in [TOKEN, RULES, LEGACY_ANCHOR] {
+        commands.remove(path)?;
     }
     Ok(())
 }
 
-/// Removes the marked block from `pf.conf` contents, keeping everything else.
-fn strip_block(conf: &str) -> String {
+fn has_reference(output: &str, token: u64) -> bool {
+    output.lines().any(|line| {
+        line.split_whitespace()
+            .nth(2)
+            .and_then(|value| value.parse::<u64>().ok())
+            == Some(token)
+    })
+}
+
+fn strip_block(conf: &str) -> Result<String, NetworkError> {
     let mut kept = String::with_capacity(conf.len());
     let mut inside = false;
-    for line in conf.lines() {
-        let trimmed = line.trim();
-        if trimmed == BLOCK_BEGIN {
-            inside = true;
-            continue;
-        }
-        if trimmed == BLOCK_END {
-            inside = false;
-            continue;
-        }
-        if !inside {
-            kept.push_str(line);
-            kept.push('\n');
+    for line in conf.split_inclusive('\n') {
+        match line.trim_end() {
+            BLOCK_BEGIN if !inside => inside = true,
+            BLOCK_END if inside => inside = false,
+            BLOCK_BEGIN | BLOCK_END => return Err(NetworkError::Platform),
+            _ if !inside => kept.push_str(line),
+            _ => {}
         }
     }
-    kept
+    if inside {
+        Err(NetworkError::Platform)
+    } else {
+        Ok(kept)
+    }
 }
 
 /// Renders the complete PF rule set for `plan`.
 fn render_rules(plan: &Plan) -> String {
     let mut rules = String::from("# cvbbmso egress guard\n");
-    rules.push_str("pass out quick on lo0 all\n");
+    rules.push_str("pass out quick on lo0 inet from any to 127.0.0.1 no state\npass out quick on lo0 inet6 from any to ::1 no state\n");
 
-    for resolver in &plan.resolvers {
-        push_pass(&mut rules, resolver, 53);
-    }
-    for port in DATAGRAM_PORTS {
-        let rule = format!("pass out quick proto udp from any to any port {port}\n");
-        rules.push_str(&rule);
+    rules.push_str(concat!(
+        "pass out quick inet6 proto ipv6-icmp from any to ff02::2 icmp6-type routersol no state\n",
+        "pass out quick inet6 proto ipv6-icmp from any to ff02::1:ff00:0/104 icmp6-type neighbrsol no state\n",
+        "pass out quick inet6 proto ipv6-icmp from any to ff02::1 icmp6-type neighbradv no state\n",
+        "pass out quick inet6 proto ipv6-icmp from any to fe80::/10 icmp6-type { neighbrsol neighbradv } no state\n",
+    ));
+    for service in &plan.services {
+        let protocol = match service.transport {
+            Transport::Tcp => "tcp",
+            Transport::Udp => "udp",
+        };
+        push_pass(
+            &mut rules,
+            &service.remote.ip(),
+            service.remote.port(),
+            protocol,
+        );
     }
     for target in [&plan.accoding, &plan.server] {
         for address in &target.addresses {
-            push_pass(&mut rules, address, target.port);
+            push_pass(&mut rules, address, target.port, "{ tcp udp }");
         }
     }
     for address in &plan.certificate {
-        for port in CERTIFICATE_PORTS {
-            push_pass(&mut rules, address, port);
-        }
+        push_pass(&mut rules, &address.ip(), address.port(), "tcp");
     }
-
-    rules.push_str("block drop out all\n");
+    rules.push_str("block drop out quick all\n");
     rules
 }
 
 /// Appends one pass rule for TCP and UDP towards `address:port`.
-fn push_pass(rules: &mut String, address: &IpAddr, port: u16) {
+fn push_pass(rules: &mut String, address: &IpAddr, port: u16, protocol: &str) {
     let family = if address.is_ipv4() { "inet" } else { "inet6" };
-    let rule =
-        format!("pass out quick {family} proto {{ tcp udp }} from any to {address} port {port}\n");
+    let rule = format!(
+        "pass out quick {family} proto {protocol} from any to {address} port {port} no state\n"
+    );
     rules.push_str(&rule);
 }
 
-/// Fails unless the process runs with root rights.
-fn require_root() -> Result<(), NetworkError> {
-    // SAFETY: `geteuid` has no preconditions and cannot fail.
-    let effective = unsafe { libc::geteuid() };
-    if effective == 0 {
-        Ok(())
-    } else {
-        Err(NetworkError::PermissionDenied)
+fn local_addresses() -> Result<Vec<IpAddr>, NetworkError> {
+    let mut head = std::ptr::null_mut();
+    // SAFETY: getifaddrs initializes head on success, and its allocation is
+    // valid until freeifaddrs. Every node is inspected within that lifetime.
+    if unsafe { libc::getifaddrs(&raw mut head) } != 0 {
+        return Err(NetworkError::Platform);
     }
+    let mut addresses = Vec::new();
+    let mut next = head;
+    while !next.is_null() {
+        // SAFETY: next is a live node from the OS-owned list. The address
+        // family determines the concrete type of each non-null socket address.
+        let interface = unsafe { &*next };
+        let address = interface.ifa_addr;
+        if !address.is_null() {
+            match i32::from(unsafe { (*address).sa_family }) {
+                libc::AF_INET => {
+                    // SAFETY: this address was reported as AF_INET.
+                    let address = unsafe { address.cast::<libc::sockaddr_in>().read_unaligned() };
+                    addresses.push(Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()).into());
+                }
+                libc::AF_INET6 => {
+                    // SAFETY: this address was reported as AF_INET6.
+                    let address = unsafe { address.cast::<libc::sockaddr_in6>().read_unaligned() };
+                    let mut octets = address.sin6_addr.s6_addr;
+                    // Darwin embeds interface scope in bytes 2..4 for link-local addresses.
+                    if Ipv6Addr::from(octets).is_unicast_link_local() {
+                        octets[2..4].fill(0);
+                    }
+                    addresses.push(Ipv6Addr::from(octets).into());
+                }
+                _ => {}
+            }
+        }
+        next = interface.ifa_next;
+    }
+    // SAFETY: head is the original pointer returned by getifaddrs.
+    unsafe { libc::freeifaddrs(head) };
+    addresses.sort();
+    addresses.dedup();
+    Ok(addresses)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ANCHOR_FILE, BLOCK_BEGIN, BLOCK_END, PF_CONF, apply_with, recover_with, render_rules,
-        strip_block, verify_with,
-    };
-    use crate::NetworkError;
+    use super::*;
     use crate::egress::commands::testing::{Call, Recorder};
-    use crate::egress::policy::{Plan, Target};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use crate::egress::policy::{Service, Target};
+
+    const BASE: &str = "# original PF configuration\nblock in all";
+    const BLOCK: &str = "block drop out quick all";
+    const PARSE: &[&str] = &["-a", ANCHOR, "-n", "-v", "-o", "none", "-f", RULES];
+    const LIVE: &[&str] = &["-a", ANCHOR, "-s", "rules"];
+    const ROOT: &[&str] = &["-s", "rules"];
 
     fn plan() -> Plan {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
         Plan::new(
-            Target::new(vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))], 443),
-            Target::new(vec![IpAddr::V6(Ipv6Addr::LOCALHOST)], 8443),
-            vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20))],
-            vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53))],
+            Target::new(vec![ip("203.0.113.10")], 443),
+            Target::new(vec![ip("2001:db8::1")], 8443),
+            vec!["203.0.113.20:80".parse().unwrap()],
+            vec![
+                Service::new(ip("192.0.2.53"), 53, Transport::Tcp),
+                Service::new(ip("192.0.2.53"), 53, Transport::Udp),
+                Service::new(ip("192.0.2.67"), 67, Transport::Udp),
+                Service::new(ip("192.0.2.123"), 123, Transport::Udp),
+            ],
         )
     }
 
-    #[test]
-    fn rules_allow_the_configured_endpoints_only() {
-        let rules = render_rules(&plan());
-        assert!(rules.contains("pass out quick on lo0 all"));
-        assert!(
-            rules.contains(
-                "pass out quick inet proto { tcp udp } from any to 203.0.113.10 port 443"
-            )
-        );
-        assert!(rules.contains("pass out quick inet6 proto { tcp udp } from any to ::1 port 8443"));
-        assert!(rules.contains("from any to 192.0.2.53 port 53"));
-        assert!(rules.contains("from any to any port 123"));
-        assert!(rules.contains("from any to 203.0.113.20 port 443"));
-        assert!(rules.trim_end().ends_with("block drop out all"));
+    fn healthy(recorder: &Recorder, live: &str) {
+        recorder.reply(&["-s", "info"], Ok("Status: Enabled for 0 days"));
+        recorder.reply(ROOT, Ok(ROOT_RULE));
+        recorder.reply(LIVE, Ok(live));
+        recorder.reply(&["-s", "References"], Ok("202 pfctl 42 0 days"));
     }
 
     #[test]
-    fn installation_writes_the_anchor_and_references_it_once() {
-        let recorder = Recorder::default();
-        apply_with(&recorder, &plan()).expect("apply succeeds");
+    fn install_confirms_the_reference_and_rechecks_existing_outbound_flows() {
+        let recorder = Recorder::with_file(PF_CONF, BASE);
+        recorder.reply(PARSE, Ok(BLOCK));
+        recorder.reply(&["-E"], Ok("pf enabled\nToken : 42\n"));
+        healthy(&recorder, BLOCK);
 
-        let anchor = recorder.contents(ANCHOR_FILE).expect("anchor file");
-        assert!(anchor.contains("block drop out all"));
+        let local = "192.0.2.123".parse().unwrap();
+        install_with(&recorder, &plan(), &[local]).unwrap();
+        assert!(recorder.contents(PF_CONF).unwrap().starts_with(BLOCK_BEGIN));
+        assert_eq!(read_token(&recorder).unwrap(), Some(42));
+        assert_eq!(
+            recorder.calls().last(),
+            Some(&Call::Run(
+                PFCTL.to_owned(),
+                vec!["-k".into(), local.to_string()]
+            )),
+        );
+    }
 
-        let conf = recorder.contents(PF_CONF).expect("pf.conf");
-        assert!(conf.contains(BLOCK_BEGIN));
-        assert_eq!(conf.matches(BLOCK_BEGIN).count(), 1);
+    #[test]
+    fn failed_enable_verification_leaves_a_recoverable_reference() {
+        let recorder = Recorder::with_file(PF_CONF, BASE);
+        recorder.reply(PARSE, Ok(BLOCK));
+        recorder.reply(&["-E"], Ok("pf enabled\nToken : 42\n"));
+        recorder.reply(&["-s", "info"], Ok("Status: Disabled"));
+        recorder.reply(ROOT, Ok(ROOT_RULE));
+        recorder.reply(LIVE, Ok(BLOCK));
+        recorder.reply(&["-s", "References"], Ok("202 pfctl 42 0 days"));
 
-        // Applying twice does not duplicate the block.
-        apply_with(&recorder, &plan()).expect("second apply succeeds");
-        let conf = recorder.contents(PF_CONF).expect("pf.conf");
-        assert_eq!(conf.matches(BLOCK_BEGIN).count(), 1);
+        assert_eq!(
+            install_with(&recorder, &plan(), &[]).err(),
+            Some(NetworkError::Platform)
+        );
 
+        recorder.reply(LIVE, Ok(BLOCK));
+        recorder.reply(ROOT, Ok(ROOT_RULE));
+        lifecycle::recover(&recorder).unwrap();
+        assert_eq!(recorder.contents(PF_CONF).as_deref(), Some(BASE));
+        assert!(recorder.contents(TOKEN).is_none());
+        assert!(recorder.contents(RULES).is_none());
         assert!(
             recorder
                 .calls()
-                .iter()
-                .any(|call| matches!(call, Call::Run(program, _) if program == "/sbin/pfctl"))
+                .contains(&Call::Run(PFCTL.to_owned(), vec!["-X".into(), "42".into()]))
         );
     }
 
     #[test]
-    fn recovery_removes_the_block_and_the_anchor() {
-        let recorder = Recorder::default();
-        apply_with(&recorder, &plan()).expect("apply succeeds");
-        recover_with(&recorder).expect("recover succeeds");
-
-        assert!(recorder.contents(ANCHOR_FILE).is_none());
-        let conf = recorder.contents(PF_CONF).expect("pf.conf");
-        assert!(!conf.contains(BLOCK_BEGIN));
-        assert!(!conf.contains(BLOCK_END));
+    fn a_rejected_anchor_refresh_leaves_the_current_rules() {
+        let recorder = Recorder::with_file(TOKEN, "Token : 42\n");
+        let mut expected = Expected {
+            rendered: BLOCK.to_owned(),
+            kernel: BLOCK.to_owned(),
+        };
+        recorder.reply(PARSE, Ok(BLOCK));
+        recorder.reply(
+            &["-a", ANCHOR, "-o", "none", "-f", RULES],
+            Err(NetworkError::Platform),
+        );
+        assert_eq!(
+            replace_with(&recorder, &mut expected, format!("# next\n{BLOCK}")),
+            Err(NetworkError::Platform)
+        );
+        assert_eq!(expected.rendered, BLOCK);
+        let calls = recorder.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|call| match call {
+            Call::Run(_, args) | Call::Output(_, args) =>
+                args.starts_with(&["-a".into(), ANCHOR.into()]),
+        }));
     }
 
     #[test]
-    fn stripping_keeps_the_rest_of_the_configuration() {
-        let conf =
-            format!("set skip on lo0\n{BLOCK_BEGIN}\nanchor \"x\"\n{BLOCK_END}\nscrub in all\n");
-        assert_eq!(strip_block(&conf), "set skip on lo0\nscrub in all\n");
+    fn verification_detects_partial_rules_or_a_missing_enable_reference() {
+        let recorder = Recorder::with_file(TOKEN, "Token : 42\n");
+        healthy(&recorder, "pass out quick on lo0 all");
+        assert_eq!(verify_with(&recorder, BLOCK), Err(NetworkError::Platform));
+        healthy(&recorder, BLOCK);
+        assert_eq!(verify_with(&recorder, BLOCK), Ok(()));
+        healthy(&recorder, BLOCK);
+        recorder.remove(TOKEN).unwrap();
+        assert_eq!(verify_with(&recorder, BLOCK), Err(NetworkError::Platform));
     }
 
     #[test]
-    fn the_rendered_rules_parse_with_pf() {
-        // `pfctl -n` parses without loading, so this needs no privileges and
-        // cannot disturb the running firewall.
-        let directory = tempfile::tempdir().expect("temp dir");
+    fn rules_parse_with_pf_and_keep_service_permissions_narrow() {
+        let rules = render_rules(&plan());
+        assert!(rules.contains("proto tcp from any to 192.0.2.53 port 53"));
+        assert!(rules.contains("proto udp from any to 192.0.2.53 port 53"));
+        assert!(rules.contains("proto udp from any to 192.0.2.67 port 67"));
+        assert!(rules.contains("proto udp from any to 192.0.2.123 port 123"));
+        assert!(rules.contains("proto tcp from any to 203.0.113.20 port 80"));
+        assert!(!rules.contains("to any port"));
+        assert!(!rules.contains("udp from any to 203.0.113.20"));
+        let directory = tempfile::tempdir().unwrap();
         let rules_path = directory.path().join("guard.rules");
-        std::fs::write(&rules_path, render_rules(&plan())).expect("write rules");
-
-        let status = std::process::Command::new("/sbin/pfctl")
-            .arg("-n")
-            .arg("-f")
-            .arg(&rules_path)
-            .status()
-            .expect("pfctl runs");
-        assert!(status.success(), "PF rejected the rendered rule set");
+        std::fs::write(&rules_path, rules).unwrap();
+        let output = std::process::Command::new(PFCTL)
+            .args(["-a", ANCHOR, "-n", "-v", "-o", "none", "-f"])
+            .arg(rules_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let printed = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(printed.trim().lines().last(), Some(BLOCK));
     }
 
     #[test]
-    fn verification_fails_without_the_block() {
-        let recorder = Recorder::default();
-        assert_eq!(
-            verify_with(&recorder).expect_err("no block"),
-            NetworkError::Platform
-        );
-    }
-
-    #[test]
-    fn verification_fails_when_pf_reports_no_rules() {
-        let recorder = Recorder::with_file(PF_CONF, &format!("{BLOCK_BEGIN}\n{BLOCK_END}\n"));
-        assert_eq!(
-            verify_with(&recorder).expect_err("empty anchor"),
-            NetworkError::Platform
-        );
+    fn unmodified_pf_configuration_bytes_survive_rollback() {
+        let marked = format!("{BLOCK_BEGIN}\nanchor \"{ANCHOR}\"\n{BLOCK_END}\n{BASE}");
+        assert_eq!(strip_block(&marked).unwrap(), BASE);
+        assert_eq!(strip_block(BLOCK_BEGIN), Err(NetworkError::Platform));
     }
 }

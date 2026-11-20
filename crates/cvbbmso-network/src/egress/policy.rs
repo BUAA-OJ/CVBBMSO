@@ -1,6 +1,6 @@
 //! Egress policy: validation and the rule set derived from it.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use url::Url;
 
@@ -53,10 +53,13 @@ impl Endpoint {
         if url.scheme() != "https" {
             return Err(NetworkError::Policy);
         }
-        let Some(host) = url.host_str() else {
+        let Some(host) = url.host() else {
             return Err(NetworkError::Policy);
         };
-        let host = host.trim().to_owned();
+        let host = match host {
+            url::Host::Ipv6(ip) => ip.to_string(),
+            other => other.to_string(),
+        };
         if host.is_empty() {
             return Err(NetworkError::Policy);
         }
@@ -78,29 +81,48 @@ impl Target {
     }
 }
 
-/// The complete rule set handed to a platform adapter.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Transport {
+    #[cfg(any(windows, target_os = "macos"))]
+    Tcp,
+    Udp,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Service {
+    pub(crate) remote: SocketAddr,
+    pub(crate) transport: Transport,
+}
+
+impl Service {
+    pub(crate) fn new(address: IpAddr, port: u16, transport: Transport) -> Self {
+        Self {
+            remote: SocketAddr::new(address, port),
+            transport,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Plan {
     pub(crate) accoding: Target,
     pub(crate) server: Target,
-    /// Certificate status responders (OCSP/CRL) maintained by the adapter.
-    pub(crate) certificate: Vec<IpAddr>,
-    /// System resolvers read from the platform configuration.
-    pub(crate) resolvers: Vec<IpAddr>,
+    pub(crate) certificate: Vec<SocketAddr>,
+    pub(crate) services: Vec<Service>,
 }
 
 impl Plan {
     pub(crate) fn new(
         accoding: Target,
         server: Target,
-        certificate: Vec<IpAddr>,
-        resolvers: Vec<IpAddr>,
+        certificate: Vec<SocketAddr>,
+        services: Vec<Service>,
     ) -> Self {
         Self {
             accoding,
             server,
             certificate,
-            resolvers,
+            services,
         }
     }
 }

@@ -7,9 +7,7 @@
 #![allow(unsafe_code, reason = "WFP has no safe binding")]
 
 use std::net::IpAddr;
-use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread::JoinHandle;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
@@ -17,20 +15,23 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_CONDITION_VALUE0_0, FWP_MATCH_EQUAL, FWP_UINT8, FWP_UINT16, FWP_V4_ADDR_AND_MASK,
     FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0, FWP_VALUE0_0,
     FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_IP_PROTOCOL, FWPM_CONDITION_IP_REMOTE_ADDRESS,
-    FWPM_CONDITION_IP_REMOTE_PORT, FWPM_FILTER_CONDITION0, FWPM_FILTER0, FWPM_FILTER0_0,
-    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SESSION_FLAG_DYNAMIC,
-    FWPM_SESSION0, FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0,
-    FwpmSubLayerAdd0,
+    FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0, FWPM_FILTER_CONDITION0,
+    FWPM_FILTER_FLAG_DISABLED, FWPM_FILTER0, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SESSION0, FWPM_SUBLAYER0,
+    FWPM_TXN_READ_ONLY, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterDeleteById0,
+    FwpmFilterGetById0, FwpmFreeMemory0, FwpmSubLayerAdd0, FwpmTransactionAbort0,
+    FwpmTransactionBegin0, FwpmTransactionCommit0,
 };
 use windows_sys::Win32::Security::{
     GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
 };
+use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::core::GUID;
 
 use crate::NetworkError;
 use crate::egress::backend::{GuardBackend, InstallResult};
-use crate::egress::policy::Plan;
+use crate::egress::policy::{Plan, Transport};
 
 /// Sublayer that owns the guard filters.
 const SUBLAYER: GUID = GUID::from_u128(0x7d2a1c44_5f6b_4a17_9b7e_63a8d4f1c2b9);
@@ -42,12 +43,8 @@ const PERMIT_WEIGHT: u8 = 5;
 const PROTOCOL_TCP: u8 = 6;
 /// IP protocol numbers used in conditions.
 const PROTOCOL_UDP: u8 = 17;
-/// Datagram services an exam client needs: DNS, DHCP and NTP.
-const DATAGRAM_PORTS: [u16; 5] = [53, 67, 68, 123, 123];
-/// Ports used to fetch certificate status.
-const CERTIFICATE_PORTS: [u16; 2] = [80, 443];
 /// Loopback prefixes kept reachable for local IPC.
-const LOOPBACK_V4: ([u8; 4], u8) = ([127, 0, 0, 0], 8);
+const LOOPBACK_V4: ([u8; 4], u8) = ([127, 0, 0, 1], 32);
 /// Loopback prefixes kept reachable for local IPC.
 const LOOPBACK_V6: ([u8; 16], u8) = ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 128);
 
@@ -64,13 +61,8 @@ pub(crate) fn install(plan: &Plan) -> Result<InstallResult, NetworkError> {
     }))
 }
 
-/// Reports success because the dynamic session cleans itself up.
-///
-/// # Errors
-///
-/// Never returns an error on this target.
-pub(crate) fn recover() -> Result<(), NetworkError> {
-    Ok(())
+pub(crate) fn prepare() -> Result<(), NetworkError> {
+    require_elevated()
 }
 
 /// Handle to a running WFP session.
@@ -86,126 +78,205 @@ impl WfpGuard {
 
 impl GuardBackend for WfpGuard {
     fn apply(&self, plan: &Plan) -> Result<(), NetworkError> {
-        let mut slot = self.session();
-        if let Some(session) = slot.take() {
-            session.stop();
-        }
-        *slot = Some(Session::start(plan)?);
-        Ok(())
+        self.session()
+            .as_mut()
+            .ok_or(NetworkError::Platform)?
+            .replace(plan)
     }
 
     fn verify(&self) -> Result<(), NetworkError> {
-        // Filters belong to the session, which exists exactly as long as the
-        // owning thread keeps the engine open.
-        if self.session().is_some() {
+        self.session()
+            .as_ref()
+            .ok_or(NetworkError::Platform)?
+            .verify()
+    }
+
+    fn revert(&self) -> Result<(), NetworkError> {
+        let mut slot = self.session();
+        if let Some(session) = slot.as_mut() {
+            session.engine.close()?;
+            *slot = None;
+        }
+        Ok(())
+    }
+}
+
+/// Filter IDs are assigned by BFE and identify immutable filter definitions.
+struct Session {
+    engine: Engine,
+    filters: Vec<u64>,
+    plan: Plan,
+}
+
+impl Session {
+    fn start(plan: &Plan) -> Result<Self, NetworkError> {
+        let engine = Engine::open()?;
+        let filters = engine.transaction(0, || {
+            engine.add_sublayer()?;
+            engine.replace_filters(&[], plan)
+        })?;
+        let session = Self {
+            engine,
+            filters,
+            plan: plan.clone(),
+        };
+        session.verify()?;
+        Ok(session)
+    }
+
+    fn replace(&mut self, plan: &Plan) -> Result<(), NetworkError> {
+        if self.plan != *plan {
+            let next = self
+                .engine
+                .transaction(0, || self.engine.replace_filters(&self.filters, plan))?;
+            self.filters = next;
+            self.plan = plan.clone();
+        }
+        self.verify()
+    }
+
+    fn verify(&self) -> Result<(), NetworkError> {
+        self.engine.transaction(FWPM_TXN_READ_ONLY, || {
+            for &id in &self.filters {
+                self.engine.verify_filter(id)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+struct Engine(HANDLE);
+
+// SAFETY: a WFP engine handle belongs to the process and has no thread affinity.
+// WfpGuard serializes access, including transactions and closure, with its mutex.
+unsafe impl Send for Engine {}
+
+impl Engine {
+    fn open() -> Result<Self, NetworkError> {
+        let mut name = wide_name();
+        let session = FWPM_SESSION0 {
+            displayData: display_data(&mut name),
+            flags: FWPM_SESSION_FLAG_DYNAMIC,
+            txnWaitTimeoutInMSec: 5_000,
+            ..FWPM_SESSION0::default()
+        };
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: the session and its name live through the call. WFP writes an
+        // owned handle to the out parameter on success.
+        check(unsafe {
+            FwpmEngineOpen0(
+                std::ptr::null(),
+                RPC_C_AUTHN_WINNT,
+                std::ptr::null(),
+                &raw const session,
+                &raw mut handle,
+            )
+        })?;
+        if handle.is_null() {
+            return Err(NetworkError::Platform);
+        }
+        Ok(Self(handle))
+    }
+
+    fn close(&mut self) -> Result<(), NetworkError> {
+        if !self.0.is_null() {
+            // SAFETY: self owns the open handle and has exclusive access to it.
+            check(unsafe { FwpmEngineClose0(self.0) })?;
+            self.0 = std::ptr::null_mut();
+        }
+        Ok(())
+    }
+
+    fn transaction<T>(
+        &self,
+        flags: u32,
+        operation: impl FnOnce() -> Result<T, NetworkError>,
+    ) -> Result<T, NetworkError> {
+        // SAFETY: the engine is open and no other caller can start a
+        // transaction while the owning guard is locked.
+        check(unsafe { FwpmTransactionBegin0(self.0, flags) })?;
+        let result = operation().and_then(|value| {
+            // SAFETY: this is the transaction opened above.
+            check(unsafe { FwpmTransactionCommit0(self.0) })?;
+            Ok(value)
+        });
+        if result.is_err() {
+            // SAFETY: abort discards all staged changes and cannot remove the
+            // previous committed rules, even when the commit already failed.
+            unsafe { FwpmTransactionAbort0(self.0) };
+        }
+        result
+    }
+
+    fn add_sublayer(&self) -> Result<(), NetworkError> {
+        let mut name = wide_name();
+        let sublayer = FWPM_SUBLAYER0 {
+            subLayerKey: SUBLAYER,
+            displayData: display_data(&mut name),
+            weight: 0x8000,
+            ..FWPM_SUBLAYER0::default()
+        };
+        // SAFETY: all input storage is valid until WFP has copied it.
+        check(unsafe { FwpmSubLayerAdd0(self.0, &raw const sublayer, std::ptr::null_mut()) })
+    }
+
+    fn replace_filters(&self, previous: &[u64], plan: &Plan) -> Result<Vec<u64>, NetworkError> {
+        let next = filter_specs(plan)
+            .iter()
+            .map(|spec| add_filter(self.0, spec))
+            .collect::<Result<Vec<_>, _>>()?;
+        for &id in previous {
+            // SAFETY: the engine is open. The deletion is staged in the
+            // same transaction as the replacement rules.
+            check(unsafe { FwpmFilterDeleteById0(self.0, id) })?;
+        }
+        Ok(next)
+    }
+
+    fn verify_filter(&self, id: u64) -> Result<(), NetworkError> {
+        let mut filter = std::ptr::null_mut();
+        // SAFETY: the engine is open and filter points to a writable out parameter.
+        check(unsafe { FwpmFilterGetById0(self.0, id, &raw mut filter) })?;
+        if filter.is_null() {
+            return Err(NetworkError::Platform);
+        }
+        // SAFETY: WFP returned an initialized filter owned by the caller; it
+        // stays live until we release it with the WFP allocator below.
+        let enabled = unsafe { (*filter).flags & FWPM_FILTER_FLAG_DISABLED == 0 };
+        let mut allocation = filter.cast();
+        // SAFETY: this is the allocation returned by FwpmFilterGetById0.
+        unsafe { FwpmFreeMemory0(&raw mut allocation) };
+        if enabled {
             Ok(())
         } else {
             Err(NetworkError::Platform)
         }
     }
+}
 
-    fn revert(&self) -> Result<(), NetworkError> {
-        if let Some(session) = self.session().take() {
-            session.stop();
-        }
+impl Drop for Engine {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+fn wide_name() -> Vec<u16> {
+    "CVBBMSO egress guard".encode_utf16().chain([0]).collect()
+}
+
+fn display_data(name: &mut [u16]) -> FWPM_DISPLAY_DATA0 {
+    FWPM_DISPLAY_DATA0 {
+        name: name.as_mut_ptr(),
+        ..FWPM_DISPLAY_DATA0::default()
+    }
+}
+
+fn check(status: u32) -> Result<(), NetworkError> {
+    if status == 0 {
         Ok(())
+    } else {
+        Err(NetworkError::Platform)
     }
-}
-
-/// A WFP session owned by a thread that keeps the engine handle open.
-struct Session {
-    stop: Sender<()>,
-    join: JoinHandle<()>,
-}
-
-impl Session {
-    fn start(plan: &Plan) -> Result<Self, NetworkError> {
-        let (ready_sender, ready_receiver) = channel::<Result<(), NetworkError>>();
-        let (stop_sender, stop_receiver) = channel::<()>();
-        let plan = plan.clone();
-
-        let join = std::thread::spawn(move || {
-            match install_filters(&plan) {
-                Ok(engine) => {
-                    let _ = ready_sender.send(Ok(()));
-                    // The session ends with the engine handle; closing it removes
-                    // every filter created in this session.
-                    let _ = stop_receiver.recv();
-                    // SAFETY: `engine` is an open engine handle owned by this
-                    // thread and is closed exactly once here.
-                    unsafe { FwpmEngineClose0(engine) };
-                }
-                Err(error) => {
-                    let _ = ready_sender.send(Err(error));
-                }
-            }
-        });
-
-        match ready_receiver.recv() {
-            Ok(Ok(())) => Ok(Self {
-                stop: stop_sender,
-                join,
-            }),
-            Ok(Err(error)) => {
-                let _ = join.join();
-                Err(error)
-            }
-            Err(_) => Err(NetworkError::Platform),
-        }
-    }
-
-    fn stop(self) {
-        let _ = self.stop.send(());
-        let _ = self.join.join();
-    }
-}
-
-/// Opens a dynamic session, adds the sublayer and every filter.
-///
-/// # Safety
-///
-/// Callers must treat the returned handle as owned by the calling thread and
-/// close it with `FwpmEngineClose0`.
-fn install_filters(plan: &Plan) -> Result<HANDLE, NetworkError> {
-    let mut session = FWPM_SESSION0::default();
-    session.flags = FWPM_SESSION_FLAG_DYNAMIC;
-
-    let mut engine: HANDLE = std::ptr::null_mut();
-    // SAFETY: the session structure is valid for the call and `engine` receives
-    // the handle; no borrowed data escapes.
-    let status = unsafe {
-        FwpmEngineOpen0(
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            &raw const session,
-            &raw mut engine,
-        )
-    };
-    if status != 0 || engine.is_null() {
-        return Err(NetworkError::Platform);
-    }
-
-    let mut sublayer = FWPM_SUBLAYER0::default();
-    sublayer.subLayerKey = SUBLAYER;
-    sublayer.weight = 0x8000;
-    // SAFETY: the sublayer is initialized and the engine handle is valid.
-    let status = unsafe { FwpmSubLayerAdd0(engine, &raw const sublayer, std::ptr::null_mut()) };
-    if status != 0 {
-        // SAFETY: the engine handle was opened above and is still open.
-        unsafe { FwpmEngineClose0(engine) };
-        return Err(NetworkError::Platform);
-    }
-
-    for specification in filter_specs(plan) {
-        if let Err(error) = add_filter(engine, &specification) {
-            // SAFETY: closing the dynamic session removes every filter of it.
-            unsafe { FwpmEngineClose0(engine) };
-            return Err(error);
-        }
-    }
-
-    Ok(engine)
 }
 
 /// One filter to add.
@@ -229,44 +300,53 @@ enum ConditionSpec {
 }
 
 /// Adds one filter owned by the guard sublayer.
-fn add_filter(engine: HANDLE, specification: &FilterSpec) -> Result<(), NetworkError> {
-    let mut owned = specification
+fn add_filter(engine: HANDLE, specification: &FilterSpec) -> Result<u64, NetworkError> {
+    with_filter(specification, |filter| {
+        let mut id = 0;
+        // SAFETY: with_filter keeps every condition and value alive until
+        // WFP has copied the filter.
+        check(unsafe { FwpmFilterAdd0(engine, filter, std::ptr::null_mut(), &raw mut id) })?;
+        Ok(id)
+    })
+}
+
+/// Keeps the filter and all of its ABI backing storage alive for the call.
+fn with_filter<T>(
+    specification: &FilterSpec,
+    use_filter: impl FnOnce(&FWPM_FILTER0) -> Result<T, NetworkError>,
+) -> Result<T, NetworkError> {
+    let owned = specification
         .conditions
         .iter()
         .map(OwnedCondition::new)
         .collect::<Vec<_>>();
-
-    let mut filter = FWPM_FILTER0::default();
-    filter.layerKey = specification.layer;
-    filter.subLayerKey = SUBLAYER;
-    filter.weight = weight_value(specification.weight);
-    filter.numFilterConditions = u32::try_from(owned.len()).unwrap_or(0);
-    filter.filterCondition = owned.as_mut_ptr().cast::<FWPM_FILTER_CONDITION0>();
-    filter.action = FWPM_ACTION0 {
-        r#type: specification.action,
-        Anonymous: FWPM_ACTION0_0 {
-            filterType: GUID::from_u128(0),
+    // The WFP ABI indexes an array of FWPM_FILTER_CONDITION0. The owning
+    // wrappers have extra fields and therefore have a different stride.
+    let mut conditions = owned
+        .iter()
+        .map(|entry| entry.condition)
+        .collect::<Vec<_>>();
+    let mut name = wide_name();
+    let filter = FWPM_FILTER0 {
+        displayData: display_data(&mut name),
+        layerKey: specification.layer,
+        subLayerKey: SUBLAYER,
+        weight: weight_value(specification.weight),
+        numFilterConditions: u32::try_from(conditions.len()).map_err(|_| NetworkError::Platform)?,
+        filterCondition: if conditions.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            conditions.as_mut_ptr()
         },
+        action: FWPM_ACTION0 {
+            r#type: specification.action,
+            Anonymous: FWPM_ACTION0_0 {
+                filterType: GUID::from_u128(0),
+            },
+        },
+        ..FWPM_FILTER0::default()
     };
-    filter.Anonymous = FWPM_FILTER0_0 {
-        providerContextKey: GUID::from_u128(0),
-    };
-
-    // SAFETY: `owned` keeps every condition value alive for the duration of the
-    // call, and WFP copies the data it needs before returning.
-    let status = unsafe {
-        FwpmFilterAdd0(
-            engine,
-            &raw const filter,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(NetworkError::Platform)
-    }
+    use_filter(&filter)
 }
 
 /// A condition whose pointed-to data is owned by the value.
@@ -281,9 +361,9 @@ impl OwnedCondition {
         match specification {
             ConditionSpec::AddressV4(octets, prefix) => {
                 let mask = Box::new(FWP_V4_ADDR_AND_MASK {
-                    // WFP expects the address and mask in network byte order.
-                    addr: u32::from_ne_bytes(*octets),
-                    mask: u32::from_ne_bytes(prefix_mask_v4(*prefix)),
+                    // WFP takes the numeric address and mask in host byte order.
+                    addr: u32::from_be_bytes(*octets),
+                    mask: prefix_mask_v4(*prefix),
                 });
                 let mut condition =
                     condition_of(FWPM_CONDITION_IP_REMOTE_ADDRESS, FWP_V4_ADDR_MASK);
@@ -357,14 +437,10 @@ fn weight_value(weight: u8) -> FWP_VALUE0 {
 }
 
 /// Returns the IPv4 mask for a prefix length.
-fn prefix_mask_v4(prefix: u8) -> [u8; 4] {
-    let prefix = prefix.min(32);
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - u32::from(prefix))
-    };
-    mask.to_ne_bytes()
+fn prefix_mask_v4(prefix: u8) -> u32 {
+    u32::MAX
+        .checked_shl(32 - u32::from(prefix.min(32)))
+        .unwrap_or(0)
 }
 
 /// Returns the complete filter list for `plan`.
@@ -387,22 +463,16 @@ fn filter_specs(plan: &Plan) -> Vec<FilterSpec> {
     specifications.push(permit_v4(LOOPBACK_V4.0, LOOPBACK_V4.1, Vec::new()));
     specifications.push(permit_v6(LOOPBACK_V6.0, LOOPBACK_V6.1, Vec::new()));
 
-    // Datagram services: DNS, DHCP and NTP.
-    for port in DATAGRAM_PORTS {
-        for layer in [
-            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-        ] {
-            specifications.push(FilterSpec {
-                layer,
-                weight: PERMIT_WEIGHT,
-                action: FWP_ACTION_PERMIT,
-                conditions: vec![
-                    ConditionSpec::Protocol(PROTOCOL_UDP),
-                    ConditionSpec::Port(port),
-                ],
-            });
-        }
+    for service in &plan.services {
+        let protocol = match service.transport {
+            Transport::Tcp => PROTOCOL_TCP,
+            Transport::Udp => PROTOCOL_UDP,
+        };
+        specifications.push(permit_address(
+            &service.remote.ip(),
+            service.remote.port(),
+            protocol,
+        ));
     }
 
     for target in [&plan.accoding, &plan.server] {
@@ -414,9 +484,7 @@ fn filter_specs(plan: &Plan) -> Vec<FilterSpec> {
     }
 
     for address in &plan.certificate {
-        for port in CERTIFICATE_PORTS {
-            specifications.push(permit_address(address, port, PROTOCOL_TCP));
-        }
+        specifications.push(permit_address(&address.ip(), address.port(), PROTOCOL_TCP));
     }
 
     specifications
@@ -498,7 +566,7 @@ mod tests {
         Plan::new(
             Target::new(vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))], 443),
             Target::new(vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)], 8443),
-            vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20))],
+            vec!["203.0.113.20:80".parse().expect("certificate responder")],
             Vec::new(),
         )
     }
@@ -522,25 +590,53 @@ mod tests {
                 .all(|specification| specification.weight == BLOCK_WEIGHT
                     || specification.weight == PERMIT_WEIGHT)
         );
-        assert!(BLOCK_WEIGHT < PERMIT_WEIGHT);
+        const { assert!(BLOCK_WEIGHT < PERMIT_WEIGHT) };
     }
 
     #[test]
     fn every_allowed_address_becomes_a_permit() {
         let specifications = filter_specs(&plan());
-        // accoding (2 protocols) + server (2 protocols) + certificate (2 ports)
+        // Origins have two protocols each; the responder is TCP-only.
         let permits = specifications
             .iter()
             .filter(|specification| specification.weight == PERMIT_WEIGHT)
             .count();
-        assert!(permits >= 6);
+        assert_eq!(permits, 7);
+    }
+
+    #[test]
+    fn ffi_sees_all_three_conditions_in_order() {
+        use super::*;
+        let filter = permit_address(&"203.0.113.10".parse().unwrap(), 8443, PROTOCOL_TCP);
+        with_filter(&filter, |raw| {
+            assert!(!raw.displayData.name.is_null());
+            assert_eq!(raw.numFilterConditions, 3);
+            // SAFETY: with_filter keeps the array and its data live. The type
+            // assertions select the correct union member for each condition.
+            unsafe {
+                let conditions = std::slice::from_raw_parts(raw.filterCondition, 3);
+                let [address, protocol, port] = conditions else {
+                    unreachable!()
+                };
+                assert_eq!(address.conditionValue.r#type, FWP_V4_ADDR_MASK);
+                assert_eq!(protocol.conditionValue.r#type, FWP_UINT8);
+                assert_eq!(port.conditionValue.r#type, FWP_UINT16);
+                let mask = &*address.conditionValue.Anonymous.v4AddrMask;
+                assert_eq!(mask.addr, 0xcb00_710a);
+                assert_eq!(mask.mask, u32::MAX);
+                assert_eq!(protocol.conditionValue.Anonymous.uint8, PROTOCOL_TCP);
+                assert_eq!(port.conditionValue.Anonymous.uint16, 8443);
+            }
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
     fn prefix_masks_cover_the_address() {
-        assert_eq!(prefix_mask_v4(32), [255, 255, 255, 255]);
-        assert_eq!(prefix_mask_v4(24), [255, 255, 255, 0]);
-        assert_eq!(prefix_mask_v4(8), [255, 0, 0, 0]);
-        assert_eq!(prefix_mask_v4(0), [0, 0, 0, 0]);
+        assert_eq!(prefix_mask_v4(32), 0xffff_ffff);
+        assert_eq!(prefix_mask_v4(24), 0xffff_ff00);
+        assert_eq!(prefix_mask_v4(8), 0xff00_0000);
+        assert_eq!(prefix_mask_v4(0), 0);
     }
 }
