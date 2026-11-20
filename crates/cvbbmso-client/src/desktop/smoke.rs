@@ -41,6 +41,7 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 
 const DEADLINE: Duration = Duration::from_secs(20);
 const EXAM_TITLE: &str = "<b>Fixture exam</b>";
+const FIXTURE_USER_ID: i64 = 42;
 
 pub(super) struct FakeProbe(Mutex<VecDeque<Verdict>>);
 
@@ -72,6 +73,8 @@ pub(super) enum Case {
     Detected,
     Exam,
     GuardLoss,
+    Recording,
+    RestoredRecording,
     ExitDuringInstall,
 }
 
@@ -125,9 +128,18 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
                         return check_exit_during_install(&app, &ui, &admission).await;
                     }
                     if let Some(connections) = exam_connections {
-                        let closed =
+                        let closed = if matches!(case, Case::Recording | Case::RestoredRecording) {
+                            exams::recording::exercise(
+                                &app,
+                                &ui,
+                                connections,
+                                case == Case::Recording,
+                            )
+                            .await?
+                        } else {
                             exams::exercise(&app, &ui, connections, foreign, &hits, &mut decisions)
-                                .await?;
+                                .await?
+                        };
                         assert_eq!(admission.installs(), 1);
                         assert_eq!(admission.shutdowns(), 0);
                         if case == Case::GuardLoss {
@@ -167,7 +179,7 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
     result
         .try_recv()
         .map_err(|_| io::Error::other("Native desktop smoke did not complete successfully"))?;
-    if case == Case::Exam {
+    if matches!(case, Case::Exam | Case::Recording | Case::RestoredRecording) {
         check_exit_peer(&exit_peer_result)?;
     }
     println!("Desktop smoke passed.");
@@ -536,9 +548,11 @@ fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
     let mut parts = cookie.split("; ").collect::<Vec<_>>();
     parts.sort_unstable();
     let (user_id, enrolled) = match parts.as_slice() {
-        ["_aux=synthetic", "connect.sid=synthetic-v1"] => (42, false),
-        ["_aux=synthetic", "connect.sid=synthetic-v2"] => (42, true),
-        ["_aux=synthetic", "connect.sid=renewed-candidate"] if include_second_exam => (42, true),
+        ["_aux=synthetic", "connect.sid=synthetic-v1"] => (FIXTURE_USER_ID, false),
+        ["_aux=synthetic", "connect.sid=synthetic-v2"] => (FIXTURE_USER_ID, true),
+        ["_aux=synthetic", "connect.sid=renewed-candidate"] if include_second_exam => {
+            (FIXTURE_USER_ID, true)
+        }
         ["_aux=synthetic", "connect.sid=other-candidate"] if include_second_exam => (43, true),
         ["_aux=synthetic", "connect.sid=unavailable"] => {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();

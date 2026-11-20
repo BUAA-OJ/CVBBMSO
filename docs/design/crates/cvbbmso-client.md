@@ -14,7 +14,9 @@
 
 运行 `cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke` 可在交互式桌面验证预检失败后的重试、两类 WebView 的权限隔离、导航、Release 调试设置、合成 Cookie 更新以及关闭并重新打开 Accoding 窗口后的会话保留。该测试使用模拟 Accoding 登录页和合成会话。将末尾参数换为 `--native-smoke-detected` 可验证检测到虚拟机后的本地阻断与退出。两组冒烟都验证直接调用受限命令不会创建远程 WebView 或外发请求。协议替身绑定回环地址，以临时 TLS 证书和合成凭据验证 HTTPS 接口、WSS 握手及首帧。
 
-将末尾参数换为 `--native-exam-smoke`，可用回环 HTTPS/WSS 服务和合成 Cookie 验证实际考试运行时的入场、重登、断线恢复、导航事件和关闭。测试子进程使用临时证书，不修改系统信任库。测试中的准入替身仅编译到测试程序。
+将末尾参数换为 `--native-exam-smoke`，可用回环 HTTPS/WSS 服务和合成 Cookie 验证实际考试运行时的入场、重登、断线恢复、导航事件和关闭。测试也会恢复两段由 Recorder 原生编码合成帧生成的 MKV，核对录像摘要、文件 SHA-256 和结束 ACK。测试子进程使用临时证书，准入替身仅编译到测试程序。
+
+`--native-recording-smoke` 供获准的隔离桌面验收使用。该用例实际采集主显示器，使用测试窗口生成变化画面，并验证开始命令、分片封存、最终录像及结束 ACK。录像在测试临时目录，监考替身只绑定回环地址。普通 CI 仅运行无屏幕采集的恢复用例。
 
 ## 应用接口
 

@@ -1,5 +1,7 @@
 //! Drives the desktop and the real exam runtime against a loopback monitor.
 
+pub(super) mod recording;
+
 use std::{
     fs,
     path::Path,
@@ -97,6 +99,14 @@ impl Auth {
 }
 
 pub(in crate::desktop) fn launch() -> tauri::Result<()> {
+    launch_modes(&["normal", "guard-loss", "restored-recording"])
+}
+
+pub(in crate::desktop) fn launch_recording() -> tauri::Result<()> {
+    launch_modes(&["recording"])
+}
+
+fn launch_modes(modes: &[&str]) -> tauri::Result<()> {
     let directory = tempfile::tempdir()?;
     let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(["127.0.0.1".to_owned()]).map_err(io::Error::other)?;
@@ -114,7 +124,7 @@ pub(in crate::desktop) fn launch() -> tauri::Result<()> {
 
     // Both runtime TLS clients read native roots. Scope the fixture root to a
     // dedicated test process rather than changing the system trust store.
-    for mode in ["normal", "guard-loss"] {
+    for mode in modes {
         let child = Command::new(std::env::current_exe()?)
             .arg("--native-exam-smoke-child")
             .arg(directory.path())
@@ -139,6 +149,7 @@ struct Connection {
     outgoing: mpsc::Sender<ServerMessage>,
     results: mpsc::UnboundedReceiver<ClientMessage>,
     denials: mpsc::UnboundedReceiver<String>,
+    recordings: mpsc::UnboundedReceiver<(u64, ExamEvent)>,
     closed: oneshot::Receiver<()>,
 }
 
@@ -208,6 +219,7 @@ async fn socket(mut ws: WebSocket, exam_id: Uuid, candidate: Candidate, listener
     let (outgoing, mut messages) = mpsc::channel(4);
     let (report, results) = mpsc::unbounded_channel();
     let (report_denial, denials) = mpsc::unbounded_channel();
+    let (report_recording, recordings) = mpsc::unbounded_channel();
     let (closed, observe_close) = oneshot::channel();
     if listener
         .connections
@@ -218,6 +230,7 @@ async fn socket(mut ws: WebSocket, exam_id: Uuid, candidate: Candidate, listener
             outgoing,
             results,
             denials,
+            recordings,
             closed: observe_close,
         })
         .await
@@ -243,6 +256,12 @@ async fn socket(mut ws: WebSocket, exam_id: Uuid, candidate: Candidate, listener
                     match serde_json::from_str(&body) {
                         Ok(result @ ClientMessage::CommandResult { .. }) => {
                             let _ = report.send(result);
+                        }
+                        Ok(ClientMessage::Event {
+                            seq,
+                            event: event @ (ExamEvent::SegmentFinalized(_) | ExamEvent::RecordingFinalized(_)),
+                        }) => {
+                            let _ = report_recording.send((seq, event));
                         }
                         Ok(ClientMessage::Event { event: ExamEvent::Incident(incident), .. })
                             if incident.code == IncidentCode::NavigationDenied =>
@@ -304,14 +323,10 @@ fn sync() -> ServerMessage {
     }
 }
 
-pub(super) async fn exercise(
+async fn open_enrolled_fixture(
     app: &AppHandle,
     ui: &WebviewWindow,
-    mut fixture: Fixture,
-    foreign: SocketAddr,
-    hits: &AtomicUsize,
-    decisions: &mut mpsc::UnboundedReceiver<(&'static str, Url)>,
-) -> Result<oneshot::Receiver<()>, Error> {
+) -> Result<WebviewWindow, Error> {
     let oj = open_fixture_browser(app, ui).await?;
     check_ipc(ui, &oj).await?;
     oj.eval("location.assign('/rotate')")?;
@@ -334,6 +349,19 @@ pub(super) async fn exercise(
         "enrolled exams",
     )
     .await?;
+
+    Ok(oj)
+}
+
+pub(super) async fn exercise(
+    app: &AppHandle,
+    ui: &WebviewWindow,
+    mut fixture: Fixture,
+    foreign: SocketAddr,
+    hits: &AtomicUsize,
+    decisions: &mut mpsc::UnboundedReceiver<(&'static str, Url)>,
+) -> Result<oneshot::Receiver<()>, Error> {
+    let oj = open_enrolled_fixture(app, ui).await?;
 
     let initial_hello = check_pending_open(ui, &mut fixture.incoming).await?;
     ui.eval("document.querySelector('.open-exam').click()")?;

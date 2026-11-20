@@ -81,16 +81,17 @@ pub fn run() -> tauri::Result<()> {
                 return smoke::run(smoke::Case::ExitDuringInstall, None);
             }
             Some("--native-exam-smoke") => return smoke::exams::launch(),
+            Some("--native-recording-smoke") => return smoke::exams::launch_recording(),
             Some("--native-exam-smoke-child") => {
                 let identity = std::env::args_os().nth(2).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "Missing fixture TLS identity")
                 })?;
-                let case = if std::env::args_os().nth(3).as_deref()
-                    == Some(std::ffi::OsStr::new("guard-loss"))
-                {
-                    smoke::Case::GuardLoss
-                } else {
-                    smoke::Case::Exam
+                let mode = std::env::args_os().nth(3);
+                let case = match mode.as_deref().and_then(std::ffi::OsStr::to_str) {
+                    Some("guard-loss") => smoke::Case::GuardLoss,
+                    Some("recording") => smoke::Case::Recording,
+                    Some("restored-recording") => smoke::Case::RestoredRecording,
+                    _ => smoke::Case::Exam,
                 };
                 return smoke::run(case, Some(PathBuf::from(identity)));
             }
