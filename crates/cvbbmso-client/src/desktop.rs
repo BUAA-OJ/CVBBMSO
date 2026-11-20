@@ -82,6 +82,9 @@ pub fn run() -> tauri::Result<()> {
             Some("--native-admission-exit") => {
                 return smoke::run(smoke::Case::ExitDuringInstall, None);
             }
+            Some("--native-admission-cleanup-failure") => {
+                return smoke::run(smoke::Case::CleanupFailure, None);
+            }
             Some("--native-exam-smoke") => return smoke::exams::launch(),
             Some("--native-exam-smoke-child") => {
                 let identity = std::env::args_os().nth(2).ok_or_else(|| {
@@ -114,7 +117,7 @@ pub fn run() -> tauri::Result<()> {
     }
     #[cfg(not(test))]
     {
-        builder()
+        let app = builder()
             .setup(|app| {
                 let data_dir = app.path().app_local_data_dir()?;
                 app.manage(Desktop::deployed(
@@ -124,8 +127,13 @@ pub fn run() -> tauri::Result<()> {
                 build_ui(app.handle())?;
                 Ok(())
             })
-            .build(tauri::generate_context!())?
-            .run(|app, event| exam::handle_exit(app, &event));
+            .build(tauri::generate_context!())?;
+        let handle = app.handle().clone();
+        let runtime_code = app.run_return(|app, event| exam::handle_exit(app, &event));
+        let code = exam::exit_code(&handle, runtime_code);
+        if code != 0 {
+            std::process::exit(code);
+        }
         Ok(())
     }
 }

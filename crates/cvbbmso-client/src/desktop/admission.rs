@@ -1,4 +1,10 @@
-use std::{future::pending, time::Duration};
+use std::{
+    fs,
+    future::pending,
+    io,
+    path::Path,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 #[cfg(windows)]
 use cvbbmso_network::EgressGuard as SystemGuard;
@@ -118,11 +124,87 @@ pub(super) enum Status {
     Ready,
     Blocked(Failure),
     Exiting,
+    CleanupFailed(CleanupReport),
+}
+
+pub(super) const CLEANUP_DIAGNOSTIC: &str = "egress-cleanup.json";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(super) struct CleanupReport {
+    code: &'static str,
+    diagnostic_saved: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum CleanupError {
+    #[error("egress guard cleanup failed")]
+    Guard(#[from] NetworkError),
+    #[error("the egress guard worker ended during cleanup")]
+    WorkerUnavailable,
+}
+
+impl CleanupError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::WorkerUnavailable => "worker_unavailable",
+            Self::Guard(NetworkError::Platform) => "platform",
+            Self::Guard(NetworkError::Io) => "io",
+            Self::Guard(NetworkError::PermissionDenied) => "permission_denied",
+            Self::Guard(NetworkError::Policy) => "policy",
+            Self::Guard(NetworkError::Resolution) => "resolution",
+            #[cfg(target_os = "macos")]
+            Self::Guard(NetworkError::MacosUnsupported) => "macos_unsupported",
+            #[cfg(target_os = "macos")]
+            Self::Guard(NetworkError::MacosUntrustedInstallation) => "macos_untrusted_installation",
+            #[cfg(target_os = "macos")]
+            Self::Guard(NetworkError::MacosApprovalRequired) => "macos_approval_required",
+            #[cfg(target_os = "macos")]
+            Self::Guard(NetworkError::MacosServiceUnavailable) => "macos_service_unavailable",
+            #[cfg(target_os = "macos")]
+            Self::Guard(NetworkError::MacosUnsupportedPfConfiguration) => {
+                "macos_unsupported_pf_configuration"
+            }
+            #[cfg(target_os = "macos")]
+            Self::Guard(NetworkError::MacosBusy) => "macos_busy",
+            Self::Guard(_) => "unknown",
+        }
+    }
+
+    pub(super) async fn report(&self, data_dir: &Path) -> CleanupReport {
+        let code = self.code();
+        let data_dir = data_dir.to_owned();
+        let diagnostic_saved =
+            tokio::task::spawn_blocking(move || save_cleanup_report(&data_dir, code))
+                .await
+                .is_ok_and(|result| result.is_ok());
+        CleanupReport {
+            code,
+            diagnostic_saved,
+        }
+    }
+}
+
+fn save_cleanup_report(data_dir: &Path, code: &'static str) -> io::Result<()> {
+    fs::create_dir_all(data_dir)?;
+    let mut diagnostic = tempfile::NamedTempFile::new_in(data_dir)?;
+    // Only stable classifications enter the report. Replace the previous report
+    // instead of appending indefinitely or following a diagnostic-file symlink.
+    serde_json::to_writer(
+        &mut diagnostic,
+        &serde_json::json!({
+            "operation": "egress_shutdown",
+            "platform": std::env::consts::OS,
+            "code": code,
+            "unix_seconds": SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|age| age.as_secs()),
+        }),
+    )?;
+    diagnostic.persist(data_dir.join(CLEANUP_DIAGNOSTIC))?;
+    Ok(())
 }
 
 pub(super) struct Admission {
     state: watch::Sender<Status>,
-    shutdown: mpsc::Sender<oneshot::Sender<bool>>,
+    shutdown: mpsc::Sender<oneshot::Sender<Result<(), NetworkError>>>,
 }
 
 impl Admission {
@@ -170,9 +252,21 @@ impl Admission {
         self.set(app, Status::Exiting, |status| status != Status::Exiting);
     }
 
-    pub(super) async fn shutdown(&self) -> bool {
+    pub(super) async fn shutdown(&self) -> Result<(), CleanupError> {
         let (reply, done) = oneshot::channel();
-        self.shutdown.send(reply).await.is_ok() && done.await.unwrap_or(false)
+        self.shutdown
+            .send(reply)
+            .await
+            .map_err(|_| CleanupError::WorkerUnavailable)?;
+        done.await
+            .map_err(|_| CleanupError::WorkerUnavailable)?
+            .map_err(CleanupError::from)
+    }
+
+    pub(super) fn show_cleanup_failure(&self, app: &AppHandle, report: CleanupReport) {
+        self.set(app, Status::CleanupFailed(report), |status| {
+            status == Status::Exiting
+        });
     }
 
     fn status(&self) -> Status {
@@ -266,9 +360,9 @@ impl Guard {
         }
     }
 
-    async fn shutdown(self) -> bool {
+    async fn shutdown(self) -> Result<(), NetworkError> {
         match self {
-            Self::System(guard) => guard.shutdown().await.is_ok(),
+            Self::System(guard) => guard.shutdown().await,
             #[cfg(test)]
             Self::Fixture(guard) => guard.shutdown(),
         }
@@ -314,7 +408,7 @@ async fn next_verify(deadline: Option<Instant>) {
 async fn run(
     app: AppHandle,
     mut changes: watch::Receiver<Status>,
-    mut stop: mpsc::Receiver<oneshot::Sender<bool>>,
+    mut stop: mpsc::Receiver<oneshot::Sender<Result<(), NetworkError>>>,
 ) {
     let admission = app.state::<Admission>();
     let mut guard = None;
@@ -339,12 +433,12 @@ async fn run(
                     Some(Work::Preflight(task)) => task.abort(),
                     None => {}
                 }
-                let ok = match guard {
+                let result = match guard {
                     Some(guard) => guard.shutdown().await,
-                    None => true,
+                    None => Ok(()),
                 };
                 if let Some(reply) = reply {
-                    let _ = reply.send(ok);
+                    let _ = reply.send(result);
                 }
                 return;
             }

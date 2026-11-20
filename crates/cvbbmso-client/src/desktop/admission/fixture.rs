@@ -3,6 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+use cvbbmso_network::NetworkError;
 use tokio::sync::Notify;
 
 use super::Failure;
@@ -25,6 +26,7 @@ struct Counters {
     settings_opened: Notify,
     pause_install: AtomicBool,
     fail_verify: AtomicBool,
+    fail_shutdown: AtomicBool,
     installs: AtomicUsize,
     shutdowns: AtomicUsize,
     verifies: AtomicUsize,
@@ -58,6 +60,10 @@ impl Admission {
 
     pub(in crate::desktop) fn lose_guard(&self) {
         self.0.fail_verify.store(true, Ordering::Relaxed);
+    }
+
+    pub(in crate::desktop) fn fail_shutdown(&self) {
+        self.0.fail_shutdown.store(true, Ordering::Relaxed);
     }
 
     pub(in crate::desktop) fn installs(&self) -> usize {
@@ -143,8 +149,11 @@ impl Guard {
         !self.0.fail_verify.load(Ordering::Relaxed)
     }
 
-    pub(super) fn shutdown(&self) -> bool {
+    pub(super) fn shutdown(&self) -> Result<(), NetworkError> {
         self.0.shutdowns.fetch_add(1, Ordering::Relaxed);
-        true
+        if self.0.fail_shutdown.load(Ordering::Relaxed) {
+            return Err(NetworkError::PermissionDenied);
+        }
+        Ok(())
     }
 }
