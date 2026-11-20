@@ -15,14 +15,17 @@ workspace = true
 
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 cvbbmso-accoding.workspace = true
+cvbbmso-exam.workspace = true
 cvbbmso-protocol.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "process", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 url.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2.workspace = true
@@ -39,6 +42,7 @@ tauri-build.workspace = true
 
 [dev-dependencies]
 axum = { workspace = true, features = ["http1", "json", "tokio", "ws"] }
+base64.workspace = true
 cvbbmso-accoding.workspace = true
 cvbbmso-protocol.workspace = true
 futures-util.workspace = true

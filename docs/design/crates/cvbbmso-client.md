@@ -14,6 +14,8 @@
 
 运行 `cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke` 可在交互式桌面验证预检失败后的重试、两类 WebView 的权限隔离、导航、Release 调试设置、合成 Cookie 更新以及关闭并重新打开 Accoding 窗口后的会话保留。该测试也会打开真实 Accoding 登录页，无需登录。将末尾参数换为 `--native-smoke-detected` 可验证检测到虚拟机后的本地阻断与退出。两组冒烟都验证直接调用受限命令不会创建远程 WebView 或外发请求。协议替身绑定回环地址，以临时 TLS 证书和合成凭据验证 HTTPS 接口、WSS 握手及首帧。
 
+将末尾参数换为 `--native-exam-smoke`，可用回环 HTTPS/WSS 服务和合成 Cookie 验证桌面控制窗与实际考试运行时的入场、状态更新、关闭和退出。测试子进程使用临时证书，不修改系统信任库。测试中的准入替身仅编译到测试程序。
+
 ## 应用接口
 
 本 crate 是二进制入口，公开契约是 Tauri commands。Tauri 本地命令面向可信的本地应用 UI；Accoding 远程网页使用普通 WebView 权限。
@@ -55,6 +57,8 @@ impl AppState {
 
 `AppState` 和浏览器适配器保留为 crate 私有类型；上表 Tauri command 是客户端 UI 的实际契约，`ClientView` 由 `cvbbmso-exam` 定义。`open_exam` 等待初始 `sync` 后返回 `connected`，失败时直接返回错误；`close_exam` 是切换考试或退出前的收尾入口，负责停止并封存当前片段。启动预检和出站守卫错误归入 `AppError::Network`。
 
+连接期间 `get_exam_status` 返回 `null`，重复入场或同时打开另一场考试返回 `session_busy`。关闭时停止发送当前会话的状态，等待运行时收尾后释放会话。状态事件定向发送到本地控制窗。控制窗收到事件后读取 Rust 中的当前快照，避免延迟到达的旧事件覆盖新状态。
+
 ## 启动预检、出站守卫与屏幕权限
 
 应用启动时、以及预检失败后用户重试进入考试时，客户端执行一次启动流程：
@@ -65,7 +69,7 @@ impl AppState {
 4. 调用 `cvbbmso-network::EgressGuard::install`，传入 Accoding Origin 和监考服务器 Origin。守卫保持到应用退出，期间系统只放行允许的出站流量。安装失败时同样停留在考试外。
 5. macOS 上由本 crate 的平台适配层探测屏幕录制权限，未授权时发起系统授权请求。仍无权限或授权后需要重启应用时，展示明确指引并阻止进入考试。Windows 视为已授权。
 
-当前桌面底座已接入第 1 步。接入提权、网络预检、出站守卫、录屏授权和 `open_exam` 时，须先通过虚拟机预检，再继续后续步骤。
+当前桌面底座已接入第 1 步。提权、网络预检、出站守卫和录屏授权接入前，正式构建的 `open_exam` 先执行虚拟机准入校验，通过后仍返回 `admission_unavailable`，不连接考试运行时。
 
 ### 虚拟机预检
 
@@ -90,7 +94,7 @@ Windows 基于 WebView2 配置 `AreDevToolsEnabled=false`、`AreBrowserAccelerat
 
 每次加载或刷新报名列表，`list_exams` 都从原生 Cookie Store 读取当前会话。Rust 仅向构建时配置的 HTTPS Origin 发送 `GET /api/exams`，禁用重定向和代理。HTTP 200 的响应体上限为 1 MiB（1,048,576 字节）。客户端在读取时累计正文实际字节数，超限立即停止读取，无 `Content-Length` 的分块响应也受此限制。成功响应必须是包含 `user` 和 `items` 的 JSON 对象，由 `ExamListResponse` 校验，只把 `items` 返回本地控制窗。HTTP 200 且列表为空表示用户已登录但未报名。HTTP 401 提示重新登录，HTTP 503 提示稍后重试。刷新时清空旧列表，响应超限、格式无效或请求失败时显示相应错误。
 
-客户端在进程启动时生成一次 `instance_id`，同一进程内的重连、关闭后重新打开考试都沿用它，避免服务端误记 `process_restarted`。学生选择考试后调用 `Exam::connect(config, exam_id, cookies)`；运行时重新拉取 `user` 并校验报名，再连接 `GET /api/exams/{exam_id}/ws`。Cookie 变化通过 `ExamHandle::notify(UiNotice::CookiesUpdated(...))` 传给运行时，用于后续重连；受控浏览器拒绝导航时，通过 `ExamHandle::notify(UiNotice::NavigationDenied { target_origin })` 通知运行时。
+客户端在首次入场时将 `device_id` 持久化到应用数据根目录，后续入场读取同一标识。`instance_id` 在进程启动时生成，同一进程内的重连和重新入场都沿用它。准入通过后，Rust 读取原生 Cookie 并调用 `Exam::connect(config, exam_id, cookies)`，由运行时重新获取 `user` 并校验报名，再连接 `GET /api/exams/{exam_id}/ws`。Cookie 更新和拒绝导航的通知待接入，分别使用 `UiNotice::CookiesUpdated` 和 `UiNotice::NavigationDenied`。
 
 ## 模块协作
 

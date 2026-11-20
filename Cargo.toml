@@ -16,8 +16,10 @@ publish = false
 
 [workspace.dependencies]
 axum = { version = "0.8", default-features = false }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 block2 = { version = "0.6", default-features = false, features = ["std"] }
 cvbbmso-accoding = { version = "0.1.0", path = "crates/cvbbmso-accoding" }
+cvbbmso-exam = { version = "0.1.0", path = "crates/cvbbmso-exam" }
 cvbbmso-protocol = { version = "0.1.0", path = "crates/cvbbmso-protocol" }
 cvbbmso-recorder = { version = "0.1.0", path = "crates/cvbbmso-recorder" }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
