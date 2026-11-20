@@ -6,7 +6,9 @@ mod exam;
 mod smoke;
 
 use cvbbmso_accoding::{AccodingCookies, AccodingError};
+use cvbbmso_exam::ExamError;
 use cvbbmso_protocol::ExamSummary;
+use reqwest::StatusCode;
 use serde::Serialize;
 use tauri::{
     AppHandle, Emitter, EventTarget, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
@@ -390,13 +392,14 @@ impl From<&MonitorError> for ListExamsError {
     fn from(error: &MonitorError) -> Self {
         match error {
             MonitorError::Configuration => Self::MonitorUnconfigured,
-            MonitorError::Initialization(_) | MonitorError::Connection(_) => Self::ConnectionFailed,
-            MonitorError::SignInRequired => Self::SignInRequired,
-            MonitorError::Unavailable => Self::ServiceUnavailable,
-            MonitorError::UnexpectedStatus(_)
-            | MonitorError::ResponseTooLarge
-            | MonitorError::NonObjectResponse
-            | MonitorError::InvalidResponse(_) => Self::UnexpectedResponse,
+            MonitorError::Initialization(_) | MonitorError::Request(ExamError::Http(Some(_))) => {
+                Self::ConnectionFailed
+            }
+            MonitorError::Request(ExamError::Auth) => Self::SignInRequired,
+            MonitorError::Request(ExamError::HttpStatus(StatusCode::SERVICE_UNAVAILABLE)) => {
+                Self::ServiceUnavailable
+            }
+            MonitorError::Request(_) => Self::UnexpectedResponse,
         }
     }
 }

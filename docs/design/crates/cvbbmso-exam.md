@@ -16,9 +16,13 @@ pub struct ExamConfig {
 
 pub struct Exam;
 pub struct ExamHandle { /* 私有运行时句柄 */ }
+pub struct Monitor { /* 私有 HTTP 客户端 */ }
 
+#[non_exhaustive]
 pub enum ExamError {
     Http(Option<reqwest::Error>),
+    HttpStatus(reqwest::StatusCode),
+    InvalidExamList(Option<serde_json::Error>),
     WebSocket(Option<tokio_tungstenite::tungstenite::Error>),
     Auth,
     NotEnrolled,
@@ -37,6 +41,18 @@ pub struct ClientView {
     pub connected: bool,
     pub state: cvbbmso_protocol::ClientState,
     pub last_error_code: Option<String>,
+}
+
+impl Monitor {
+    pub fn new(
+        base: url::Url,
+        root_certificate: Option<reqwest::Certificate>,
+    ) -> Result<Self, ExamError>;
+    pub fn server_base(&self) -> &url::Url;
+    pub async fn list_exams(
+        &self,
+        cookies: &cvbbmso_accoding::AccodingCookies,
+    ) -> Result<cvbbmso_protocol::ExamListResponse, ExamError>;
 }
 
 impl Exam {
@@ -61,6 +77,10 @@ impl ExamHandle {
     pub async fn shutdown(self) -> Result<(), ExamError>;
 }
 ```
+
+`Monitor::list_exams` 为桌面列表和运行时入场复验提供同一套 `GET /api/exams` 请求实现。HTTP 客户端仅接受 HTTPS Origin，使用系统信任根，可额外信任指定证书。请求禁用代理和重定向，10 秒时限涵盖正文读取。HTTP 200 的正文按实际读取字节数限制为 1 MiB，无 `Content-Length` 的分块响应也受此限制。正文根元素必须是 JSON 对象，由 `ExamListResponse` 校验。
+
+列表接口把 HTTP 401 返回为 `Auth`，其他非 200 状态返回为 `HttpStatus`，不合规正文返回为 `InvalidExamList`。运行时把 HTTP 403 或列表缺少指定考试判为 `NotEnrolled`，把其余非预期状态和不合规正文映射为 `Http`，保持 `Exam::connect` 的错误分类。
 
 `Exam::connect` 首先调用 `GET /api/exams` 确认用户身份和考试报名，以返回的 `user.id` 定位本地 `(exam_id, oj_user_id)` 数据，然后建立 WSS 并等待初始 `sync`，再按 `sync.recording_policy` 打开/恢复 recorder。`ExamConfig.instance_id` 由客户端进程启动时生成，在该进程的所有重连中保持一致；`device_id` 是持久设备标识。`Exam::connect` 是该 crate 的唯一启动入口。
 

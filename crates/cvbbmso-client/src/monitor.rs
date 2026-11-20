@@ -1,113 +1,62 @@
-use std::time::Duration;
-
 use cvbbmso_accoding::AccodingCookies;
-use cvbbmso_protocol::{ExamListResponse, ExamSummary};
-use reqwest::{Client, ClientBuilder, Response, StatusCode, header, redirect};
+use cvbbmso_exam::ExamError;
+use cvbbmso_protocol::ExamSummary;
+use reqwest::Certificate;
 use thiserror::Error;
 use url::{Origin, Url};
 
+// The fixture sets response sizes from the protocol limit independently of the reader.
+#[cfg(test)]
 pub(crate) const MAX_EXAM_LIST_BYTES: usize = 1024 * 1024;
 
-pub(crate) struct Monitor {
-    base: Url,
-    client: Client,
-}
+pub(crate) struct Monitor(cvbbmso_exam::Monitor);
 
 #[derive(Debug, Error)]
 pub(crate) enum MonitorError {
     #[error("The monitor HTTPS origin is missing or invalid")]
     Configuration,
     #[error("The monitor HTTP client could not be initialized")]
-    Initialization(#[source] reqwest::Error),
-    #[error("The Accoding session is missing or expired")]
-    SignInRequired,
-    #[error("The identity service is temporarily unavailable")]
-    Unavailable,
-    #[error("The monitor request could not complete")]
-    Connection(#[source] reqwest::Error),
-    #[error("The monitor returned HTTP {0}")]
-    UnexpectedStatus(StatusCode),
-    #[error("The exam list exceeds the maximum response size")]
-    ResponseTooLarge,
-    #[error("The exam list response must be a JSON object")]
-    NonObjectResponse,
-    #[error("The monitor returned an invalid exam list")]
-    InvalidResponse(#[from] serde_json::Error),
+    Initialization(#[source] ExamError),
+    #[error(transparent)]
+    Request(#[from] ExamError),
 }
 
 impl Monitor {
     pub(crate) fn new(origin: Option<Origin>) -> Result<Self, MonitorError> {
-        Self::build(origin, Client::builder())
+        Self::build(origin, None)
     }
 
     #[cfg(test)]
     pub(crate) fn with_root_certificate(
         origin: Origin,
-        certificate: reqwest::Certificate,
+        certificate: Certificate,
     ) -> Result<Self, MonitorError> {
-        Self::build(
-            Some(origin),
-            Client::builder().add_root_certificate(certificate),
-        )
+        Self::build(Some(origin), Some(certificate))
     }
 
-    fn build(origin: Option<Origin>, builder: ClientBuilder) -> Result<Self, MonitorError> {
+    fn build(
+        origin: Option<Origin>,
+        root_certificate: Option<Certificate>,
+    ) -> Result<Self, MonitorError> {
         let origin = origin
             .filter(|origin| matches!(origin, Origin::Tuple(scheme, ..) if scheme == "https"))
             .ok_or(MonitorError::Configuration)?;
         let base =
             Url::parse(&origin.ascii_serialization()).map_err(|_| MonitorError::Configuration)?;
 
-        let client = builder
-            .https_only(true)
-            .no_proxy()
-            .redirect(redirect::Policy::none())
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(MonitorError::Initialization)?;
-        Ok(Self { base, client })
+        cvbbmso_exam::Monitor::new(base, root_certificate)
+            .map(Self)
+            .map_err(MonitorError::Initialization)
     }
 
     pub(crate) fn server_base(&self) -> &Url {
-        &self.base
+        self.0.server_base()
     }
 
     pub(crate) async fn list_exams(
         &self,
         cookies: &AccodingCookies,
     ) -> Result<Vec<ExamSummary>, MonitorError> {
-        let mut endpoint = self.server_base().clone();
-        endpoint.set_path("/api/exams");
-        let response = self
-            .client
-            .get(endpoint)
-            .header(header::ACCEPT, "application/json")
-            .header(header::COOKIE, cookies.header_value())
-            .send()
-            .await
-            .map_err(MonitorError::Connection)?;
-
-        match response.status() {
-            StatusCode::OK => read_exam_list(response).await,
-            StatusCode::UNAUTHORIZED => Err(MonitorError::SignInRequired),
-            StatusCode::SERVICE_UNAVAILABLE => Err(MonitorError::Unavailable),
-            status => Err(MonitorError::UnexpectedStatus(status)),
-        }
+        Ok(self.0.list_exams(cookies).await?.items)
     }
-}
-
-async fn read_exam_list(mut response: Response) -> Result<Vec<ExamSummary>, MonitorError> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(MonitorError::Connection)? {
-        if chunk.len() > MAX_EXAM_LIST_BYTES - body.len() {
-            return Err(MonitorError::ResponseTooLarge);
-        }
-        body.extend_from_slice(&chunk);
-    }
-
-    // Serde's struct decoder also accepts positional arrays, which the HTTP contract excludes.
-    if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
-        return Err(MonitorError::NonObjectResponse);
-    }
-    Ok(serde_json::from_slice::<ExamListResponse>(&body)?.items)
 }

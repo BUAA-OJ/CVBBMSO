@@ -217,7 +217,7 @@ impl Harness {
         };
         let cookies =
             AccodingCookies::from_pairs([("connect.sid".into(), "session".into())]).unwrap();
-        let monitor = Monitor::new(self.base.clone()).unwrap();
+        let monitor = Monitor::for_test(self.base.clone()).unwrap();
         let capture = FakeCapture {
             script: self.script.clone(),
             segment_count: self.segment_count,
@@ -804,7 +804,7 @@ async fn a_full_send_queue_cannot_hold_recording_past_the_offline_deadline() {
         oj_user_id: USER,
         device_id: DEVICE,
         instance_id: INSTANCE,
-        monitor: Monitor::new(harness.base.clone()).unwrap(),
+        monitor: Monitor::for_test(harness.base.clone()).unwrap(),
         cookies: AccodingCookies::from_pairs([("connect.sid".into(), "session".into())]).unwrap(),
         timing,
         journal,

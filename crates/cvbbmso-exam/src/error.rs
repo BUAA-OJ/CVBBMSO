@@ -2,7 +2,7 @@ use cvbbmso_recorder::RecordingError;
 use thiserror::Error;
 use tokio_tungstenite::tungstenite;
 
-/// Failures of the exam runtime.
+/// Failures of the monitor client and exam runtime.
 ///
 /// Variants are categories; the underlying cause, when one exists, stays in the
 /// source chain so the application can report it through `anyhow`.
@@ -12,6 +12,12 @@ pub enum ExamError {
     /// The monitor HTTP API could not be reached or answered unexpectedly.
     #[error("monitor HTTP request failed")]
     Http(#[source] Option<reqwest::Error>),
+    /// The exam list endpoint returned an HTTP status other than 200 or 401.
+    #[error("monitor returned HTTP {0}")]
+    HttpStatus(reqwest::StatusCode),
+    /// The exam list body exceeded the size limit or did not match the protocol.
+    #[error("invalid exam list response")]
+    InvalidExamList(#[source] Option<serde_json::Error>),
     /// The monitor WebSocket could not be established or broke the protocol.
     #[error("monitor WebSocket connection failed")]
     WebSocket(#[source] Option<tungstenite::Error>),
