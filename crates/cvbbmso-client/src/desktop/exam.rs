@@ -20,8 +20,8 @@ use url::{Origin, Url};
 use uuid::Uuid;
 
 use super::{
-    Desktop, ReadSessionError, UI,
-    admission::{Admission, Failure, Status},
+    Desktop, OJ, ReadSessionError, UI,
+    admission::{Admission, CleanupError, Failure, Status},
     current_cookies,
 };
 use crate::{monitor::MonitorError, policy::denied_target_origin, preflight::Preflight};
@@ -136,7 +136,8 @@ enum Request {
 enum Exit {
     Running,
     Requested(i32),
-    Drained,
+    AwaitingConfirmation(i32),
+    Drained(i32),
 }
 
 pub(super) struct ExamSession {
@@ -187,24 +188,74 @@ pub(super) fn handle_exit(app: &AppHandle, event: &RunEvent) {
     if let RunEvent::ExitRequested { api, code, .. } = event
         && let Some(sessions) = app.try_state::<ExamSession>()
     {
-        if *sessions.exit.borrow() == Exit::Drained {
+        let exit = *sessions.exit.borrow();
+        match exit {
+            Exit::Running => {
+                api.prevent_exit();
+                app.state::<Admission>().begin_exit(app);
+                sessions
+                    .exit
+                    .send_replace(Exit::Requested(code.unwrap_or(0)));
+            }
+            Exit::Requested(_) => api.prevent_exit(),
+            Exit::AwaitingConfirmation(code) => {
+                api.prevent_exit();
+                sessions.exit.send_replace(Exit::Drained(code));
+                app.exit(code);
+            }
+            Exit::Drained(_) => {}
+        }
+    }
+}
+
+async fn finish_exit(app: &AppHandle, code: i32, cleanup: Result<(), CleanupError>) {
+    if let Err(error) = cleanup {
+        let report = error.report(&app.state::<Desktop>().data_dir).await;
+        let current = app.clone();
+        if app
+            .run_on_main_thread(move || {
+                let sessions = current.state::<ExamSession>();
+                if let Some(window) = current.get_webview_window(UI)
+                    && window.show().is_ok()
+                {
+                    let _ = window.unminimize();
+                    if let Some(browser) = current.get_webview_window(OJ) {
+                        let _ = browser.destroy();
+                    }
+                    sessions.exit.send_replace(Exit::AwaitingConfirmation(code));
+                    current
+                        .state::<Admission>()
+                        .show_cleanup_failure(&current, report);
+                    let _ = window.set_focus();
+                } else {
+                    sessions.exit.send_replace(Exit::Drained(code));
+                    current.exit(code);
+                }
+            })
+            .is_ok()
+        {
             return;
         }
-        api.prevent_exit();
-        app.state::<Admission>().begin_exit(app);
-        sessions.exit.send_if_modified(|state| {
-            if *state == Exit::Running {
-                *state = Exit::Requested(code.unwrap_or(0));
-                return true;
-            }
-            false
-        });
     }
+    app.state::<ExamSession>()
+        .exit
+        .send_replace(Exit::Drained(code));
+    app.exit(code);
+}
+
+pub(super) fn exit_code(app: &AppHandle, runtime_code: i32) -> i32 {
+    // Tauri delivers the requested code but the runtime may return zero.
+    if let Some(sessions) = app.try_state::<ExamSession>()
+        && let Exit::Drained(code) = *sessions.exit.borrow()
+    {
+        return if code == 0 { runtime_code } else { code };
+    }
+    runtime_code
 }
 
 #[cfg(test)]
 pub(super) fn exit_drained(app: &AppHandle) -> bool {
-    *app.state::<ExamSession>().exit.borrow() == Exit::Drained
+    matches!(*app.state::<ExamSession>().exit.borrow(), Exit::Drained(_))
 }
 
 type ConnectedExam = (ExamHandle, AccodingCookies);
@@ -344,10 +395,10 @@ async fn run(
                 let requested = *exit.borrow();
                 if let Exit::Requested(code) = requested {
                     let result = clear(&sessions, &mut opening, &mut active, &snapshot).await;
-                    let guard_closed = admission.shutdown().await;
-                    sessions.exit.send_replace(Exit::Drained);
-                    let failed = result.is_err() || !guard_closed || guard_close_failed;
-                    app.exit(if failed && code == 0 { 1 } else { code });
+                    let cleanup = admission.shutdown().await;
+                    let failed = result.is_err() || cleanup.is_err() || guard_close_failed;
+                    let exit_code = if failed && code == 0 { 1 } else { code };
+                    finish_exit(&app, exit_code, cleanup).await;
                 }
                 return;
             }

@@ -73,9 +73,9 @@ impl AppState {
 
 刚启动、等待批准与安装期间，Rust 拒绝打开 Accoding、读取会话、请求报名列表和进入考试。守卫返回已验证的句柄后，`admission_status` 才返回 `ready` 并开放这些操作。虚拟机预检通过后，若监考地址缺失，`list_exams` 仍返回 `monitor_unconfigured`。
 
-一次只运行一次准入检查。守卫由应用持有，每 30 秒复查。运行期校验失败时，Rust 阻止新入场并结束活动考试，界面提示联系监考人员后重新启动客户端。关闭一场考试时守卫继续运行。退出客户端会先结束并封存考试，再等待已开始的守卫安装并清理其状态。
+一次只运行一次准入检查。守卫由应用持有，每 30 秒复查。运行期校验失败时，Rust 阻止新入场并结束活动考试，界面提示联系监考人员后重新启动客户端。关闭一场考试时守卫继续运行。退出客户端会先结束并封存考试，再等待已开始的守卫安装并清理其状态。守卫清理失败时，控制窗仍可关闭，并显示错误类别。准入状态为 `cleanup_failed`，其 `reason` 携带 `code` 和 `diagnostic_saved`。客户端尝试在应用数据目录写入最近一次失败的 `egress-cleanup.json`，只记录操作、时间、平台和错误类别。macOS 的目录为 `~/Library/Application Support/edu.buaa.accoding.cvbbmso/`，Windows 为 `%LOCALAPPDATA%\edu.buaa.accoding.cvbbmso\`。
 
-Release 桌面冒烟使用替身检查权限顺序、并发重试、macOS 等待批准和 PF 阻断，以及运行期守卫失效。`--native-admission-exit` 覆盖安装尚未返回时退出。签名 DMG、系统服务授权、真实 PF 与 WFP 在隔离环境中验收。
+Release 桌面冒烟使用替身检查权限顺序、并发重试、macOS 等待批准和 PF 阻断，以及运行期守卫失效。`--native-admission-exit` 覆盖安装尚未返回时退出。`--native-admission-cleanup-failure` 覆盖重复关闭、诊断和确认退出。签名 DMG、系统服务授权、真实 PF 与 WFP 在隔离环境中验收。
 
 ### 虚拟机预检
 

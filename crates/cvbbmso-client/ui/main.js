@@ -8,6 +8,7 @@ const admissionPanel = document.querySelector("#admission-panel");
 const admissionStatus = document.querySelector("#admission-status");
 const admissionRetry = document.querySelector("#admission-retry");
 const admissionSettings = document.querySelector("#admission-settings");
+const admissionExit = document.querySelector("#admission-exit");
 const admittedControls = document.querySelector("#admitted-controls");
 let admissionRevision = 0;
 
@@ -45,6 +46,17 @@ async function refreshAdmission(retry = false) {
     admissionPanel.hidden = ready;
     admissionRetry.hidden = result.status !== "blocked" || restartRequired.has(result.reason);
     admissionSettings.hidden = result.status !== "blocked" || result.reason !== "macos_approval_required";
+    const cleanupFailed = result.status === "cleanup_failed";
+    admissionExit.hidden = !cleanupFailed;
+    if (cleanupFailed) {
+      preflight.hidden = true;
+      studentControls.hidden = false;
+      const diagnostic = result.reason.diagnostic_saved
+        ? "本地诊断已保存到应用数据目录中的 egress-cleanup.json。"
+        : "无法保存本地诊断，请记录错误代码。";
+      admissionStatus.textContent = `网络守卫清理失败（${result.reason.code}）。请联系监考人员。${diagnostic}`;
+      return;
+    }
     admissionStatus.textContent = result.status === "exiting"
       ? "正在关闭客户端…"
       : admissionErrors.get(result.reason) ?? "正在检查考试环境…";
@@ -58,6 +70,11 @@ async function refreshAdmission(retry = false) {
 }
 
 admissionRetry.addEventListener("click", () => refreshAdmission(true));
+admissionExit.addEventListener("click", () => {
+  tauriWindow.getCurrentWindow().close().catch(() => {
+    admissionStatus.append(" 请关闭客户端窗口以退出。");
+  });
+});
 admissionSettings.addEventListener("click", async () => {
   admissionSettings.disabled = true;
   try {

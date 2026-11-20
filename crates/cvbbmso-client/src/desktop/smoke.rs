@@ -7,7 +7,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -76,6 +76,26 @@ pub(super) enum Case {
     Recording,
     RestoredRecording,
     ExitDuringInstall,
+    CleanupFailure,
+}
+
+impl Case {
+    fn pauses_install(self) -> bool {
+        matches!(self, Self::ExitDuringInstall | Self::CleanupFailure)
+    }
+
+    fn admission(self) -> FakeAdmission {
+        let admission = FakeAdmission::default();
+        match self {
+            Self::Desktop => admission.require_retry(),
+            case if case.pauses_install() => admission.pause(),
+            _ => {}
+        }
+        if self == Self::CleanupFailure {
+            admission.fail_shutdown();
+        }
+        admission
+    }
 }
 
 pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<()> {
@@ -84,13 +104,15 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
     let data_dir = data.path().to_owned();
     let (completed, result) = std::sync::mpsc::channel();
     let (exit_peer, exit_peer_result) = std::sync::mpsc::channel();
+    let cleanup_checked = Arc::new(AtomicBool::new(false));
+    let checked = cleanup_checked.clone();
     let app = builder()
         .setup(move |app| {
             check_deployment(&data_dir)?;
             let requests = Arc::new(AtomicUsize::new(0));
             let (fixture, foreign, hits) =
                 async_runtime::block_on(start_fixture(requests.clone()))?;
-            let (monitor, exam_connections) = if case == Case::ExitDuringInstall {
+            let (monitor, exam_connections) = if case.pauses_install() {
                 (Monitor::new(None), None)
             } else {
                 let (monitor, connections) =
@@ -106,12 +128,7 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
                 monitor,
                 blocked: Some(blocked),
             });
-            let admission = FakeAdmission::default();
-            match case {
-                Case::Desktop => admission.require_retry(),
-                Case::ExitDuringInstall => admission.pause(),
-                _ => {}
-            }
+            let admission = case.admission();
             app.manage(admission.clone());
             app.manage(FakeProbe::for_smoke(detected));
             let ui = build_ui(app.handle())?;
@@ -124,8 +141,14 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
                             .eval("document.querySelector('#vm-quit').click()")
                             .map_err(Into::into);
                     }
-                    if case == Case::ExitDuringInstall {
-                        return check_exit_during_install(&app, &ui, &admission).await;
+                    if case.pauses_install() {
+                        check_exit_during_install(&app, &ui, &admission).await?;
+                        if case == Case::CleanupFailure {
+                            check_cleanup_failure(&app, &ui, &admission).await?;
+                            checked.store(true, Ordering::SeqCst);
+                            ui.eval("document.querySelector('#admission-exit').click()")?;
+                        }
+                        return Ok(());
                     }
                     if let Some(connections) = exam_connections {
                         let closed = exams::exercise(
@@ -158,22 +181,23 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
                     sleep(DEADLINE).await;
                     eprintln!("Desktop smoke failed: closing the control window did not exit");
                 }
+                checked.store(false, Ordering::SeqCst);
                 app.exit(1);
             });
             Ok(())
         })
         .build(tauri::generate_context!())?;
-    app.run_return(move |app, event| {
+    let expected_code = i32::from(case == Case::CleanupFailure);
+    let handle = app.handle().clone();
+    let runtime_code = app.run_return(move |app, event| {
         exam::handle_exit(app, &event);
-        let expect_browser = !matches!(case, Case::Detected | Case::ExitDuringInstall);
-        if matches!(event, tauri::RunEvent::ExitRequested { code: Some(0), .. })
-            && exam::exit_drained(app)
-            && app.get_webview_window(OJ).is_some() == expect_browser
-            && app.state::<FakeAdmission>().shutdowns() == usize::from(!detected)
-        {
+        if exit_matches_case(app, &event, case, &cleanup_checked) {
             let _ = completed.send(());
         }
     });
+    if exam::exit_code(&handle, runtime_code) != expected_code {
+        return Err(io::Error::other("Unexpected desktop smoke exit code").into());
+    }
     result
         .try_recv()
         .map_err(|_| io::Error::other("Native desktop smoke did not complete successfully"))?;
@@ -182,6 +206,21 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
     }
     println!("Desktop smoke passed.");
     Ok(())
+}
+
+fn exit_matches_case(
+    app: &AppHandle,
+    event: &tauri::RunEvent,
+    case: Case,
+    cleanup_checked: &AtomicBool,
+) -> bool {
+    let failure = case == Case::CleanupFailure;
+    let expect_browser = case != Case::Detected && !case.pauses_install();
+    matches!(event, tauri::RunEvent::ExitRequested { code: Some(code), .. } if *code == i32::from(failure))
+        && exam::exit_drained(app)
+        && app.get_webview_window(OJ).is_some() == expect_browser
+        && app.state::<FakeAdmission>().shutdowns() == usize::from(case != Case::Detected)
+        && (!failure || cleanup_checked.load(Ordering::SeqCst))
 }
 
 fn check_exit_peer(peer: &std::sync::mpsc::Receiver<oneshot::Receiver<()>>) -> io::Result<()> {
@@ -327,8 +366,56 @@ async fn check_exit_during_install(
     .await?;
     assert!(!exam::exit_drained(app));
     assert_eq!(admission.shutdowns(), 0);
+    ui.close()?;
+    wait_for(
+        ui,
+        "document.querySelector('#admission-status').textContent.includes('关闭客户端')",
+        "a repeated close leaving the in-flight cleanup in progress",
+    )
+    .await?;
     admission.resume();
     println!("Exit deferred until the in-flight install returned its guard.");
+    Ok(())
+}
+
+async fn check_cleanup_failure(
+    app: &AppHandle,
+    ui: &WebviewWindow,
+    admission: &FakeAdmission,
+) -> Result<(), Error> {
+    wait_for(
+        ui,
+        "document.querySelector('#admission-status').textContent.includes('permission_denied') && !document.querySelector('#admission-exit').hidden && document.querySelector('#admitted-controls').hidden && document.querySelector('#admission-retry').hidden",
+        "cleanup diagnostics and explicit exit",
+    )
+    .await?;
+    assert!(!exam::exit_drained(app));
+    assert_eq!(admission.shutdowns(), 1);
+
+    let diagnostic = app
+        .state::<Desktop>()
+        .data_dir
+        .join(admission::CLEANUP_DIAGNOSTIC);
+    let saved: Value = serde_json::from_slice(&std::fs::read(diagnostic)?)?;
+    assert_eq!(saved["code"], "permission_denied");
+    assert_eq!(saved["operation"], "egress_shutdown");
+    assert_eq!(saved["platform"], std::env::consts::OS);
+    assert!(saved["unix_seconds"].is_u64());
+    assert_eq!(saved.as_object().map(serde_json::Map::len), Some(4));
+
+    ui.eval(
+        r"
+        window.cleanupRetryBlocked = false;
+        window.__TAURI__.core.invoke('admission_status', {retry: true}).then(({status, reason}) => {
+            window.cleanupRetryBlocked = status === 'cleanup_failed'
+                && reason.diagnostic_saved === true && reason.code === 'permission_denied';
+        });
+    ",
+    )?;
+    wait_for(ui, "window.cleanupRetryBlocked", "terminal cleanup failure").await?;
+    assert_eq!(admission.installs(), 1);
+    assert_eq!(admission.shutdowns(), 1);
+    println!("Cleanup failure retained its category on screen and in the local diagnostic.");
     Ok(())
 }
 
