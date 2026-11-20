@@ -15,7 +15,7 @@ use cvbbmso_protocol::{
     IncidentCode, RecordingManifest, RecordingPolicy, RecordingState, SegmentMeta, ServerMessage,
     Sha256Digest, error_code,
 };
-use cvbbmso_recorder::{PlatformError, RecorderEvent, RecordingError};
+use cvbbmso_recorder::{RecorderEvent, RecordingError};
 use futures_util::{SinkExt, StreamExt};
 use time::OffsetDateTime;
 use tokio::{
@@ -136,7 +136,7 @@ impl Capture for FakeCapture {
         script.calls.push("start");
         let result = if script.start_failures > 0 {
             script.start_failures -= 1;
-            Err(RecordingError::Platform(PlatformError::Unsupported))
+            Err(RecordingError::Platform(None))
         } else {
             Ok(())
         };
@@ -657,9 +657,7 @@ async fn a_capture_fault_is_reported_and_retried_until_it_recovers() {
     for _ in 0..2 {
         harness
             .recorder
-            .try_send(RecorderEvent::Fault(RecordingError::Platform(
-                PlatformError::Unsupported,
-            )))
+            .try_send(RecorderEvent::Fault(RecordingError::Platform(None)))
             .unwrap();
     }
 
