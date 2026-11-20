@@ -1,5 +1,5 @@
-//! macOS PF management. The main ruleset calls an outbound anchor before other
-//! filter rules. Refreshes only replace that anchor in a PF transaction.
+//! macOS PF management. Deployment provisions the main ruleset hook. The
+//! guard loads and flushes only its reserved outbound anchor.
 #![allow(
     unsafe_code,
     reason = "PF needs native privilege and interface queries"
@@ -21,13 +21,9 @@ use lifecycle::Prepared;
 pub(crate) use lifecycle::{HELPER, watchdog_entry};
 
 const ANCHOR: &str = "com.cvbbmso.egress";
-const LEGACY_ANCHOR: &str = "/etc/pf.anchors/com.cvbbmso.egress";
 const RULES: &str = "/Library/Application Support/com.cvbbmso/pf.rules";
 const TOKEN: &str = "/Library/Application Support/com.cvbbmso/pf.enable";
-const PF_CONF: &str = "/etc/pf.conf";
 const PFCTL: &str = "/sbin/pfctl";
-const BLOCK_BEGIN: &str = "# BEGIN cvbbmso egress guard";
-const BLOCK_END: &str = "# END cvbbmso egress guard";
 const ROOT_RULE: &str = "anchor \"com.cvbbmso.egress\" out quick all";
 pub(crate) fn prepare() -> Result<(), NetworkError> {
     Prepared::new().map(drop)
@@ -101,15 +97,9 @@ fn install_with(
     plan: &Plan,
     local: &[IpAddr],
 ) -> Result<Expected, NetworkError> {
-    let conf = commands.read(PF_CONF)?.ok_or(NetworkError::Io)?;
+    verify_deployment(commands)?;
     let expected = stage(commands, render_rules(plan))?;
-    let block = format!(
-        "{BLOCK_BEGIN}\nset require-order no\nanchor \"{ANCHOR}\" out quick\n{BLOCK_END}\n"
-    );
-    commands.write(PF_CONF, &format!("{block}{conf}"))?;
-    commands.run(PFCTL, &["-n", "-R", "-f", PF_CONF])?;
     load_anchor(commands)?;
-    commands.run(PFCTL, &["-m", "-R", "-f", PF_CONF])?;
     commands.capture(PFCTL, &["-E"], TOKEN)?;
     read_token(commands)?.ok_or(NetworkError::Platform)?;
     verify_with(commands, &expected.kernel)?;
@@ -156,21 +146,29 @@ fn load_anchor(commands: &dyn Commands) -> Result<(), NetworkError> {
     commands.run(PFCTL, &["-a", ANCHOR, "-o", "none", "-f", RULES])
 }
 
-fn verify_with(commands: &dyn Commands, expected: &str) -> Result<(), NetworkError> {
-    let info = commands.output(PFCTL, &["-s", "info"])?;
+fn verify_deployment(commands: &dyn Commands) -> Result<(), NetworkError> {
     let root = commands.output(PFCTL, &["-s", "rules"])?;
-    let live = commands.output(PFCTL, &["-a", ANCHOR, "-s", "rules"])?;
     let interfaces = commands.output(PFCTL, &["-vv", "-s", "Interfaces"])?;
-    let reference = read_token(commands)?.ok_or(NetworkError::Platform)?;
-    let references = commands.output(PFCTL, &["-s", "References"])?;
     let skipped = interfaces.lines().any(|line| {
         let mut words = line.split_whitespace();
         words.next().is_some_and(|name| name != "lo0") && words.any(|word| word == "(skip)")
     });
+    // An earlier terminal rule could skip the guard. A runtime root reload
+    // cannot restore unrelated live rules and children from the disk config.
+    if root.lines().next().map(str::trim) != Some(ROOT_RULE) || skipped {
+        return Err(NetworkError::Platform);
+    }
+    Ok(())
+}
+
+fn verify_with(commands: &dyn Commands, expected: &str) -> Result<(), NetworkError> {
+    verify_deployment(commands)?;
+    let info = commands.output(PFCTL, &["-s", "info"])?;
+    let live = commands.output(PFCTL, &["-a", ANCHOR, "-s", "rules"])?;
+    let reference = read_token(commands)?.ok_or(NetworkError::Platform)?;
+    let references = commands.output(PFCTL, &["-s", "References"])?;
     if !info.lines().any(|line| line.starts_with("Status: Enabled"))
-        || root.lines().next().map(str::trim) != Some(ROOT_RULE)
         || live.trim() != expected
-        || skipped
         || !has_reference(&references, reference)
     {
         return Err(NetworkError::Platform);
@@ -191,22 +189,12 @@ fn read_token(commands: &dyn Commands) -> Result<Option<u64>, NetworkError> {
 }
 
 fn recover_with(commands: &dyn Commands) -> Result<(), NetworkError> {
-    let conf = commands.read(PF_CONF)?.ok_or(NetworkError::Io)?;
-    let has_block = conf.lines().any(|line| line == BLOCK_BEGIN);
     let live = commands.output(PFCTL, &["-a", ANCHOR, "-s", "rules"])?;
     if !live.trim().is_empty() {
+        // A load always writes the protected journal before changing PF.
+        // Existing rules without that journal cannot be attributed to us.
+        commands.read(RULES)?.ok_or(NetworkError::Platform)?;
         commands.run(PFCTL, &["-a", ANCHOR, "-F", "rules"])?;
-    }
-
-    if has_block {
-        commands.write(PF_CONF, &strip_block(&conf)?)?;
-    }
-    let root = commands.output(PFCTL, &["-s", "rules"])?;
-    if root.lines().any(|line| {
-        line.trim_start()
-            .starts_with(&format!("anchor \"{ANCHOR}\""))
-    }) {
-        commands.run(PFCTL, &["-m", "-R", "-f", PF_CONF])?;
     }
 
     if let Some(token) = read_token(commands)?
@@ -217,7 +205,7 @@ fn recover_with(commands: &dyn Commands) -> Result<(), NetworkError> {
             return Err(NetworkError::Platform);
         }
     }
-    for path in [TOKEN, RULES, LEGACY_ANCHOR] {
+    for path in [TOKEN, RULES] {
         commands.remove(path)?;
     }
     Ok(())
@@ -230,25 +218,6 @@ fn has_reference(output: &str, token: u64) -> bool {
             .and_then(|value| value.parse::<u64>().ok())
             == Some(token)
     })
-}
-
-fn strip_block(conf: &str) -> Result<String, NetworkError> {
-    let mut kept = String::with_capacity(conf.len());
-    let mut inside = false;
-    for line in conf.split_inclusive('\n') {
-        match line.trim_end() {
-            BLOCK_BEGIN if !inside => inside = true,
-            BLOCK_END if inside => inside = false,
-            BLOCK_BEGIN | BLOCK_END => return Err(NetworkError::Platform),
-            _ if !inside => kept.push_str(line),
-            _ => {}
-        }
-    }
-    if inside {
-        Err(NetworkError::Platform)
-    } else {
-        Ok(kept)
-    }
 }
 
 /// Renders the complete PF rule set for `plan`.
@@ -344,7 +313,13 @@ mod tests {
     use crate::egress::commands::testing::{Call, Recorder};
     use crate::egress::policy::{Service, Target};
 
-    const BASE: &str = "# original PF configuration\nblock in all";
+    const PF_CONF: &str = "/etc/pf.conf";
+    const BASE: &str = "# on-disk PF configuration\nanchor \"com.cvbbmso.egress\" out quick\n";
+    const LIVE_ROOT: &str = concat!(
+        "anchor \"com.cvbbmso.egress\" out quick all\n",
+        "anchor \"system.keep/*\" all\n",
+        "block drop in on en0 all\n",
+    );
     const BLOCK: &str = "block drop out quick all";
     const PARSE: &[&str] = &["-a", ANCHOR, "-n", "-v", "-o", "none", "-f", RULES];
     const LIVE: &[&str] = &["-a", ANCHOR, "-s", "rules"];
@@ -367,7 +342,7 @@ mod tests {
 
     fn healthy(recorder: &Recorder, live: &str) {
         recorder.reply(&["-s", "info"], Ok("Status: Enabled for 0 days"));
-        recorder.reply(ROOT, Ok(ROOT_RULE));
+        recorder.reply(ROOT, Ok(LIVE_ROOT));
         recorder.reply(LIVE, Ok(live));
         recorder.reply(&["-s", "References"], Ok("202 pfctl 42 0 days"));
     }
@@ -375,13 +350,15 @@ mod tests {
     #[test]
     fn install_confirms_the_reference_and_rechecks_existing_outbound_flows() {
         let recorder = Recorder::with_file(PF_CONF, BASE);
+        recorder.reply(ROOT, Ok(LIVE_ROOT));
         recorder.reply(PARSE, Ok(BLOCK));
         recorder.reply(&["-E"], Ok("pf enabled\nToken : 42\n"));
         healthy(&recorder, BLOCK);
 
         let local = "192.0.2.123".parse().unwrap();
         install_with(&recorder, &plan(), &[local]).unwrap();
-        assert!(recorder.contents(PF_CONF).unwrap().starts_with(BLOCK_BEGIN));
+        assert_eq!(recorder.contents(PF_CONF).as_deref(), Some(BASE));
+        assert_only_own_mutations(&recorder);
         assert_eq!(read_token(&recorder).unwrap(), Some(42));
         assert_eq!(
             recorder.calls().last(),
@@ -395,10 +372,11 @@ mod tests {
     #[test]
     fn failed_enable_verification_leaves_a_recoverable_reference() {
         let recorder = Recorder::with_file(PF_CONF, BASE);
+        recorder.reply(ROOT, Ok(LIVE_ROOT));
         recorder.reply(PARSE, Ok(BLOCK));
         recorder.reply(&["-E"], Ok("pf enabled\nToken : 42\n"));
         recorder.reply(&["-s", "info"], Ok("Status: Disabled"));
-        recorder.reply(ROOT, Ok(ROOT_RULE));
+        recorder.reply(ROOT, Ok(LIVE_ROOT));
         recorder.reply(LIVE, Ok(BLOCK));
         recorder.reply(&["-s", "References"], Ok("202 pfctl 42 0 days"));
 
@@ -408,8 +386,8 @@ mod tests {
         );
 
         recorder.reply(LIVE, Ok(BLOCK));
-        recorder.reply(ROOT, Ok(ROOT_RULE));
         lifecycle::recover(&recorder).unwrap();
+        assert_only_own_mutations(&recorder);
         assert_eq!(recorder.contents(PF_CONF).as_deref(), Some(BASE));
         assert!(recorder.contents(TOKEN).is_none());
         assert!(recorder.contents(RULES).is_none());
@@ -482,12 +460,67 @@ mod tests {
         );
         let printed = String::from_utf8(output.stdout).unwrap();
         assert_eq!(printed.trim().lines().last(), Some(BLOCK));
+
+        let root_path = directory.path().join("pf.conf");
+        std::fs::write(root_path.as_path(), BASE).unwrap();
+        let root = std::process::Command::new(PFCTL)
+            .args(["-n", "-v", "-f"])
+            .arg(root_path)
+            .output()
+            .unwrap();
+        assert!(
+            root.status.success(),
+            "{}",
+            String::from_utf8_lossy(&root.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(root.stdout).unwrap().lines().next(),
+            Some(ROOT_RULE)
+        );
+    }
+
+    fn assert_only_own_mutations(recorder: &Recorder) {
+        for item in recorder.calls() {
+            if let Call::Run(program, args) = item
+                && program == PFCTL
+                && args.iter().any(|arg| matches!(arg.as_str(), "-f" | "-F"))
+            {
+                assert_eq!(&args[..2], &["-a", ANCHOR]);
+            }
+        }
     }
 
     #[test]
-    fn unmodified_pf_configuration_bytes_survive_rollback() {
-        let marked = format!("{BLOCK_BEGIN}\nanchor \"{ANCHOR}\"\n{BLOCK_END}\n{BASE}");
-        assert_eq!(strip_block(&marked).unwrap(), BASE);
-        assert_eq!(strip_block(BLOCK_BEGIN), Err(NetworkError::Platform));
+    fn an_on_disk_hook_cannot_make_an_incompatible_live_ruleset_safe() {
+        let recorder = Recorder::with_file(PF_CONF, BASE);
+        let live = "anchor \"system.keep/*\" all\npass out quick all";
+        recorder.reply(ROOT, Ok(live));
+        assert_eq!(
+            install_with(&recorder, &plan(), &[]).err(),
+            Some(NetworkError::Platform)
+        );
+        assert_eq!(recorder.contents(PF_CONF).as_deref(), Some(BASE));
+        assert!(recorder.contents(RULES).is_none());
+        assert!(recorder.contents(TOKEN).is_none());
+        assert!(
+            recorder
+                .calls()
+                .iter()
+                .all(|call| matches!(call, Call::Output(..)))
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_an_anchor_without_a_project_journal() {
+        let recorder = Recorder::with_file(PF_CONF, BASE);
+        recorder.reply(LIVE, Ok("pass out all"));
+        assert_eq!(recover_with(&recorder), Err(NetworkError::Platform));
+        assert_eq!(recorder.contents(PF_CONF).as_deref(), Some(BASE));
+        assert!(
+            recorder
+                .calls()
+                .iter()
+                .all(|call| matches!(call, Call::Output(..)))
+        );
     }
 }

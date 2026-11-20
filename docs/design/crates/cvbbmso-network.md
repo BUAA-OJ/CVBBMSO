@@ -105,10 +105,20 @@ Windows 使用 WinINet、WinHTTP 与代理环境变量；macOS 使用 SystemConf
 客户端每 30 秒调用 `verify`。过滤规则或允许 IP 集失效时，客户端负责停止考试并展示错误。安装需要管理员或 root 权限。安装失败时客户端停留在考试外。
 
 - **Windows** 使用动态 WFP 会话。初次安装和规则替换都通过事务提交，校验按过滤器 ID 查询 WFP。正常退出关闭会话，进程崩溃后由 WFP 删除会话对象。
-- **macOS** 从 `/Library/PrivilegedHelperTools/com.cvbbmso.egress-watchdog` 启动看门狗。安装包须由 root 将 helper 安装到此路径，并禁止其他用户修改 helper 或其父目录。安装先清理遗留规则、持久化所有者状态并登记看门狗和 launchd 恢复任务，然后加载 PF anchor、持有启用引用并校验内核规则。临时主规则使用 `/etc/pf.conf` 作为基础，安装时会重新加载主过滤规则。安装后始发于本机的旧 PF 状态会被撤销，以便流量重新匹配规则。
+- **macOS** 从 `/Library/PrivilegedHelperTools/com.cvbbmso.egress-watchdog` 启动看门狗。安装包须由 root 将 helper 安装到此路径，并禁止其他用户修改 helper 或其父目录。安装先检查主过滤规则入口，再清理守卫遗留的规则、持久化所有者状态并登记看门狗和 launchd 恢复任务。随后加载专用 anchor、持有启用引用并校验内核规则。始发于本机的旧 PF 状态会被撤销，以便流量重新匹配规则。
 - **macOS 清理** 使用跨进程锁协调正常退出、看门狗和 launchd。看门狗发现客户端退出后撤销 anchor、释放本次安装持有的 PF 引用并清理状态。恢复任务每分钟检查，负责在看门狗失效或 15 分钟租约到期后重试清理。客户端每 5 分钟续期。
 
-系统服务白名单按 IP、协议和端口匹配。平台未报告的加密 DNS 配置和部署证书链独有的 OCSP、CRL 或时间戳地址需要随部署验证。动态加载到 macOS PF 主规则集、且只存在于内核的第三方过滤规则也需要在部署环境验证兼容性。
+系统服务白名单按 IP、协议和端口匹配。平台未报告的加密 DNS 配置和部署证书链独有的 OCSP、CRL 或时间戳地址需要随部署验证。
+
+### macOS 部署
+
+部署方须在 PF 主过滤规则的第一条配置并加载这个入口。anchor 由守卫独占，初始为空，规则由守卫在安装时加载。
+
+```pf
+anchor "com.cvbbmso.egress" out quick
+```
+
+运行期的安装、刷新和回滚只加载或清空专用 anchor，保留 PF 主规则和其他 anchor。内核中缺少入口、入口排位不符，或存在跳过 PF 的非回环接口时，`install` 返回 `NetworkError::Platform`。旧版写入的 `/etc/pf.conf` 标记和 anchor 文件由部署方迁移。守卫运行时，专用 anchor 对匹配的出站报文作出终止判定，后续主规则不再处理这些报文。
 
 ### 失败处理
 

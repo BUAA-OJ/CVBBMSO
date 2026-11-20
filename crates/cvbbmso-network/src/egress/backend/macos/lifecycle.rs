@@ -13,7 +13,7 @@ use crate::egress::commands::{Commands, SystemCommands};
 use crate::egress::policy::Plan;
 use crate::egress::state::{self, GuardState};
 
-use super::{PfGuard, install_with, local_addresses, recover_with};
+use super::{PfGuard, install_with, local_addresses, recover_with, verify_deployment};
 
 pub(crate) const HELPER: &str = "/Library/PrivilegedHelperTools/com.cvbbmso.egress-watchdog";
 
@@ -31,8 +31,10 @@ impl Prepared {
             state::check_protected(Path::new(path), true)?;
         }
         state::check_protected(Path::new(HELPER), false)?;
+        verify_deployment(&SystemCommands(None))?;
         let lock = state::lock()?;
         let commands = SystemCommands(Some(&lock));
+        verify_deployment(&commands)?;
         if state::read(&commands)?
             .is_some_and(|state| !state.expired() && process_alive(state.parent))
         {
