@@ -75,8 +75,8 @@ this file and explaining why.
 | HTTP server | `axum` | `tower` / `tower-http` only where they replace custom middleware. |
 | WebSocket client | `tokio-tungstenite` | |
 | WebSocket server | `axum` built-in WebSocket extractor | |
-| Database | `SeaORM` over SQLite (`sqlx` backend) | Domain crate only; entities stay private. |
-| Migrations | `sea-orm-migration` | SeaORM's own migration framework; no `refinery`. |
+| Database | `SeaORM` over SQLite (`sqlx` backend) | `cvbbmso-domain` owns business queries and keeps its entities private. |
+| Migrations | `sea-orm-migration` | Prefer the default `sea-orm-cli` layout described in §5. |
 | CLI parsing | `clap` (derive) | |
 | Configuration | `clap` flags + environment variables | No configuration files for the server. |
 | Logging | `tracing` + `tracing-subscriber` | JSON logs for the server, human-readable for the client. |
@@ -186,9 +186,14 @@ Write idiomatic Rust and keep the design boring.
   positive IDs, non-zero recording policy values, `start_at <= end_at`.
 - Times are UTC `OffsetDateTime`; render RFC 3339. Never store or transmit
   local time or naive timestamps.
-- Database schema changes are forward-only `sea-orm-migration` migrations. The
-  `Migrator` lives in a private module of `cvbbmso-domain`; keep each migration
-  reversible and never edit an applied migration.
+- Prefer the standalone `migration/` crate that `sea-orm-cli migrate init`
+  generates at the workspace root. Keep its `Cargo.toml`, `src/lib.rs` for
+  `Migrator`, and `src/main.rs` for the migration CLI.
+  Use `sea-orm-cli migrate generate` for timestamped migration files and
+  register them in chronological order. `cvbbmso-domain` calls `Migrator`
+  when it opens the database.
+- Add schema changes as new `sea-orm-migration` migrations. Keep each migration
+  reversible and preserve applied migrations.
 - Store timestamps in UTC. Filtering uses absolute instants.
 - Deviations from the documented contracts require a docs change in the same
   change set.
