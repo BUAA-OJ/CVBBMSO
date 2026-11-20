@@ -778,8 +778,12 @@ name = "cvbbmso-network"
 version = "0.1.0"
 dependencies = [
  "core-foundation",
+ "libc",
  "reqwest",
+ "serde",
+ "serde_json",
  "system-configuration",
+ "tempfile",
  "thiserror",
  "tokio",
  "url",
