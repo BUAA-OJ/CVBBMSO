@@ -18,7 +18,7 @@ const admissionErrors = new Map([
   ["proxy_unknown", "无法确认系统代理状态，请联系考试管理员。"],
   ["monitor_unreachable", "无法连接监考服务，请检查网络后重试。"],
   ["guard_install_failed", "无法启用出站网络守卫，请联系考试管理员。"],
-  ["guard_lost", "出站网络守卫校验失败，客户端将结束当前考试。请关闭并重新启动。"],
+  ["guard_lost", "出站网络守卫校验失败，客户端将结束当前考试。请联系监考人员后重新启动客户端。"],
   ["screen_permission", "请在系统设置中允许客户端录制屏幕，再重试。"],
   ["screen_restart_required", "屏幕录制权限已设置，请重新启动客户端。"],
 ]);

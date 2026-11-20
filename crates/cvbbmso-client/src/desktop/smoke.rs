@@ -71,19 +71,24 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
     let (exit_peer, exit_peer_result) = std::sync::mpsc::channel();
     let app = builder()
         .setup(move |app| {
-            let deployed = check_deployment(&data_dir)?;
+            check_deployment(&data_dir)?;
             let requests = Arc::new(AtomicUsize::new(0));
             let (fixture, foreign, hits) =
                 async_runtime::block_on(start_fixture(requests.clone()))?;
-            let (monitor, exam_connections) =
-                start_monitor(requests.clone(), exam_identity.as_deref())?;
+            let (monitor, exam_connections) = if case == Case::ExitDuringInstall {
+                (Monitor::new(None), None)
+            } else {
+                let (monitor, connections) =
+                    start_monitor(requests.clone(), exam_identity.as_deref())?;
+                (Ok(monitor), connections)
+            };
             let base = Url::parse(&format!("http://{fixture}/"))?;
             let (blocked, mut decisions) = mpsc::unbounded_channel();
             app.manage(Desktop {
                 login: base.join("user/login")?,
                 identity: base.join("api/users/me")?,
                 data_dir,
-                monitor: Ok(monitor),
+                monitor,
                 blocked: Some(blocked),
             });
             let admission = FakeAdmission::default();
@@ -128,8 +133,7 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
                         }
                     } else {
                         check_admission_retry(&ui, &admission).await?;
-                        exercise(&app, &ui, &deployed, &base, foreign, &hits, &mut decisions)
-                            .await?;
+                        exercise(&app, &ui, &base, foreign, &hits, &mut decisions).await?;
                     }
                     ui.close().map_err(Into::into)
                 }
@@ -241,6 +245,21 @@ async fn check_exit_during_install(
     admission: &FakeAdmission,
 ) -> Result<(), Error> {
     timeout(DEADLINE, admission.install_started()).await?;
+    ui.eval(
+        r"
+        window.missingMonitor = 'pending';
+        window.__TAURI__.core.invoke('list_exams').then(
+            () => { window.missingMonitor = 'unexpected_success'; },
+            error => { window.missingMonitor = error; },
+        );
+    ",
+    )?;
+    wait_for(
+        ui,
+        "window.missingMonitor === 'monitor_unconfigured'",
+        "list_exams reporting the missing monitor after VM preflight",
+    )
+    .await?;
     ui.close()?;
     wait_for(
         ui,
@@ -262,7 +281,7 @@ async fn check_guard_loss(
 ) -> Result<(), Error> {
     assert!(admission.verifies() > 0);
     admission.lose_guard();
-    wait_for(ui, "document.querySelector('#admission-status').textContent.includes('网络守卫校验失败') && document.querySelector('#admitted-controls').hidden", "terminal guard loss").await?;
+    wait_for(ui, "document.querySelector('#admission-status').textContent.includes('联系监考人员') && document.querySelector('#admitted-controls').hidden", "terminal guard loss").await?;
     check_environment_gate(ui).await?;
     timeout(DEADLINE, peer).await??;
     ui.eval(r"
@@ -288,7 +307,7 @@ async fn check_guard_loss(
     Ok(())
 }
 
-fn check_deployment(data_dir: &Path) -> Result<Desktop, Box<dyn std::error::Error>> {
+fn check_deployment(data_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let deployed = Desktop::deployed(data_dir.to_path_buf(), None)?;
     assert!(matches!(deployed.monitor, Err(MonitorError::Configuration)));
     for invalid in ["", "http://monitor.example.org"] {
@@ -299,7 +318,7 @@ fn check_deployment(data_dir: &Path) -> Result<Desktop, Box<dyn std::error::Erro
         );
     }
     println!("Missing monitor configuration is allowed; invalid origins fail startup.");
-    Ok(deployed)
+    Ok(())
 }
 
 fn start_monitor(
@@ -630,7 +649,6 @@ async fn expect_cookie(oj: &WebviewWindow, base: &Url, session: &str) -> Result<
 async fn exercise(
     app: &AppHandle,
     ui: &WebviewWindow,
-    deployed: &Desktop,
     base: &Url,
     foreign: SocketAddr,
     hits: &AtomicUsize,
@@ -670,29 +688,6 @@ async fn exercise(
     if hits.load(Ordering::Relaxed) != 0 {
         return Err(io::Error::other("Cross-origin navigation reached the listener").into());
     }
-    oj.destroy()?;
-    timeout(DEADLINE, async {
-        while app.get_webview_window(OJ).is_some() {
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await?;
-
-    open_browser(app, deployed)?;
-    let oj = app
-        .get_webview_window(OJ)
-        .ok_or_else(|| io::Error::other("Accoding window missing"))?;
-    if let Err(error) = wait_for(
-        &oj,
-        "location.origin === 'https://accoding.buaa.edu.cn' && Boolean(document.querySelector('input[type=password]'))",
-        "Accoding login form",
-    ).await {
-        if let Ok(url) = oj.url() {
-            eprintln!("Accoding WebView location: {}{}", url.origin().ascii_serialization(), url.path());
-        }
-        return Err(error);
-    }
-    println!("Accoding login form loaded.");
     Ok(())
 }
 

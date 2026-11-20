@@ -387,11 +387,17 @@ impl From<&MonitorError> for ListExamsError {
 
 #[tauri::command]
 async fn list_exams(app: AppHandle) -> Result<Vec<ExamSummary>, ListExamsError> {
-    if !app.state::<Preflight>().is_admitted() || !app.state::<admission::Admission>().is_ready() {
+    if !app.state::<Preflight>().is_admitted() {
         return Err(ListExamsError::PreflightBlocked);
     }
     let desktop = app.state::<Desktop>();
-    let monitor = desktop.monitor.as_ref().map_err(ListExamsError::from)?;
+    let monitor = match desktop.monitor.as_ref() {
+        Err(MonitorError::Configuration) => return Err(ListExamsError::MonitorUnconfigured),
+        _ if !app.state::<admission::Admission>().is_ready() => {
+            return Err(ListExamsError::PreflightBlocked);
+        }
+        monitor => monitor.map_err(ListExamsError::from)?,
+    };
     let cookies = current_cookies(&app).await.map_err(|error| match error {
         ReadSessionError::BrowserClosed
         | ReadSessionError::Invalid(AccodingError::MissingSession) => {

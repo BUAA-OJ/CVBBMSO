@@ -54,7 +54,7 @@ impl Failure {
             Self::ProxyUnknown => "无法确认系统代理状态，请联系考试管理员。",
             Self::MonitorUnreachable => "无法连接监考服务，请检查网络后重试。",
             Self::GuardInstallFailed => "无法启用出站网络守卫，请联系考试管理员。",
-            Self::GuardLost => "出站网络守卫校验失败，请关闭并重新启动客户端。",
+            Self::GuardLost => "出站网络守卫校验失败，请联系监考人员后重新启动客户端。",
             #[cfg(any(target_os = "macos", test))]
             Self::ScreenPermission => "请在系统设置中允许客户端录制屏幕，再重试。",
             #[cfg(target_os = "macos")]
