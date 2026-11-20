@@ -10,12 +10,12 @@ use std::time::Duration;
 use cvbbmso_protocol::{ClientMessage, ServerMessage};
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
-    net::TcpStream,
-    sync::mpsc,
-    time::{Instant, MissedTickBehavior, interval_at, timeout},
+    io::{AsyncRead, AsyncWrite},
+    sync::{mpsc, oneshot},
+    time::{Instant, MissedTickBehavior, interval_at, sleep_until, timeout, timeout_at},
 };
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
+    WebSocketStream, connect_async,
     tungstenite::{Message, handshake::client::Request},
 };
 
@@ -24,16 +24,18 @@ use crate::{ExamError, monitor::handshake_error};
 /// Capacity of the queue of messages waiting for the socket.
 const OUTBOUND_CAPACITY: usize = 64;
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
 /// Report from a session task to the runtime.
 #[derive(Debug)]
 pub(super) enum Inbound {
     /// The handshake succeeded; messages sent here reach the socket in order.
     Opened(u64, mpsc::Sender<ClientMessage>),
     /// A message arrived from the server.
-    Message(u64, ServerMessage),
-    /// The connection ended; `None` when the runtime closed it.
+    Message {
+        generation: u64,
+        message: ServerMessage,
+        received_at: Instant,
+    },
+    /// The connection ended; `None` when its channels were closed normally.
     Closed(u64, Option<ExamError>),
 }
 
@@ -47,105 +49,147 @@ pub(crate) struct Liveness {
 /// Connects in the background and reports to `inbound`.
 ///
 /// The session ends when the server closes, the socket fails, nothing arrives
-/// for `liveness.silence`, or the runtime drops the outbound sender.
+/// for `liveness.silence`, or the runtime drops the cancellation sender.
 pub(super) fn spawn(
     request: Request,
     generation: u64,
     inbound: mpsc::Sender<Inbound>,
     liveness: Liveness,
-) {
+) -> oneshot::Sender<()> {
+    let (cancel, mut cancelled) = oneshot::channel();
     tokio::spawn(async move {
-        let socket = match timeout(liveness.silence, connect_async(request)).await {
-            Ok(Ok((socket, _))) => socket,
-            Ok(Err(error)) => {
-                let _ = inbound
-                    .send(Inbound::Closed(generation, Some(handshake_error(error))))
-                    .await;
-                return;
-            }
-            Err(_) => {
-                let _ = inbound
-                    .send(Inbound::Closed(
-                        generation,
-                        Some(ExamError::WebSocket(None)),
-                    ))
-                    .await;
-                return;
-            }
+        let handshake = tokio::select! {
+            biased;
+            _ = &mut cancelled => return,
+            result = timeout(liveness.silence, connect_async(request)) => result,
         };
-        let (outbound, receiver) = mpsc::channel(OUTBOUND_CAPACITY);
-        if inbound
-            .send(Inbound::Opened(generation, outbound))
-            .await
-            .is_err()
-        {
-            return;
+        let reason = match handshake {
+            Ok(Ok((mut socket, _))) => {
+                let (outbound, receiver) = mpsc::channel(OUTBOUND_CAPACITY);
+                tokio::select! {
+                    biased;
+                    _ = &mut cancelled => {
+                        // Send a close frame if the socket is writable.
+                        let _ = timeout(Duration::ZERO, socket.close(None)).await;
+                        return;
+                    }
+                    result = async {
+                        if inbound.send(Inbound::Opened(generation, outbound)).await.is_err() {
+                            return Ok(());
+                        }
+                        drive(&mut socket, receiver, &inbound, generation, liveness).await
+                    } => result,
+                }
+            }
+            Ok(Err(error)) => Err(handshake_error(error)),
+            Err(_) => Err(ExamError::WebSocket(None)),
+        };
+        tokio::select! {
+            _ = &mut cancelled => {}
+            _ = inbound.send(Inbound::Closed(generation, reason.err())) => {}
         }
-        let reason = drive(socket, receiver, &inbound, generation, liveness).await;
-        let _ = inbound.send(Inbound::Closed(generation, reason)).await;
     });
+    cancel
 }
 
-async fn drive(
-    mut socket: Socket,
+async fn drive<S: AsyncRead + AsyncWrite + Unpin>(
+    socket: &mut WebSocketStream<S>,
     mut outbound: mpsc::Receiver<ClientMessage>,
     inbound: &mpsc::Sender<Inbound>,
     generation: u64,
     liveness: Liveness,
-) -> Option<ExamError> {
-    // The first beat waits a full period so `hello` stays the first message.
+) -> Result<(), ExamError> {
+    let mut deadline = Instant::now() + liveness.silence;
+    // A delayed runtime cannot cause the first heartbeat to overtake hello.
+    let Some(hello) = timeout_at(deadline, outbound.recv())
+        .await
+        .map_err(|_| ExamError::WebSocket(None))?
+    else {
+        return Ok(());
+    };
+    send_message(socket, &hello, deadline).await?;
+
+    let mut synced = false;
     let mut beat = interval_at(Instant::now() + liveness.heartbeat, liveness.heartbeat);
     beat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut last_seen = Instant::now();
     loop {
         tokio::select! {
-            frame = socket.next() => match frame {
-                Some(Ok(Message::Text(text))) => {
-                    last_seen = Instant::now();
-                    let Ok(message) = serde_json::from_str::<ServerMessage>(&text) else {
-                        tracing::warn!("monitor sent a message outside the protocol");
-                        let _ = socket.close(None).await;
-                        return Some(ExamError::WebSocket(None));
-                    };
-                    if inbound.send(Inbound::Message(generation, message)).await.is_err() {
-                        return None;
+            () = sleep_until(deadline) => return Err(ExamError::WebSocket(None)),
+            frame = socket.next() => {
+                let seen = Instant::now();
+                match frame {
+                    Some(Ok(Message::Text(text))) => {
+                        let Ok(message) = serde_json::from_str::<ServerMessage>(&text) else {
+                            tracing::warn!("monitor sent a message outside the protocol");
+                            return Err(ExamError::WebSocket(None));
+                        };
+                        let rejected = !synced && matches!(message, ServerMessage::Error { .. });
+                        if let ServerMessage::Sync { start_at, end_at, .. } = &message {
+                            if synced || start_at > end_at {
+                                return Err(ExamError::WebSocket(None));
+                            }
+                            synced = true;
+                            beat.reset();
+                        } else if !synced && !rejected {
+                            return Err(ExamError::WebSocket(None));
+                        }
+                        if synced {
+                            deadline = seen + liveness.silence;
+                        }
+                        let report = Inbound::Message { generation, message, received_at: seen };
+                        if timeout_at(deadline, inbound.send(report))
+                            .await.map_err(|_| ExamError::WebSocket(None))?.is_err()
+                        {
+                            return Ok(());
+                        }
+                        if rejected {
+                            return Ok(());
+                        }
                     }
-                }
-                Some(Ok(Message::Close(_))) | None => return Some(ExamError::WebSocket(None)),
-                Some(Ok(_)) => last_seen = Instant::now(),
-                Some(Err(error)) => return Some(ExamError::WebSocket(Some(error))),
-            },
-            message = outbound.recv() => {
-                let Some(message) = message else {
-                    let _ = socket.close(None).await;
-                    return None;
-                };
-                if let Err(error) = send(&mut socket, &message).await {
-                    return Some(error);
+                    Some(Ok(Message::Close(_))) | None => return Err(ExamError::WebSocket(None)),
+                    Some(Ok(_)) => {
+                        if synced {
+                            deadline = seen + liveness.silence;
+                        }
+                    }
+                    Some(Err(error)) => return Err(ExamError::WebSocket(Some(error))),
                 }
             }
-            _ = beat.tick() => {
-                if last_seen.elapsed() >= liveness.silence {
-                    return Some(ExamError::WebSocket(None));
-                }
-                if let Err(error) = send(&mut socket, &ClientMessage::Heartbeat).await {
-                    return Some(error);
-                }
-                // A ping makes the server answer even when it has nothing to say,
-                // so a half-open connection is noticed within `silence`.
-                if let Err(error) = socket.send(Message::Ping(Vec::new().into())).await {
-                    return Some(ExamError::WebSocket(Some(error)));
-                }
+            message = outbound.recv() => {
+                let Some(message) = message else {
+                    return Ok(());
+                };
+                send_message(socket, &message, deadline).await?;
+            }
+            _ = beat.tick(), if synced => {
+                send_message(socket, &ClientMessage::Heartbeat, deadline).await?;
+                // A ping makes the server answer even when it has no business messages.
+                write_frame(socket, Message::Ping(Vec::new().into()), deadline).await?;
             }
         }
     }
 }
 
-async fn send(socket: &mut Socket, message: &ClientMessage) -> Result<(), ExamError> {
+async fn send_message<S: AsyncRead + AsyncWrite + Unpin>(
+    socket: &mut WebSocketStream<S>,
+    message: &ClientMessage,
+    deadline: Instant,
+) -> Result<(), ExamError> {
     // Protocol messages always serialize; a failure would be a schema bug.
     let text = serde_json::to_string(message).map_err(|_| ExamError::WebSocket(None))?;
-    socket
-        .send(Message::text(text))
+    write_frame(socket, Message::text(text), deadline).await
+}
+
+async fn write_frame<S: AsyncRead + AsyncWrite + Unpin>(
+    socket: &mut WebSocketStream<S>,
+    frame: Message,
+    deadline: Instant,
+) -> Result<(), ExamError> {
+    timeout_at(deadline, socket.send(frame))
         .await
+        .map_err(|_| ExamError::WebSocket(None))?
         .map_err(|error| ExamError::WebSocket(Some(error)))
 }
+
+#[cfg(test)]
+mod tests;

@@ -13,16 +13,17 @@ use cvbbmso_accoding::AccodingCookies;
 use cvbbmso_protocol::{
     ClientMessage, ClientState, CommandName, CommandStatus, ExamEvent, ExamPhase, ExecutionState,
     IncidentCode, RecordingManifest, RecordingPolicy, RecordingState, SegmentMeta, ServerMessage,
-    Sha256Digest,
+    Sha256Digest, error_code,
 };
 use cvbbmso_recorder::{PlatformError, RecorderEvent, RecordingError};
 use futures_util::{SinkExt, StreamExt};
 use time::OffsetDateTime;
 use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
-    time::timeout,
+    time::{Instant, timeout},
 };
 use tokio_tungstenite::{
     WebSocketStream, accept_hdr_async,
@@ -35,7 +36,7 @@ use tokio_tungstenite::{
 use url::Url;
 use uuid::Uuid;
 
-use super::{Capture, Launch, Timing, launch, session::Liveness};
+use super::{Capture, Clock, END_GRACE, Launch, Runtime, Timing, launch, session::Liveness};
 use crate::{ExamConfig, ExamError, ExamHandle, UiNotice, journal::Journal, monitor::Monitor};
 
 const EXAM: Uuid = Uuid::from_u128(0x10);
@@ -126,6 +127,7 @@ impl Script {
 
 struct FakeCapture {
     script: Script,
+    final_segment: Option<mpsc::Sender<RecorderEvent>>,
 }
 
 impl Capture for FakeCapture {
@@ -148,12 +150,27 @@ impl Capture for FakeCapture {
 
     fn finish(&mut self) -> impl Future<Output = Result<RecordingManifest, RecordingError>> + Send {
         self.script.0.lock().unwrap().calls.push("finish");
+        let segment = segment(1);
         let manifest = RecordingManifest::new(
-            vec![segment(1)],
+            vec![segment.clone()],
             Sha256Digest::parse(&"b".repeat(64)).unwrap(),
         );
-        async move { Ok(manifest.unwrap()) }
+        let final_segment = self.final_segment.clone();
+        async move {
+            if let Some(sender) = final_segment {
+                sender
+                    .send(RecorderEvent::SegmentFinalized(segment))
+                    .await
+                    .unwrap();
+            }
+            Ok(manifest.unwrap())
+        }
     }
+}
+
+struct OpenGate {
+    entered: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
 }
 
 /// Loopback monitor, scripted recorder, and data directory of one test.
@@ -164,6 +181,8 @@ struct Harness {
     script: Script,
     recorder: mpsc::Sender<RecorderEvent>,
     events: Option<mpsc::Receiver<RecorderEvent>>,
+    seal_on_finish: bool,
+    open_gate: Option<OpenGate>,
 }
 
 impl Harness {
@@ -178,6 +197,8 @@ impl Harness {
             script: Script::default(),
             recorder,
             events: Some(events),
+            seal_on_finish: false,
+            open_gate: None,
         }
     }
 
@@ -187,6 +208,13 @@ impl Harness {
             .join("exams")
             .join(EXAM.to_string())
             .join(USER.to_string())
+    }
+
+    fn block_journal_writes(&self) -> std::path::PathBuf {
+        let path = self.candidate_dir().join("runtime").join("journal.json");
+        std::fs::rename(&path, path.with_extension("saved")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        path
     }
 
     fn launch(&mut self) -> JoinHandle<Result<ExamHandle, ExamError>> {
@@ -201,8 +229,10 @@ impl Harness {
         let monitor = Monitor::new(self.base.clone()).unwrap();
         let capture = FakeCapture {
             script: self.script.clone(),
+            final_segment: self.seal_on_finish.then(|| self.recorder.clone()),
         };
         let events = self.events.take().expect("launched once per harness");
+        let open_gate = self.open_gate.take();
         tokio::spawn(launch(
             Launch {
                 config,
@@ -212,12 +242,57 @@ impl Harness {
                 monitor,
                 timing: timing(),
             },
-            move |_, _| async move { Ok((capture, events)) },
+            move |_, _| async move {
+                if let Some(gate) = open_gate {
+                    gate.entered.send(()).unwrap();
+                    gate.release.await.unwrap();
+                }
+                Ok((capture, events))
+            },
         ))
     }
 
     async fn accept(&self) -> Conn {
         self.accept_with(|_, response| Ok(response)).await
+    }
+
+    async fn answer_enrollment(&self, expected_cookie: &str, user: i64) {
+        timeout(WAIT, async {
+            let (tcp, _) = self.listener.accept().await.unwrap();
+            let mut tcp = BufReader::new(tcp);
+            let mut line = String::new();
+            tcp.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "GET /api/exams HTTP/1.1\r\n");
+            let mut cookie = None;
+            loop {
+                line.clear();
+                assert_ne!(tcp.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("cookie")
+                {
+                    cookie = Some(value.trim().to_owned());
+                }
+            }
+            assert_eq!(cookie.as_deref(), Some(expected_cookie));
+
+            let body = serde_json::json!({
+                "user": { "id": user, "username": "candidate", "nickname": "Candidate" },
+                "items": [{
+                    "id": EXAM, "title": "Exam", "phase": "running",
+                    "start_at": "2026-12-20T01:00:00Z", "end_at": "2026-12-20T04:00:00Z"
+                }]
+            }).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            tcp.get_mut().write_all(response.as_bytes()).await.unwrap();
+        })
+        .await
+        .expect("runtime verifies the new cookies over HTTP");
     }
 
     async fn accept_with(
@@ -372,7 +447,12 @@ async fn commands_drive_the_recording_through_the_end_handshake() {
     let (mut conn, handle) = harness.connected(ExamPhase::Running).await;
     let mut view = handle.subscribe();
 
-    start_recording(&mut conn).await;
+    conn.send(command(1, CommandName::StartExam)).await;
+    expect_status(
+        &conn.recv().await,
+        state(ExecutionState::Recording, RecordingState::Capturing),
+    );
+    expect_result(&conn.recv().await, 1, CommandStatus::Completed);
     harness
         .recorder
         .send(RecorderEvent::SegmentFinalized(segment(1)))
@@ -382,6 +462,7 @@ async fn commands_drive_the_recording_through_the_end_handshake() {
     assert_eq!(seq, 1);
     assert!(matches!(event, ExamEvent::SegmentFinalized(meta) if meta.index == 1));
 
+    // The end command can arrive before the start acknowledgement.
     conn.send(command(2, CommandName::EndExam)).await;
     expect_status(
         &conn.recv().await,
@@ -396,6 +477,7 @@ async fn commands_drive_the_recording_through_the_end_handshake() {
     );
     expect_result(&conn.recv().await, 2, CommandStatus::Completed);
 
+    conn.send(ack(1)).await;
     conn.send(ack(2)).await;
     conn.closed().await;
     let finished = state(ExecutionState::Finished, RecordingState::Complete);
@@ -440,19 +522,146 @@ async fn reconnecting_resends_only_unconfirmed_events() {
 }
 
 #[tokio::test]
+async fn a_reconnect_rejects_commands_before_sync() {
+    let mut harness = Harness::new().await;
+    let (conn, handle) = harness.connected(ExamPhase::Scheduled).await;
+    drop(conn);
+
+    let mut conn = harness.accept().await;
+    assert!(matches!(conn.recv().await, ClientMessage::Hello(_)));
+    conn.send(command(1, CommandName::StartExam)).await;
+    conn.closed().await;
+    assert_eq!(harness.script.calls(), Vec::<&str>::new());
+
+    let mut conn = harness.accept().await;
+    let ClientMessage::Hello(hello) = conn.recv().await else {
+        panic!("hello must come first");
+    };
+    assert_eq!(
+        hello.state,
+        state(ExecutionState::Ready, RecordingState::Idle)
+    );
+    conn.send(sync(ExamPhase::Running, 0)).await;
+    start_recording(&mut conn).await;
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_same_account_cookie_update_is_used_on_reconnect() {
+    let mut harness = Harness::new().await;
+    let (mut conn, handle) = harness.connected(ExamPhase::Running).await;
+    let mut view = handle.subscribe();
+    start_recording(&mut conn).await;
+
+    conn.send(ServerMessage::Error {
+        code: error_code::ACCODING_AUTH_EXPIRED.to_owned(),
+        message: "Sign in again".to_owned(),
+    })
+    .await;
+    timeout(
+        WAIT,
+        view.wait_for(|view| {
+            view.last_error_code.as_deref() == Some(error_code::ACCODING_AUTH_EXPIRED)
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let cookies =
+        AccodingCookies::from_pairs([("connect.sid".into(), "refreshed".into())]).unwrap();
+    handle
+        .notify(UiNotice::CookiesUpdated(cookies))
+        .await
+        .unwrap();
+    harness
+        .answer_enrollment("connect.sid=refreshed", USER)
+        .await;
+    timeout(
+        WAIT,
+        view.wait_for(|view| view.connected && view.last_error_code.is_none()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    drop(conn);
+    let mut conn = harness.accept().await;
+    assert_eq!(conn.cookie.as_deref(), Some("connect.sid=refreshed"));
+    let ClientMessage::Hello(hello) = conn.recv().await else {
+        panic!("hello must come first");
+    };
+    assert_eq!(
+        hello.state,
+        state(ExecutionState::Recording, RecordingState::Capturing)
+    );
+    conn.send(sync(ExamPhase::Running, 0)).await;
+    timeout(
+        WAIT,
+        view.wait_for(|view| view.connected && view.last_error_code.is_none()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn another_enrolled_account_cannot_send_the_original_candidates_events() {
+    let mut harness = Harness::new().await;
+    let (mut conn, handle) = harness.connected(ExamPhase::Running).await;
+    let mut view = handle.subscribe();
+    start_recording(&mut conn).await;
+    harness
+        .recorder
+        .send(RecorderEvent::SegmentFinalized(segment(1)))
+        .await
+        .unwrap();
+    assert_eq!(expect_event(conn.recv().await).0, 1);
+
+    let cookies = AccodingCookies::from_pairs([("connect.sid".into(), "other".into())]).unwrap();
+    handle
+        .notify(UiNotice::CookiesUpdated(cookies))
+        .await
+        .unwrap();
+    harness
+        .answer_enrollment("connect.sid=other", USER + 1)
+        .await;
+    timeout(
+        WAIT,
+        view.wait_for(|view| {
+            view.connected
+                && view.last_error_code.as_deref() == Some(error_code::ACCODING_AUTH_EXPIRED)
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    drop(conn);
+    let mut conn = harness.accept().await;
+    assert_eq!(conn.cookie.as_deref(), Some("connect.sid=session"));
+    assert!(matches!(conn.recv().await, ClientMessage::Hello(_)));
+    conn.send(sync(ExamPhase::Running, 0)).await;
+    assert_eq!(expect_event(conn.recv().await).0, 1);
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_capture_fault_is_reported_and_retried_until_it_recovers() {
     let mut harness = Harness::new().await;
     let (mut conn, _handle) = harness.connected(ExamPhase::Running).await;
     start_recording(&mut conn).await;
     harness.script.fail_next_starts(1);
 
-    harness
-        .recorder
-        .send(RecorderEvent::Fault(RecordingError::Platform(
-            PlatformError::Unsupported,
-        )))
-        .await
-        .unwrap();
+    for _ in 0..2 {
+        harness
+            .recorder
+            .try_send(RecorderEvent::Fault(RecordingError::Platform(
+                PlatformError::Unsupported,
+            )))
+            .unwrap();
+    }
 
     expect_incident(conn.recv().await, IncidentCode::RecordingFailed);
     expect_status(
@@ -495,14 +704,59 @@ async fn a_restarted_process_reports_the_lost_capture_and_resumes_it() {
 }
 
 #[tokio::test]
+async fn recorder_restoration_does_not_extend_the_server_deadline() {
+    let mut harness = Harness::new().await;
+    let mut journal = Journal::open(&harness.candidate_dir()).await.unwrap();
+    journal.set_state(state(ExecutionState::Recording, RecordingState::Capturing));
+    journal.save().await.unwrap();
+    let (entered, restoring) = oneshot::channel();
+    let (release, wait_for_release) = oneshot::channel();
+    harness.open_gate = Some(OpenGate {
+        entered,
+        release: wait_for_release,
+    });
+
+    let pending = harness.launch();
+    let mut conn = harness.accept().await;
+    assert!(matches!(conn.recv().await, ClientMessage::Hello(_)));
+    let server_time = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(120);
+    conn.send(ServerMessage::Sync {
+        server_time,
+        phase: ExamPhase::Ended,
+        start_at: OffsetDateTime::UNIX_EPOCH,
+        end_at: server_time - END_GRACE + Duration::from_secs(10),
+        recording_policy: RecordingPolicy::new(30, 15).unwrap(),
+        ack_event_through: 0,
+    })
+    .await;
+    timeout(WAIT, restoring).await.unwrap().unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(11)).await;
+    release.send(()).unwrap();
+
+    let handle = pending.await.unwrap().unwrap();
+    let mut view = handle.subscribe();
+    timeout(
+        Duration::from_secs(1),
+        view.wait_for(|view| view.state.execution == ExecutionState::Finalizing),
+    )
+    .await
+    .expect("the server has already reached the stop deadline")
+    .unwrap();
+    assert_eq!(harness.script.calls(), ["stop"]);
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn repeated_navigation_denials_are_reported_once() {
     let mut harness = Harness::new().await;
     let (mut conn, handle) = harness.connected(ExamPhase::Running).await;
 
     for origin in [
         "https://a.example",
-        "https://a.example",
         "https://b.example",
+        "https://a.example",
+        "https://c.example",
     ] {
         handle
             .notify(UiNotice::NavigationDenied {
@@ -516,6 +770,8 @@ async fn repeated_navigation_denials_are_reported_once() {
     assert_eq!((first, detail.as_deref()), (1, Some("https://a.example")));
     let (second, detail) = expect_incident(conn.recv().await, IncidentCode::NavigationDenied);
     assert_eq!((second, detail.as_deref()), (2, Some("https://b.example")));
+    let (third, detail) = expect_incident(conn.recv().await, IncidentCode::NavigationDenied);
+    assert_eq!((third, detail.as_deref()), (3, Some("https://c.example")));
 }
 
 #[tokio::test]
@@ -528,6 +784,102 @@ async fn shutdown_stops_capture_and_closes_the_connection() {
 
     conn.closed().await;
     assert_eq!(harness.script.calls(), ["start", "stop"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_full_send_queue_cannot_hold_recording_past_the_offline_deadline() {
+    let harness = Harness::new().await;
+    let mut journal = Journal::open(&harness.candidate_dir()).await.unwrap();
+    let state = state(ExecutionState::Recording, RecordingState::Capturing);
+    journal.set_state(state);
+    journal.anchor(0);
+
+    let (link, mut stalled_session) = mpsc::channel(1);
+    link.try_send(ClientMessage::Heartbeat).unwrap();
+    let (recorder_tx, recorder) = mpsc::channel(1);
+    recorder_tx
+        .try_send(RecorderEvent::SegmentFinalized(segment(1)))
+        .unwrap();
+    let (requests_tx, requests) = mpsc::channel(1);
+    let (inbound_tx, inbound) = mpsc::channel(1);
+    let (view_tx, mut view) = watch::channel(crate::ClientView {
+        exam_id: EXAM,
+        connected: true,
+        state,
+        last_error_code: None,
+    });
+    let server_time = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(120);
+    let timing = timing();
+    let runtime = Runtime {
+        exam_id: EXAM,
+        oj_user_id: USER,
+        device_id: DEVICE,
+        instance_id: INSTANCE,
+        monitor: Monitor::new(harness.base.clone()).unwrap(),
+        cookies: AccodingCookies::from_pairs([("connect.sid".into(), "session".into())]).unwrap(),
+        timing,
+        journal,
+        capture: FakeCapture {
+            script: harness.script.clone(),
+            final_segment: None,
+        },
+        recorder,
+        inbound_tx,
+        inbound,
+        requests,
+        view: view_tx,
+        session: None,
+        link: Some(link),
+        generation: 1,
+        connected: true,
+        state,
+        last_error_code: None,
+        clock: Some(Clock {
+            server_time,
+            at: Instant::now(),
+        }),
+        end_at: Some(server_time - END_GRACE + Duration::from_secs(2)),
+        command: None,
+        reconnect_at: None,
+        backoff: Duration::from_secs(60),
+        retry_at: None,
+        start_failures: 0,
+        ack_deadline: None,
+        recent_denials: std::collections::HashMap::new(),
+        done: false,
+        storage_retry_at: None,
+        sent_through: 0,
+    };
+    let task = tokio::spawn(runtime.run());
+
+    timeout(
+        Duration::from_secs(3),
+        view.wait_for(|view| !view.connected && view.state.execution == ExecutionState::Finalizing),
+    )
+    .await
+    .expect("stop at the monotonic deadline")
+    .unwrap();
+    assert!(stalled_session.is_closed());
+    assert_eq!(
+        stalled_session.try_recv().unwrap(),
+        ClientMessage::Heartbeat
+    );
+    assert_eq!(harness.script.calls(), ["stop"]);
+    let journal = Journal::open(&harness.candidate_dir()).await.unwrap();
+    assert_eq!(
+        journal
+            .messages_after(0)
+            .map(|(seq, _)| seq)
+            .collect::<Vec<_>>(),
+        [1]
+    );
+
+    let handle = ExamHandle {
+        requests: requests_tx,
+        view,
+        task,
+    };
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -554,12 +906,7 @@ async fn a_failed_journal_write_keeps_the_exam_running() {
     let (mut conn, handle) = harness.connected(ExamPhase::Running).await;
     let mut view = handle.subscribe();
     start_recording(&mut conn).await;
-    // A directory where the temporary snapshot goes makes every save fail.
-    let blocker = harness
-        .candidate_dir()
-        .join("runtime")
-        .join("journal.json.tmp");
-    std::fs::create_dir(&blocker).unwrap();
+    let blocker = harness.block_journal_writes();
 
     harness
         .recorder
@@ -567,7 +914,6 @@ async fn a_failed_journal_write_keeps_the_exam_running() {
         .await
         .unwrap();
 
-    assert_eq!(expect_event(conn.recv().await).0, 1);
     timeout(
         WAIT,
         view.wait_for(|view| view.last_error_code.as_deref() == Some("INTERNAL_ERROR")),
@@ -576,17 +922,60 @@ async fn a_failed_journal_write_keeps_the_exam_running() {
     .unwrap()
     .unwrap();
 
-    std::fs::remove_dir(&blocker).unwrap();
     harness
         .recorder
         .send(RecorderEvent::SegmentFinalized(segment(2)))
         .await
         .unwrap();
+    conn.send(command(2, CommandName::StartExam)).await;
+    expect_result(&conn.recv().await, 2, CommandStatus::Completed);
+    conn.send(ack(2)).await;
+
+    std::fs::remove_dir(&blocker).unwrap();
+    assert_eq!(expect_event(conn.recv().await).0, 1);
     assert_eq!(expect_event(conn.recv().await).0, 2);
     timeout(WAIT, view.wait_for(|view| view.last_error_code.is_none()))
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn end_result_waits_for_the_manifest_to_be_saved_and_sent() {
+    let mut harness = Harness::new().await;
+    harness.seal_on_finish = true;
+    let (mut conn, handle) = harness.connected(ExamPhase::Running).await;
+    let mut view = handle.subscribe();
+    start_recording(&mut conn).await;
+    let blocker = harness.block_journal_writes();
+
+    conn.send(command(2, CommandName::EndExam)).await;
+    expect_status(
+        &conn.recv().await,
+        state(ExecutionState::Finalizing, RecordingState::Finalizing),
+    );
+    expect_status(
+        &conn.recv().await,
+        state(ExecutionState::Finalizing, RecordingState::Complete),
+    );
+    timeout(
+        WAIT,
+        view.wait_for(|view| view.last_error_code.as_deref() == Some(error_code::INTERNAL_ERROR)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    std::fs::remove_dir(&blocker).unwrap();
+
+    let (seq, event) = expect_event(conn.recv().await);
+    assert_eq!(seq, 1);
+    assert!(matches!(event, ExamEvent::SegmentFinalized(meta) if meta.index == 1));
+    let (seq, event) = expect_event(conn.recv().await);
+    assert_eq!(seq, 2);
+    assert!(matches!(event, ExamEvent::RecordingFinalized(_)));
+    expect_result(&conn.recv().await, 2, CommandStatus::Completed);
+    conn.send(ack(2)).await;
+    conn.closed().await;
 }
 
 #[tokio::test]
@@ -615,9 +1004,60 @@ async fn capture_is_retried_after_start_exam_reports_failure() {
 }
 
 #[tokio::test]
+async fn restart_replays_finalized_evidence_without_running_finish_again() {
+    let mut harness = Harness::new().await;
+    let (mut conn, handle) = harness.connected(ExamPhase::Running).await;
+    start_recording(&mut conn).await;
+    conn.send(command(2, CommandName::EndExam)).await;
+    expect_status(
+        &conn.recv().await,
+        state(ExecutionState::Finalizing, RecordingState::Finalizing),
+    );
+    let (seq, manifest) = expect_event(conn.recv().await);
+    assert_eq!(seq, 1);
+    assert!(matches!(manifest, ExamEvent::RecordingFinalized(_)));
+    expect_status(
+        &conn.recv().await,
+        state(ExecutionState::Finalizing, RecordingState::Complete),
+    );
+    expect_result(&conn.recv().await, 2, CommandStatus::Completed);
+
+    // The UI can still report a denied navigation while the end ACK is in
+    // flight. No new event may trail the result and later be cleared by it.
+    handle
+        .notify(UiNotice::NavigationDenied {
+            target_origin: "https://example.org".into(),
+        })
+        .await
+        .unwrap();
+    handle.shutdown().await.unwrap();
+    conn.closed().await;
+
+    let mut restarted = Harness::new().await;
+    std::mem::swap(&mut restarted.data, &mut harness.data);
+    let (mut conn, handle) = restarted.connected(ExamPhase::Ended).await;
+    assert_eq!(expect_event(conn.recv().await), (1, manifest));
+    conn.send(command(3, CommandName::EndExam)).await;
+    expect_result(&conn.recv().await, 3, CommandStatus::Completed);
+    assert_eq!(restarted.script.calls(), Vec::<&str>::new());
+    conn.send(ack(3)).await;
+    conn.closed().await;
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn reopening_a_finished_exam_closes_the_connection() {
     let mut harness = Harness::new().await;
     let mut journal = Journal::open(&harness.candidate_dir()).await.unwrap();
+    journal.anchor(0);
+    journal.append(ExamEvent::RecordingFinalized(
+        RecordingManifest::new(
+            vec![segment(1)],
+            Sha256Digest::parse(&"b".repeat(64)).unwrap(),
+        )
+        .unwrap(),
+    ));
+    journal.clear_events();
     journal.set_state(state(ExecutionState::Finished, RecordingState::Complete));
     journal.save().await.unwrap();
 

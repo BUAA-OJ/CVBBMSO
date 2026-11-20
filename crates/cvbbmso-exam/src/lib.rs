@@ -51,7 +51,8 @@ pub struct Exam;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum UiNotice {
-    /// The controlled browser holds new Accoding cookies; used for reconnects.
+    /// The browser holds new Accoding cookies to verify for this candidate
+    /// before adopting them for reconnects.
     CookiesUpdated(AccodingCookies),
     /// The controlled browser refused a navigation to another origin.
     NavigationDenied {
@@ -95,7 +96,7 @@ impl Exam {
     ///
     /// # Errors
     ///
-    /// [`ExamError::Http`] when `server_base` is not HTTPS or the monitor is
+    /// [`ExamError::Http`] when `server_base` is not an HTTPS origin or the monitor is
     /// unreachable, [`ExamError::Auth`] / [`ExamError::NotEnrolled`] when the
     /// session or enrollment is rejected, [`ExamError::WebSocket`] when the
     /// connection or the first `sync` fails, [`ExamError::Storage`] and

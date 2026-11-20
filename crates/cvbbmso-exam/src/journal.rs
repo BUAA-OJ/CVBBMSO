@@ -14,7 +14,7 @@
 
 use std::{
     collections::{BTreeSet, VecDeque},
-    fs::{self, File},
+    fs,
     io::{self, Write},
     path::{Path, PathBuf},
 };
@@ -28,10 +28,10 @@ use crate::ExamError;
 const RUNTIME_DIR: &str = "runtime";
 /// Journal snapshot file.
 const JOURNAL_FILE: &str = "journal.json";
-/// Temporary file used to replace the snapshot atomically.
-const TEMP_FILE: &str = "journal.json.tmp";
 /// Name a corrupt snapshot is moved to before the journal starts afresh.
 const CORRUPT_FILE: &str = "journal.json.corrupt";
+/// One past the last wire sequence number, representing exhaustion.
+const EXHAUSTED: u128 = (u64::MAX as u128) + 1;
 
 /// Durable runtime state of one candidate in one exam.
 pub(crate) struct Journal {
@@ -41,8 +41,8 @@ pub(crate) struct Journal {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Data {
-    /// Next sequence number; `None` until the first `sync` anchors numbering.
-    next_seq: Option<u64>,
+    /// Next sequence number or `EXHAUSTED`; `None` until the first sync.
+    next_seq: Option<u128>,
     /// Events not yet confirmed by the server, in recording order.
     queue: VecDeque<Entry>,
     /// Segment indexes already queued, so recovered segments are not repeated.
@@ -72,6 +72,51 @@ impl Default for Data {
             },
         }
     }
+}
+
+impl Data {
+    fn is_valid(&self) -> bool {
+        use ExecutionState::{Finalizing, Finished, Ready, Recording};
+        use RecordingState::{Capturing, Complete, Failed, Idle};
+
+        let valid_state = match (self.state.execution, self.state.recording) {
+            (Ready, Idle)
+            | (Recording, Capturing | Failed)
+            | (Finalizing, RecordingState::Finalizing | Failed)
+            | (Finished, Failed) => true,
+            (Finalizing | Finished, Complete) => self.finalized,
+            _ => false,
+        };
+        valid_state && self.has_valid_numbering()
+    }
+
+    fn has_valid_numbering(&self) -> bool {
+        if self
+            .next_seq
+            .is_some_and(|seq| !(1..=EXHAUSTED).contains(&seq))
+        {
+            return false;
+        }
+        let mut expected = self.next_seq;
+        for entry in self.queue.iter().rev() {
+            match entry.seq {
+                Some(seq) if seq > 0 && expected == Some(u128::from(seq) + 1) => {
+                    expected = Some(u128::from(seq));
+                }
+                None if expected == self.next_seq && matches!(expected, None | Some(EXHAUSTED)) => {
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+fn take_sequence(next: &mut Option<u128>) -> Option<u64> {
+    let next = next.as_mut()?;
+    let seq = u64::try_from(*next).ok()?;
+    *next += 1;
+    Some(seq)
 }
 
 impl Journal {
@@ -104,12 +149,12 @@ impl Journal {
             .map_err(ExamError::Storage)
     }
 
-    /// Queues an event and returns the message to send once saved.
+    /// Queues an event and returns its sequence number, if already anchored.
     ///
     /// Returns `None` for a segment whose index was already queued, for a
     /// second recording manifest, and for any event recorded before numbering
-    /// is anchored; [`Journal::anchor`] numbers and returns those later.
-    pub(crate) fn append(&mut self, event: ExamEvent) -> Option<ClientMessage> {
+    /// is anchored or after the sequence space is exhausted.
+    pub(crate) fn append(&mut self, event: ExamEvent) -> Option<u64> {
         let repeated = match &event {
             ExamEvent::SegmentFinalized(meta) => !self.data.segments.insert(meta.index),
             ExamEvent::RecordingFinalized(_) => std::mem::replace(&mut self.data.finalized, true),
@@ -118,52 +163,52 @@ impl Journal {
         if repeated {
             return None;
         }
-        let seq = self.data.next_seq;
-        if let Some(seq) = seq {
-            self.data.next_seq = Some(seq + 1);
-        }
-        let message = seq.map(|seq| ClientMessage::Event {
-            seq,
-            event: event.clone(),
-        });
+        let seq = take_sequence(&mut self.data.next_seq);
         self.data.queue.push_back(Entry { seq, event });
-        message
+        seq
     }
 
-    /// Applies `sync.ack_event_through` and returns every unconfirmed event to
-    /// send again, in order.
+    /// Applies `sync.ack_event_through` and numbers any unnumbered events.
     ///
     /// The first call anchors numbering after the server's position. Later
     /// calls never move numbering backwards.
-    pub(crate) fn anchor(&mut self, ack_event_through: u64) -> Vec<ClientMessage> {
-        let after_ack = ack_event_through.saturating_add(1);
-        let next = self
-            .data
-            .next_seq
-            .map_or(after_ack, |next| next.max(after_ack));
+    pub(crate) fn anchor(&mut self, ack_event_through: u64) {
+        let after_ack = u128::from(ack_event_through) + 1;
+        self.data.next_seq = Some(self.data.next_seq.unwrap_or(after_ack).max(after_ack));
         self.data
             .queue
             .retain(|entry| entry.seq.is_none_or(|seq| seq > ack_event_through));
 
-        let mut next = next;
         for entry in &mut self.data.queue {
             if entry.seq.is_none() {
-                entry.seq = Some(next);
-                next += 1;
+                entry.seq = take_sequence(&mut self.data.next_seq);
             }
         }
-        self.data.next_seq = Some(next);
+    }
 
+    /// Whether events are still waiting for a sequence number.
+    pub(crate) fn has_unnumbered_events(&self) -> bool {
         self.data
             .queue
-            .iter()
-            .filter_map(|entry| {
-                entry.seq.map(|seq| ClientMessage::Event {
+            .back()
+            .is_some_and(|entry| entry.seq.is_none())
+    }
+
+    /// Returns numbered messages beyond the current session's send position.
+    pub(crate) fn messages_after(
+        &self,
+        through: u64,
+    ) -> impl Iterator<Item = (u64, ClientMessage)> + '_ {
+        self.data.queue.iter().filter_map(move |entry| {
+            let seq = entry.seq.filter(|&seq| seq > through)?;
+            Some((
+                seq,
+                ClientMessage::Event {
                     seq,
                     event: entry.event.clone(),
-                })
-            })
-            .collect()
+                },
+            ))
+        })
     }
 
     /// Drops every queued event after the server confirmed the end of the exam.
@@ -194,28 +239,34 @@ fn load(dir: &Path) -> io::Result<Data> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Data::default()),
         Err(error) => return Err(error),
     };
-    match serde_json::from_slice(&bytes) {
-        Ok(data) => Ok(data),
-        Err(error) => {
-            tracing::warn!(
-                path = %path.display(),
-                %error,
-                "runtime journal is corrupt; starting an empty journal"
-            );
-            fs::rename(&path, dir.join(CORRUPT_FILE))?;
-            Ok(Data::default())
-        }
+    match serde_json::from_slice::<Data>(&bytes) {
+        Ok(data) if data.is_valid() => Ok(data),
+        Ok(_) => recover_corrupt(dir, &path, &"inconsistent snapshot"),
+        Err(error) => recover_corrupt(dir, &path, &error),
     }
 }
 
-/// Replaces the snapshot under `dir` without exposing a partial file.
+fn recover_corrupt(dir: &Path, path: &Path, error: &impl std::fmt::Display) -> io::Result<Data> {
+    tracing::warn!(
+        path = %path.display(),
+        %error,
+        "runtime journal is corrupt; starting an empty journal"
+    );
+    fs::rename(path, dir.join(CORRUPT_FILE))?;
+    Ok(Data::default())
+}
+
+/// Replaces the snapshot without following a pre-existing temporary path.
 fn write_atomically(dir: &Path, bytes: &[u8]) -> io::Result<()> {
-    let temp = dir.join(TEMP_FILE);
-    let mut file = File::create(&temp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&temp, dir.join(JOURNAL_FILE))
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".journal-")
+        .tempfile_in(dir)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(dir.join(JOURNAL_FILE))
+        .map_err(|error| error.error)?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@
 mod capture;
 mod session;
 
-use std::{future::Future, path::PathBuf, time::Duration};
+use std::{collections::HashMap, future::Future, path::PathBuf, time::Duration};
 
 use cvbbmso_accoding::AccodingCookies;
 use cvbbmso_protocol::{
@@ -24,7 +24,7 @@ use cvbbmso_recorder::{RecorderEvent, RecordingError};
 use time::OffsetDateTime;
 use tokio::{
     sync::{mpsc, oneshot, watch},
-    time::{Instant, sleep, sleep_until, timeout},
+    time::{Instant, sleep, sleep_until, timeout, timeout_at},
 };
 use uuid::Uuid;
 
@@ -37,7 +37,7 @@ use crate::{
 
 /// Grace period after `end_at` before an offline client stops recording on
 /// its own, fixed by the design contract.
-const END_GRACE: Duration = Duration::from_secs(60);
+const END_GRACE: time::Duration = time::Duration::seconds(60);
 /// Longest detail kept for a navigation incident.
 const MAX_DETAIL_CHARS: usize = 200;
 /// Repeated denials of one origin within this window are reported once.
@@ -128,16 +128,17 @@ where
     let state = resumed(journal.state());
 
     let (inbound_tx, mut inbound) = mpsc::channel(64);
-    session::spawn(
+    let session = session::spawn(
         monitor.socket_request(&cookies, exam_id)?,
         1,
         inbound_tx.clone(),
         timing.liveness,
     );
     let hello = hello(config.device_id, config.instance_id, state);
-    let (link, sync) = timeout(timing.liveness.silence, first_sync(&mut inbound, hello))
-        .await
-        .map_err(|_| ExamError::WebSocket(None))??;
+    let (link, sync, received_at) =
+        timeout(timing.liveness.silence, first_sync(&mut inbound, hello))
+            .await
+            .map_err(|_| ExamError::WebSocket(None))??;
     let ServerMessage::Sync {
         recording_policy, ..
     } = &sync
@@ -157,6 +158,7 @@ where
     });
     let mut runtime = Runtime {
         exam_id,
+        oj_user_id,
         device_id: config.device_id,
         instance_id: config.instance_id,
         monitor,
@@ -169,6 +171,7 @@ where
         inbound,
         requests,
         view: view_tx,
+        session: Some(session),
         link: Some(link),
         generation: 1,
         connected: false,
@@ -181,13 +184,13 @@ where
         backoff: timing.reconnect_min,
         retry_at: None,
         start_failures: 0,
-        end_outcome: None,
         ack_deadline: None,
-        last_denial: None,
+        recent_denials: HashMap::new(),
         done: false,
-        storage_failed: false,
+        storage_retry_at: None,
+        sent_through: 0,
     };
-    runtime.handle_message(sync).await;
+    runtime.handle_message(sync, received_at).await;
     if state.execution == ExecutionState::Finished {
         // Nothing is left to report; keep no connection to an ended exam.
         runtime.done = true;
@@ -206,18 +209,24 @@ where
 async fn first_sync(
     inbound: &mut mpsc::Receiver<Inbound>,
     hello: ClientMessage,
-) -> Result<(mpsc::Sender<ClientMessage>, ServerMessage), ExamError> {
+) -> Result<(mpsc::Sender<ClientMessage>, ServerMessage, Instant), ExamError> {
     let link = match inbound.recv().await {
         Some(Inbound::Opened(_, link)) => link,
         Some(Inbound::Closed(_, error)) => return Err(error.unwrap_or(ExamError::WebSocket(None))),
         _ => return Err(ExamError::WebSocket(None)),
     };
-    link.send(hello)
-        .await
+    link.try_send(hello)
         .map_err(|_| ExamError::WebSocket(None))?;
     match inbound.recv().await {
-        Some(Inbound::Message(_, sync @ ServerMessage::Sync { .. })) => Ok((link, sync)),
-        Some(Inbound::Message(_, ServerMessage::Error { code, .. })) => Err(code_error(&code)),
+        Some(Inbound::Message {
+            message: sync @ ServerMessage::Sync { .. },
+            received_at,
+            ..
+        }) => Ok((link, sync, received_at)),
+        Some(Inbound::Message {
+            message: ServerMessage::Error { code, .. },
+            ..
+        }) => Err(code_error(&code)),
         Some(Inbound::Closed(_, Some(error))) => Err(error),
         _ => Err(ExamError::WebSocket(None)),
     }
@@ -274,7 +283,8 @@ struct Clock {
 
 impl Clock {
     fn now(&self) -> OffsetDateTime {
-        self.server_time + self.at.elapsed()
+        let elapsed = time::Duration::try_from(self.at.elapsed()).unwrap_or(time::Duration::MAX);
+        self.server_time.saturating_add(elapsed)
     }
 
     /// Local instant of a server time; instants in the past map to the anchor.
@@ -295,6 +305,7 @@ struct Active {
 
 struct Runtime<C> {
     exam_id: Uuid,
+    oj_user_id: i64,
     device_id: Uuid,
     instance_id: Uuid,
     monitor: Monitor,
@@ -307,6 +318,8 @@ struct Runtime<C> {
     inbound: mpsc::Receiver<Inbound>,
     requests: mpsc::Receiver<Request>,
     view: watch::Sender<ClientView>,
+    /// Dropped to cancel the session, including an in-flight handshake or send.
+    session: Option<oneshot::Sender<()>>,
     /// Outbound queue of the current session, once its handshake succeeded.
     link: Option<mpsc::Sender<ClientMessage>>,
     generation: u64,
@@ -321,24 +334,40 @@ struct Runtime<C> {
     backoff: Duration,
     retry_at: Option<Instant>,
     start_failures: u32,
-    /// Result of finishing the recording, reused when `end_exam` repeats.
-    end_outcome: Option<(CommandStatus, Option<String>)>,
     ack_deadline: Option<Instant>,
-    last_denial: Option<(String, Instant)>,
+    recent_denials: HashMap<String, Instant>,
     /// The end handshake completed; the runtime no longer reconnects.
     done: bool,
-    /// The last journal save failed; cleared by the next successful save.
-    storage_failed: bool,
+    /// Retries a failed journal save even if no further events arrive.
+    storage_retry_at: Option<Instant>,
+    /// Highest event sequence queued to the current session.
+    sent_through: u64,
 }
 
 impl<C: Capture> Runtime<C> {
     async fn run(mut self) {
+        let mut cookie_check = None;
         loop {
             self.publish();
             let deadline = self.next_deadline();
             tokio::select! {
                 request = self.requests.recv() => match request {
-                    Some(Request::Notice(notice)) => self.notice(notice).await,
+                    Some(Request::Notice(UiNotice::CookiesUpdated(cookies))) => {
+                        if !self.done {
+                            let monitor = self.monitor.clone();
+                            let (exam_id, oj_user_id) = (self.exam_id, self.oj_user_id);
+                            // Replacing the future cancels a superseded browser update.
+                            cookie_check = Some(Box::pin(async move {
+                                if monitor.enrollment(&cookies, exam_id).await? != oj_user_id {
+                                    return Err(ExamError::Auth);
+                                }
+                                Ok(cookies)
+                            }));
+                        }
+                    }
+                    Some(Request::Notice(UiNotice::NavigationDenied { target_origin })) => {
+                        self.navigation_denied(target_origin).await;
+                    }
                     Some(Request::Shutdown(reply)) => {
                         let _ = reply.send(self.stop().await);
                         return;
@@ -346,6 +375,17 @@ impl<C: Capture> Runtime<C> {
                     None => {
                         let _ = self.stop().await;
                         return;
+                    }
+                },
+                result = async {
+                    match cookie_check.as_mut() {
+                        Some(check) => check.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    cookie_check = None;
+                    if !self.done {
+                        self.apply_cookie_check(result);
                     }
                 },
                 Some(inbound) = self.inbound.recv() => self.handle_inbound(inbound).await,
@@ -363,24 +403,20 @@ impl<C: Capture> Runtime<C> {
 
     /// Writes the journal, keeping the runtime alive when the write fails.
     ///
-    /// A transient lock on the file, such as an antivirus scan, must not end
-    /// the recording. The in-memory journal stays authoritative, the next
-    /// save rewrites the whole snapshot, and anchored numbering keeps a crash
-    /// before that save from reusing a sequence number the server holds.
+    /// A successful save releases all new events in sequence order. On
+    /// failure, keep them in memory and retry the whole snapshot.
     async fn persist(&mut self) {
         match self.journal.save().await {
             Ok(()) => {
-                if self.storage_failed {
-                    self.storage_failed = false;
-                    self.last_error_code = None;
-                }
+                self.storage_retry_at = None;
+                self.flush_events().await;
+                self.send_command_result().await;
             }
             Err(error) => {
-                if !self.storage_failed {
+                if self.storage_retry_at.is_none() {
                     tracing::error!(%error, "saving the exam journal failed");
                 }
-                self.storage_failed = true;
-                self.last_error_code = Some(error_code::INTERNAL_ERROR.to_owned());
+                self.storage_retry_at = Some(Instant::now() + self.timing.retry);
             }
         }
     }
@@ -390,7 +426,13 @@ impl<C: Capture> Runtime<C> {
             exam_id: self.exam_id,
             connected: self.connected,
             state: self.state,
-            last_error_code: self.last_error_code.clone(),
+            last_error_code: if self.storage_retry_at.is_some()
+                || self.journal.has_unnumbered_events()
+            {
+                Some(error_code::INTERNAL_ERROR.to_owned())
+            } else {
+                self.last_error_code.clone()
+            },
         };
         self.view.send_if_modified(|view| {
             let changed = *view != next;
@@ -409,6 +451,7 @@ impl<C: Capture> Runtime<C> {
             self.reconnect_at,
             self.retry_at,
             self.ack_deadline,
+            self.storage_retry_at,
             command,
             self.end_deadline(),
         ]
@@ -423,7 +466,7 @@ impl<C: Capture> Runtime<C> {
             return None;
         }
         let (clock, end_at) = (self.clock?, self.end_at?);
-        Some(clock.instant_of(end_at) + END_GRACE)
+        Some(clock.instant_of(end_at.saturating_add(END_GRACE)))
     }
 
     async fn tick(&mut self) {
@@ -438,6 +481,9 @@ impl<C: Capture> Runtime<C> {
         if self.end_deadline().is_some_and(|at| at <= now) {
             self.stop_at_deadline().await;
         }
+        if self.storage_retry_at.is_some_and(|at| at <= now) {
+            self.persist().await;
+        }
         if self.retry_at.is_some_and(|at| at <= now) {
             self.retry_at = None;
             self.try_start().await;
@@ -451,46 +497,62 @@ impl<C: Capture> Runtime<C> {
         }
     }
 
-    async fn notice(&mut self, notice: UiNotice) {
-        match notice {
-            UiNotice::CookiesUpdated(cookies) => {
+    fn apply_cookie_check(&mut self, result: Result<AccodingCookies, ExamError>) {
+        match result {
+            Ok(cookies) => {
                 self.cookies = cookies;
-                if self.reconnect_at.is_some() {
+                if self.connected {
+                    self.last_error_code = None;
+                } else {
+                    self.drop_link();
                     self.backoff = self.timing.reconnect_min;
                     self.reconnect_at = Some(Instant::now());
                 }
             }
-            UiNotice::NavigationDenied { target_origin } => {
-                if self.done {
-                    // The exam is over; nothing would ever send the incident.
-                    return;
-                }
-                let detail: String = target_origin.chars().take(MAX_DETAIL_CHARS).collect();
-                let repeated = self.last_denial.as_ref().is_some_and(|(origin, at)| {
-                    *origin == detail && at.elapsed() < NAVIGATION_QUIET
-                });
-                self.last_denial = Some((detail.clone(), Instant::now()));
-                if repeated {
-                    return;
-                }
-                self.incident(IncidentCode::NavigationDenied, Some(detail))
-                    .await;
+            Err(ExamError::Auth) => {
+                self.last_error_code = Some(error_code::ACCODING_AUTH_EXPIRED.to_owned());
+            }
+            Err(ExamError::NotEnrolled) => {
+                self.last_error_code = Some(error_code::NOT_ENROLLED.to_owned());
+            }
+            Err(error) => {
+                tracing::warn!(%error, "checking updated Accoding cookies failed");
+                self.last_error_code = Some(error_code::INTERNAL_ERROR.to_owned());
             }
         }
+    }
+
+    async fn navigation_denied(&mut self, target_origin: String) {
+        if self.done || self.end_status().is_some() {
+            return;
+        }
+        self.recent_denials
+            .retain(|_, at| at.elapsed() < NAVIGATION_QUIET);
+        if self.recent_denials.contains_key(&target_origin) {
+            return;
+        }
+        let detail: String = target_origin.chars().take(MAX_DETAIL_CHARS).collect();
+        self.recent_denials.insert(target_origin, Instant::now());
+        self.incident(IncidentCode::NavigationDenied, Some(detail))
+            .await;
     }
 
     async fn handle_inbound(&mut self, inbound: Inbound) {
         match inbound {
             Inbound::Opened(generation, link) if generation == self.generation => {
                 let hello = hello(self.device_id, self.instance_id, self.state);
-                if link.send(hello).await.is_ok() {
+                if link.try_send(hello).is_ok() {
                     self.link = Some(link);
                 } else {
                     self.lose_connection(None);
                 }
             }
-            Inbound::Message(generation, message) if generation == self.generation => {
-                self.handle_message(message).await;
+            Inbound::Message {
+                generation,
+                message,
+                received_at,
+            } if generation == self.generation => {
+                self.handle_message(message, received_at).await;
             }
             Inbound::Closed(generation, error) if generation == self.generation => {
                 self.lose_connection(error);
@@ -499,7 +561,7 @@ impl<C: Capture> Runtime<C> {
         }
     }
 
-    async fn handle_message(&mut self, message: ServerMessage) {
+    async fn handle_message(&mut self, message: ServerMessage, received_at: Instant) {
         match message {
             ServerMessage::Sync {
                 server_time,
@@ -510,7 +572,8 @@ impl<C: Capture> Runtime<C> {
             } => {
                 self.clock = Some(Clock {
                     server_time,
-                    at: Instant::now(),
+                    // Recorder restoration and journal writes can delay handling.
+                    at: received_at,
                 });
                 self.end_at = Some(end_at);
                 self.connected = true;
@@ -519,11 +582,9 @@ impl<C: Capture> Runtime<C> {
                 // Commands of the previous connection are superseded.
                 self.command = None;
                 self.ack_deadline = None;
-                let resend = self.journal.anchor(ack_event_through);
+                self.journal.anchor(ack_event_through);
+                self.sent_through = ack_event_through;
                 self.persist().await;
-                for message in resend {
-                    self.send(message).await;
-                }
                 if phase == ExamPhase::Running
                     && self.state.execution == ExecutionState::Recording
                     && self.state.recording == RecordingState::Failed
@@ -538,6 +599,16 @@ impl<C: Capture> Runtime<C> {
                 name,
                 effective_at,
             } => {
+                if self
+                    .command
+                    .as_ref()
+                    .is_some_and(|active| active.id == command_id)
+                {
+                    return;
+                }
+                // An acknowledgement for the previous command must not
+                // delay the new command's result.
+                self.ack_deadline = None;
                 let due = self
                     .clock
                     .map_or_else(Instant::now, |clock| clock.instant_of(effective_at));
@@ -550,6 +621,9 @@ impl<C: Capture> Runtime<C> {
                 });
             }
             ServerMessage::CommandAck { command_id } => {
+                if self.ack_deadline.is_none() {
+                    return;
+                }
                 let Some(command) = self
                     .command
                     .take_if(|command| command.id == command_id && command.result.is_some())
@@ -570,11 +644,24 @@ impl<C: Capture> Runtime<C> {
     }
 
     async fn recorder_event(&mut self, event: RecorderEvent) {
+        if self.done
+            || self.command.as_ref().is_some_and(|command| {
+                command.name == CommandName::EndExam && command.result.is_some()
+            })
+        {
+            // The end result is the last business message of this handshake.
+            return;
+        }
         match event {
             RecorderEvent::SegmentFinalized(meta) => {
                 self.record(ExamEvent::SegmentFinalized(meta)).await;
             }
             RecorderEvent::Fault(error) => {
+                if self.state.execution == ExecutionState::Recording
+                    && self.state.recording == RecordingState::Failed
+                {
+                    return;
+                }
                 tracing::warn!(%error, "recording fault");
                 self.incident(IncidentCode::RecordingFailed, Some(error.to_string()))
                     .await;
@@ -618,11 +705,16 @@ impl<C: Capture> Runtime<C> {
                 }
             },
             CommandName::EndExam => {
-                let outcome = match self.end_outcome.clone() {
-                    Some(outcome) => outcome,
+                let status = match self.end_status() {
+                    Some(status) => {
+                        self.drain_recorder_events().await;
+                        status
+                    }
                     None => self.finish().await,
                 };
-                self.resolve(outcome.0, outcome.1).await;
+                let code = (status == CommandStatus::Failed)
+                    .then(|| error_code::RECORDING_FINISH_FAILED.to_owned());
+                self.resolve(status, code).await;
             }
             _ => {}
         }
@@ -664,24 +756,25 @@ impl<C: Capture> Runtime<C> {
         }
     }
 
+    /// The journal records the outcome and its evidence together on success.
+    fn end_status(&self) -> Option<CommandStatus> {
+        match (self.state.execution, self.state.recording) {
+            (ExecutionState::Finalizing, RecordingState::Complete) => {
+                Some(CommandStatus::Completed)
+            }
+            (ExecutionState::Finalizing, RecordingState::Failed) => Some(CommandStatus::Failed),
+            _ => None,
+        }
+    }
+
     /// Finishes the recording with bounded retries and reports the manifest.
-    async fn finish(&mut self) -> (CommandStatus, Option<String>) {
+    async fn finish(&mut self) -> CommandStatus {
         self.retry_at = None;
         self.set_state(ExecutionState::Finalizing, RecordingState::Finalizing)
             .await;
         let mut attempt = 1;
-        let outcome = loop {
+        let result = loop {
             match self.capture.finish().await {
-                Ok(manifest) => {
-                    // The save that records the manifest also records the state.
-                    let changed =
-                        self.update_state(ExecutionState::Finalizing, RecordingState::Complete);
-                    self.record(ExamEvent::RecordingFinalized(manifest)).await;
-                    if let Some(state) = changed {
-                        self.announce(state).await;
-                    }
-                    break (CommandStatus::Completed, None);
-                }
                 Err(error)
                     if attempt < self.timing.finish_attempts
                         && !matches!(error, RecordingError::NoSegments) =>
@@ -690,20 +783,39 @@ impl<C: Capture> Runtime<C> {
                     attempt += 1;
                     sleep(self.timing.retry).await;
                 }
-                Err(error) => {
-                    self.incident(IncidentCode::RecordingFailed, Some(error.to_string()))
-                        .await;
-                    self.set_state(ExecutionState::Finalizing, RecordingState::Failed)
-                        .await;
-                    break (
-                        CommandStatus::Failed,
-                        Some(error_code::RECORDING_FINISH_FAILED.to_owned()),
-                    );
-                }
+                result => break result,
             }
         };
-        self.end_outcome = Some(outcome.clone());
-        outcome
+        // Finishing may seal a segment while the runtime is awaiting the
+        // recorder. Queue its notification before the manifest and result.
+        self.drain_recorder_events().await;
+        match result {
+            Ok(manifest) => {
+                // The save that records the manifest also records the state.
+                let changed =
+                    self.update_state(ExecutionState::Finalizing, RecordingState::Complete);
+                self.record(ExamEvent::RecordingFinalized(manifest)).await;
+                if let Some(state) = changed {
+                    self.announce(state).await;
+                }
+                CommandStatus::Completed
+            }
+            Err(error) => {
+                let changed = self.update_state(ExecutionState::Finalizing, RecordingState::Failed);
+                self.incident(IncidentCode::RecordingFailed, Some(error.to_string()))
+                    .await;
+                if let Some(state) = changed {
+                    self.announce(state).await;
+                }
+                CommandStatus::Failed
+            }
+        }
+    }
+
+    async fn drain_recorder_events(&mut self) {
+        while let Ok(event) = self.recorder.try_recv() {
+            self.recorder_event(event).await;
+        }
     }
 
     /// Stops recording after `end_at + 60s` passed without `end_exam`.
@@ -725,11 +837,11 @@ impl<C: Capture> Runtime<C> {
         } else {
             RecordingState::Failed
         };
-        self.journal.clear_events();
-        self.set_state(ExecutionState::Finished, recording).await;
         self.done = true;
         self.reconnect_at = None;
         self.drop_link();
+        self.journal.clear_events();
+        self.set_state(ExecutionState::Finished, recording).await;
     }
 
     /// Fixes the result of a pending `start_exam`, if one is waiting.
@@ -746,16 +858,35 @@ impl<C: Capture> Runtime<C> {
         let Some(command) = self.command.as_mut() else {
             return;
         };
-        command.result = Some((status, error_code.clone()));
+        command.result = Some((status, error_code));
+        self.send_command_result().await;
+    }
+
+    async fn send_command_result(&mut self) {
+        let Some(command) = &self.command else {
+            return;
+        };
+        // The server can complete the exam as soon as it receives the end
+        // result. Wait for the journal to release all preceding evidence.
+        if !self.connected
+            || self.ack_deadline.is_some()
+            || (command.name == CommandName::EndExam
+                && (self.storage_retry_at.is_some() || self.journal.has_unnumbered_events()))
+        {
+            return;
+        }
+        let Some((status, error_code)) = &command.result else {
+            return;
+        };
         let message = ClientMessage::CommandResult {
             command_id: command.id,
-            status,
-            error_code,
+            status: *status,
+            error_code: error_code.clone(),
         };
+        self.send(message).await;
         if self.connected {
             self.ack_deadline = Some(Instant::now() + self.timing.ack_timeout);
         }
-        self.send(message).await;
     }
 
     async fn incident(&mut self, code: IncidentCode, detail: Option<String>) {
@@ -772,11 +903,8 @@ impl<C: Capture> Runtime<C> {
 
     /// Persists an event before sending it.
     async fn record(&mut self, event: ExamEvent) {
-        let message = self.journal.append(event);
+        self.journal.append(event);
         self.persist().await;
-        if let Some(message) = message {
-            self.send(message).await;
-        }
     }
 
     async fn set_state(&mut self, execution: ExecutionState, recording: RecordingState) {
@@ -820,13 +948,45 @@ impl<C: Capture> Runtime<C> {
         let Some(link) = &self.link else {
             return;
         };
-        if link.send(message).await.is_err() {
+        if !matches!(
+            timeout_at(self.send_deadline(), link.send(message)).await,
+            Ok(Ok(()))
+        ) {
             self.lose_connection(None);
         }
     }
 
+    /// The whole replay shares one budget so a long queue cannot monopolize
+    /// the runtime even when the socket occasionally makes progress.
+    async fn flush_events(&mut self) {
+        if !self.connected {
+            return;
+        }
+        let Some(link) = &self.link else {
+            return;
+        };
+        let deadline = self.send_deadline();
+        let result = timeout_at(deadline, async {
+            for (seq, message) in self.journal.messages_after(self.sent_through) {
+                link.send(message).await?;
+                self.sent_through = seq;
+            }
+            Ok::<_, mpsc::error::SendError<ClientMessage>>(())
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            self.lose_connection(None);
+        }
+    }
+
+    fn send_deadline(&self) -> Instant {
+        let budget = Instant::now() + self.timing.liveness.heartbeat;
+        self.end_deadline().map_or(budget, |end| budget.min(end))
+    }
+
     fn drop_link(&mut self) {
         self.link = None;
+        self.session = None;
         self.connected = false;
         self.ack_deadline = None;
         // Reports of the closed session are ignored from now on.
@@ -856,12 +1016,14 @@ impl<C: Capture> Runtime<C> {
         self.reconnect_at = None;
         self.generation += 1;
         match self.monitor.socket_request(&self.cookies, self.exam_id) {
-            Ok(request) => session::spawn(
-                request,
-                self.generation,
-                self.inbound_tx.clone(),
-                self.timing.liveness,
-            ),
+            Ok(request) => {
+                self.session = Some(session::spawn(
+                    request,
+                    self.generation,
+                    self.inbound_tx.clone(),
+                    self.timing.liveness,
+                ));
+            }
             Err(error) => self.lose_connection(Some(error)),
         }
     }

@@ -109,7 +109,14 @@ fn the_socket_request_targets_the_exam_and_carries_the_session() {
 
 #[test]
 fn only_http_origins_are_accepted() {
-    for base in ["ftp://monitor.example.org/", "data:text/plain,monitor"] {
+    for base in [
+        "ftp://monitor.example.org/",
+        "data:text/plain,monitor",
+        "https://monitor.example.org/path",
+        "https://monitor.example.org/?query",
+        "https://monitor.example.org/#fragment",
+        "https://user:password@monitor.example.org/",
+    ] {
         assert!(Monitor::new(Url::parse(base).unwrap()).is_err(), "{base}");
     }
 }

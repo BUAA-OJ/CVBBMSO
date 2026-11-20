@@ -22,6 +22,7 @@ const MAX_EXAM_LIST_BYTES: usize = 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// HTTP client and endpoint addresses of one monitor server.
+#[derive(Clone)]
 pub(crate) struct Monitor {
     base: Url,
     http: Client,
@@ -33,7 +34,14 @@ impl Monitor {
     /// `base` must be an `http` or `https` URL with a host; the public entry
     /// point additionally requires `https`.
     pub(crate) fn new(base: Url) -> Result<Self, ExamError> {
-        if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
+        if !matches!(base.scheme(), "http" | "https")
+            || base.host_str().is_none()
+            || base.path() != "/"
+            || base.query().is_some()
+            || base.fragment().is_some()
+            || !base.username().is_empty()
+            || base.password().is_some()
+        {
             return Err(ExamError::Http(None));
         }
         let http = Client::builder()

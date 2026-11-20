@@ -1,6 +1,6 @@
 use cvbbmso_protocol::{
-    ClientIncident, ClientMessage, ClientState, ExamEvent, ExecutionState, IncidentCode,
-    RecordingManifest, RecordingState, SegmentMeta, Sha256Digest,
+    ClientIncident, ClientState, ExamEvent, ExecutionState, IncidentCode, RecordingManifest,
+    RecordingState, SegmentMeta, Sha256Digest,
 };
 use time::OffsetDateTime;
 
@@ -47,18 +47,8 @@ fn manifest() -> ExamEvent {
     )
 }
 
-fn seqs(messages: &[ClientMessage]) -> Vec<u64> {
-    messages
-        .iter()
-        .map(|message| match message {
-            ClientMessage::Event { seq, .. } => *seq,
-            other => panic!("unexpected message {other:?}"),
-        })
-        .collect()
-}
-
-fn seq_of(message: Option<ClientMessage>) -> Option<u64> {
-    message.map(|message| seqs(&[message])[0])
+fn seqs(journal: &Journal) -> Vec<u64> {
+    journal.messages_after(0).map(|(seq, _)| seq).collect()
 }
 
 async fn open(dir: &tempfile::TempDir) -> Journal {
@@ -73,8 +63,9 @@ async fn events_wait_for_the_first_sync_to_be_numbered() {
     assert!(journal.append(segment(1)).is_none());
     assert!(journal.append(incident(40)).is_none());
 
-    assert_eq!(seqs(&journal.anchor(0)), [1, 2]);
-    assert_eq!(seq_of(journal.append(segment(2))), Some(3));
+    journal.anchor(0);
+    assert_eq!(seqs(&journal), [1, 2]);
+    assert_eq!(journal.append(segment(2)), Some(3));
 }
 
 #[tokio::test]
@@ -84,8 +75,9 @@ async fn a_fresh_journal_continues_after_the_server_position() {
     journal.append(segment(1));
 
     // The server already holds seq 1..=7 from a journal that was lost.
-    assert_eq!(seqs(&journal.anchor(7)), [8]);
-    assert_eq!(seq_of(journal.append(incident(50))), Some(9));
+    journal.anchor(7);
+    assert_eq!(seqs(&journal), [8]);
+    assert_eq!(journal.append(incident(50)), Some(9));
 }
 
 #[tokio::test]
@@ -97,8 +89,10 @@ async fn sync_drops_confirmed_events_and_resends_the_rest_in_order() {
         journal.append(segment(index));
     }
 
-    assert_eq!(seqs(&journal.anchor(2)), [3, 4]);
-    assert_eq!(seqs(&journal.anchor(4)), Vec::<u64>::new());
+    journal.anchor(2);
+    assert_eq!(seqs(&journal), [3, 4]);
+    journal.anchor(4);
+    assert_eq!(seqs(&journal), Vec::<u64>::new());
 }
 
 #[tokio::test]
@@ -110,8 +104,9 @@ async fn numbering_never_moves_backwards() {
     journal.append(segment(2));
 
     // A stale or lower acknowledgement must not reissue seq 1 or 2.
-    assert_eq!(seqs(&journal.anchor(0)), [1, 2]);
-    assert_eq!(seq_of(journal.append(segment(3))), Some(3));
+    journal.anchor(0);
+    assert_eq!(seqs(&journal), [1, 2]);
+    assert_eq!(journal.append(segment(3)), Some(3));
 }
 
 #[tokio::test]
@@ -120,13 +115,13 @@ async fn recovered_segments_are_not_queued_twice() {
     let mut journal = open(&dir).await;
     journal.anchor(0);
 
-    assert_eq!(seq_of(journal.append(segment(1))), Some(1));
+    assert_eq!(journal.append(segment(1)), Some(1));
     // Still pending: the original entry keeps its sequence number.
     assert!(journal.append(segment(1)).is_none());
     journal.anchor(1);
     // Already confirmed: nothing is sent again.
     assert!(journal.append(segment(1)).is_none());
-    assert_eq!(seq_of(journal.append(segment(2))), Some(2));
+    assert_eq!(journal.append(segment(2)), Some(2));
 }
 
 #[tokio::test]
@@ -144,8 +139,9 @@ async fn saved_state_survives_a_restart() {
     let mut journal = open(&dir).await;
     assert_eq!(journal.state(), capturing());
     assert!(journal.append(segment(1)).is_none());
-    assert_eq!(seqs(&journal.anchor(3)), [4, 5]);
-    assert_eq!(seq_of(journal.append(segment(2))), Some(6));
+    journal.anchor(3);
+    assert_eq!(seqs(&journal), [4, 5]);
+    assert_eq!(journal.append(segment(2)), Some(6));
 }
 
 #[tokio::test]
@@ -158,9 +154,10 @@ async fn clearing_events_keeps_numbering_and_segment_identity() {
 
     journal.clear_events();
 
-    assert_eq!(seqs(&journal.anchor(0)), Vec::<u64>::new());
+    journal.anchor(0);
+    assert_eq!(seqs(&journal), Vec::<u64>::new());
     assert!(journal.append(segment(1)).is_none());
-    assert_eq!(seq_of(journal.append(incident(60))), Some(3));
+    assert_eq!(journal.append(incident(60)), Some(3));
 }
 
 #[tokio::test]
@@ -178,11 +175,76 @@ async fn a_corrupt_snapshot_is_set_aside() {
 }
 
 #[tokio::test]
+async fn a_snapshot_with_noncontiguous_sequences_is_set_aside() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = open(&dir).await;
+    journal.anchor(0);
+    journal.append(segment(1));
+    journal.data.next_seq = Some(3);
+    journal.save().await.unwrap();
+
+    let mut journal = open(&dir).await;
+    assert!(dir.path().join(RUNTIME_DIR).join(CORRUPT_FILE).exists());
+    journal.anchor(1);
+    assert_eq!(journal.append(segment(1)), Some(2));
+}
+
+#[tokio::test]
+async fn a_completed_snapshot_requires_a_recorded_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = open(&dir).await;
+    journal.set_state(ClientState {
+        execution: ExecutionState::Finalizing,
+        recording: RecordingState::Complete,
+    });
+    journal.save().await.unwrap();
+
+    let journal = open(&dir).await;
+    assert!(dir.path().join(RUNTIME_DIR).join(CORRUPT_FILE).exists());
+    assert_eq!(journal.state().execution, ExecutionState::Ready);
+}
+
+#[tokio::test]
+async fn sequence_exhaustion_survives_reopening_without_wrapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut journal = open(&dir).await;
+    journal.append(segment(1));
+    journal.append(segment(2));
+    journal.anchor(u64::MAX - 1);
+    assert_eq!(seqs(&journal), [u64::MAX]);
+    assert!(journal.has_unnumbered_events());
+    journal.save().await.unwrap();
+
+    let mut journal = open(&dir).await;
+    assert_eq!(seqs(&journal), [u64::MAX]);
+    journal.anchor(u64::MAX);
+    assert_eq!(journal.append(segment(3)), None);
+    assert!(journal.has_unnumbered_events());
+    assert_eq!(seqs(&journal), Vec::<u64>::new());
+}
+
+#[tokio::test]
+async fn saving_does_not_follow_a_preexisting_temporary_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = open(&dir).await;
+    let unrelated = dir.path().join("unrelated");
+    std::fs::write(&unrelated, "original").unwrap();
+    let stale = dir.path().join(RUNTIME_DIR).join("journal.json.tmp");
+    std::fs::hard_link(&unrelated, &stale).unwrap();
+
+    journal.save().await.unwrap();
+
+    assert_eq!(std::fs::read_to_string(&unrelated).unwrap(), "original");
+    assert_eq!(std::fs::read_to_string(&stale).unwrap(), "original");
+    assert!(dir.path().join(RUNTIME_DIR).join(JOURNAL_FILE).is_file());
+}
+
+#[tokio::test]
 async fn the_recording_manifest_is_queued_once() {
     let dir = tempfile::tempdir().unwrap();
     let mut journal = open(&dir).await;
     journal.anchor(0);
 
-    assert_eq!(seq_of(journal.append(manifest())), Some(1));
+    assert_eq!(journal.append(manifest()), Some(1));
     assert!(journal.append(manifest()).is_none());
 }
