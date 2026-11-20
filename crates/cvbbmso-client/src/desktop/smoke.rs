@@ -41,6 +41,7 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 
 const DEADLINE: Duration = Duration::from_secs(20);
 const EXAM_TITLE: &str = "<b>Fixture exam</b>";
+const FIXTURE_USER_ID: i64 = 42;
 
 pub(super) struct FakeProbe(Mutex<VecDeque<Verdict>>);
 
@@ -72,6 +73,8 @@ pub(super) enum Case {
     Detected,
     Exam,
     GuardLoss,
+    Recording,
+    RestoredRecording,
     ExitDuringInstall,
     CleanupFailure,
 }
@@ -92,6 +95,32 @@ impl Case {
             admission.fail_shutdown();
         }
         admission
+    }
+
+    async fn check_startup_exit(
+        self,
+        app: &AppHandle,
+        ui: &WebviewWindow,
+        requests: &AtomicUsize,
+        admission: &FakeAdmission,
+        cleanup_checked: &AtomicBool,
+    ) -> Result<bool, Error> {
+        let detected = self == Self::Detected;
+        check_blocked_preflight(app, ui, requests, detected).await?;
+        if detected {
+            ui.eval("document.querySelector('#vm-quit').click()")?;
+            return Ok(true);
+        }
+        if !self.pauses_install() {
+            return Ok(false);
+        }
+        check_exit_during_install(app, ui, admission).await?;
+        if self == Self::CleanupFailure {
+            check_cleanup_failure(app, ui, admission).await?;
+            cleanup_checked.store(true, Ordering::SeqCst);
+            ui.eval("document.querySelector('#admission-exit').click()")?;
+        }
+        Ok(true)
     }
 }
 
@@ -132,25 +161,23 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
             let app = app.handle().clone();
             async_runtime::spawn(async move {
                 let exercised: Result<(), Error> = async {
-                    check_blocked_preflight(&app, &ui, &requests, detected).await?;
-                    if detected {
-                        return ui
-                            .eval("document.querySelector('#vm-quit').click()")
-                            .map_err(Into::into);
-                    }
-                    if case.pauses_install() {
-                        check_exit_during_install(&app, &ui, &admission).await?;
-                        if case == Case::CleanupFailure {
-                            check_cleanup_failure(&app, &ui, &admission).await?;
-                            checked.store(true, Ordering::SeqCst);
-                            ui.eval("document.querySelector('#admission-exit').click()")?;
-                        }
+                    if case
+                        .check_startup_exit(&app, &ui, &requests, &admission, &checked)
+                        .await?
+                    {
                         return Ok(());
                     }
                     if let Some(connections) = exam_connections {
-                        let closed =
-                            exams::exercise(&app, &ui, connections, foreign, &hits, &mut decisions)
-                                .await?;
+                        let closed = exams::exercise(
+                            case,
+                            &app,
+                            &ui,
+                            connections,
+                            foreign,
+                            &hits,
+                            &mut decisions,
+                        )
+                        .await?;
                         assert_eq!(admission.installs(), 1);
                         assert_eq!(admission.shutdowns(), 0);
                         if case == Case::GuardLoss {
@@ -191,7 +218,7 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
     result
         .try_recv()
         .map_err(|_| io::Error::other("Native desktop smoke did not complete successfully"))?;
-    if case == Case::Exam {
+    if matches!(case, Case::Exam | Case::Recording | Case::RestoredRecording) {
         check_exit_peer(&exit_peer_result)?;
     }
     println!("Desktop smoke passed.");
@@ -623,9 +650,11 @@ fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
     let mut parts = cookie.split("; ").collect::<Vec<_>>();
     parts.sort_unstable();
     let (user_id, enrolled) = match parts.as_slice() {
-        ["_aux=synthetic", "connect.sid=synthetic-v1"] => (42, false),
-        ["_aux=synthetic", "connect.sid=synthetic-v2"] => (42, true),
-        ["_aux=synthetic", "connect.sid=renewed-candidate"] if include_second_exam => (42, true),
+        ["_aux=synthetic", "connect.sid=synthetic-v1"] => (FIXTURE_USER_ID, false),
+        ["_aux=synthetic", "connect.sid=synthetic-v2"] => (FIXTURE_USER_ID, true),
+        ["_aux=synthetic", "connect.sid=renewed-candidate"] if include_second_exam => {
+            (FIXTURE_USER_ID, true)
+        }
         ["_aux=synthetic", "connect.sid=other-candidate"] if include_second_exam => (43, true),
         ["_aux=synthetic", "connect.sid=unavailable"] => {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
