@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use crate::NetworkError;
 
 pub(crate) const CAPTURE_PID: &str = "Capture PID: ";
+pub(crate) const CAPTURE_PID_DIGITS: usize = 10;
 
 /// Runs platform tools and reads or writes the files they need.
 #[cfg_attr(
@@ -221,7 +222,7 @@ fn write_capture_pid() -> std::io::Result<()> {
     let mut line = *b"Capture PID: 0000000000\n";
     // SAFETY: getpid is async-signal-safe and has no preconditions.
     let mut pid = unsafe { libc::getpid() }.unsigned_abs();
-    for digit in line[CAPTURE_PID.len()..CAPTURE_PID.len() + 10]
+    for digit in line[CAPTURE_PID.len()..CAPTURE_PID.len() + CAPTURE_PID_DIGITS]
         .iter_mut()
         .rev()
     {

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::NetworkError;
 use crate::egress::backend::{GuardBackend, InstallResult};
-use crate::egress::commands::{CAPTURE_PID, Commands};
+use crate::egress::commands::{CAPTURE_PID, CAPTURE_PID_DIGITS, Commands};
 use crate::egress::{policy::Plan, state};
 
 mod lifecycle;
@@ -341,6 +341,13 @@ fn capture_pid(contents: &str) -> Option<u32> {
         .ok()
 }
 
+fn capture_stopped_before_exec(contents: &str) -> bool {
+    CAPTURE_PID.starts_with(contents)
+        || contents.strip_prefix(CAPTURE_PID).is_some_and(|digits| {
+            digits.len() <= CAPTURE_PID_DIGITS && digits.bytes().all(|digit| digit.is_ascii_digit())
+        })
+}
+
 fn recover_with(commands: &dyn Commands) -> Result<(), NetworkError> {
     let live = commands.output(PFCTL, &["-a", ANCHOR, "-s", "rules"])?;
     let tables = commands.output(PFCTL, &["-a", ANCHOR, "-s", "Tables"])?;
@@ -395,6 +402,14 @@ fn recover_reference(commands: &dyn Commands) -> Result<(), NetworkError> {
         .map(serde_json::from_str::<BTreeSet<u64>>)
         .transpose()
         .map_err(|_| NetworkError::Io)?;
+    if journal == ENABLE_CAPTURE && capture_stopped_before_exec(&contents) {
+        // A short PID write aborts pre_exec before pfctl can acquire a reference.
+        return if commands.read(ENABLE_OWNER)?.is_none() {
+            Ok(())
+        } else {
+            Err(NetworkError::Io)
+        };
+    }
     if let Some(token) = complete_token(&contents) {
         if before
             .as_ref()
@@ -787,8 +802,51 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_capture_before_exec_clears_the_journal_and_allows_retry() {
+        for partial in [
+            "",
+            "Capture PI",
+            "Capture PID: ",
+            "Capture PID: 00000002",
+            "Capture PID: 0000000202",
+        ] {
+            let recorder = Recorder::with_file(ENABLE_CAPTURE, partial);
+            recorder.reply(REFERENCES, Ok(HOST_REFERENCE));
+            recorder.reply(&["-E"], Err(NetworkError::Io));
+            assert_eq!(enable_pf(&recorder), Err(NetworkError::Io));
+            assert_eq!(recorder.contents(ENABLE_BASELINE).as_deref(), Some("[4]"));
+
+            // The host reference is still present. Recovery should leave it
+            // alone and the next attempt should still see it as its baseline.
+            recorder.reply(REFERENCES, Ok(HOST_REFERENCE));
+            let start = recorder.calls().len();
+            assert_eq!(recover_with(&recorder), Ok(()), "{partial:?}");
+            assert!(!has_enable_record(&recorder).unwrap());
+            assert_eq!(
+                &recorder.calls()[start..],
+                [LIVE, TABLES].map(|args| Call::Output(
+                    PFCTL.to_owned(),
+                    args.iter().map(|arg| (*arg).to_owned()).collect()
+                ))
+            );
+
+            recorder.reply(REFERENCES, Ok(BOTH_REFERENCES));
+            recorder.reply(&["-E"], Ok("Token : 42\n"));
+            enable_pf(&recorder).unwrap();
+            assert_eq!(recorder.contents(ENABLE_BASELINE).as_deref(), Some("[4]"));
+            assert_eq!(read_token(&recorder).unwrap(), Some(42));
+        }
+    }
+
+    #[test]
     fn enable_timeout_with_missing_or_partial_token_keeps_unknown_references() {
-        for partial in ["", "Token : 4"] {
+        for partial in [
+            "Capture PID: 0000000202\n",
+            "Capture PID: 0000000202\nToken : 4",
+            "Capture PID: malformed",
+            "Capture PID: 00000000202",
+            "Token : 4",
+        ] {
             let recorder = Recorder::with_file(ENABLE_CAPTURE, partial);
             recorder.reply(REFERENCES, Ok(HOST_REFERENCE));
             recorder.reply(&["-E"], Err(NetworkError::Io));
@@ -806,8 +864,20 @@ mod tests {
     }
 
     #[test]
+    fn a_partial_capture_does_not_discard_conflicting_owner_evidence() {
+        let recorder = Recorder::with_file(ENABLE_CAPTURE, "Capture PID: 0000000202");
+        recorder.write(ENABLE_BASELINE, "[4]").unwrap();
+        let owner = r#"[42,{"pid":202,"process":"pfctl","earliest_start":1799999999,"latest_start":1799999999}]"#;
+        recorder.write(ENABLE_OWNER, owner).unwrap();
+
+        assert_eq!(recover_with(&recorder), Err(NetworkError::Io));
+        assert_eq!(recorder.contents(ENABLE_OWNER).as_deref(), Some(owner));
+        assert!(recorder.contents(ENABLE_CAPTURE).is_some());
+    }
+
+    #[test]
     fn an_incomplete_capture_can_be_cleared_when_no_references_remain() {
-        let recorder = Recorder::with_file(ENABLE_CAPTURE, "");
+        let recorder = Recorder::with_file(ENABLE_CAPTURE, "Capture PID: 0000000202\n");
         recorder.write(ENABLE_BASELINE, "[4]").unwrap();
         recorder.reply(REFERENCES, Ok(HOST_REFERENCE));
         assert_eq!(recover_with(&recorder), Err(NetworkError::Io));
