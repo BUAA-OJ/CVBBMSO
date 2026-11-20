@@ -143,6 +143,9 @@ function renderExamSession() {
   }
   closeExam.disabled = examBusy;
   currentExam.hidden = examView === null;
+  const needsSignIn = examView?.state.execution !== "finished"
+    && examView?.last_error_code === "ACCODING_AUTH_EXPIRED";
+  open.textContent = needsSignIn ? "重新登录 Accoding" : "打开 Accoding";
   if (!examView) {
     currentExamTitle.textContent = "";
     currentExamStatus.textContent = "";
@@ -152,11 +155,17 @@ function renderExamSession() {
   const exam = examSelection?.id === exam_id ? examSelection : exams.find(({ id }) => id === exam_id);
   currentExamTitle.textContent = exam?.title ?? exam_id;
   const status = [
-    connected ? "已连接监考服务" : "未连接监考服务",
+    connected ? "已连接监考服务" : state.execution === "finished" ? "监考连接已关闭" : "正在重连监考服务",
     executionStates.get(state.execution),
     `录像${recordingStates.get(state.recording)}`,
   ];
-  if (last_error_code) status.push(`错误 ${last_error_code}`);
+  if (needsSignIn) status.push("请用本场考试账号重新登录 Accoding。");
+  else if (last_error_code) {
+    status.push(`错误 ${last_error_code}`);
+    if (!connected && last_error_code === "INTERNAL_ERROR") {
+      status.push("可点击「检查会话」重试登录验证。");
+    }
+  }
   currentExamStatus.textContent = status.join(" · ");
 }
 

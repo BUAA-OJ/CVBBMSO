@@ -212,12 +212,16 @@ async fn open_accoding(app: AppHandle) -> Result<(), &'static str> {
 
 fn open_browser(app: &AppHandle, desktop: &Desktop) -> tauri::Result<()> {
     if let Some(existing) = app.get_webview_window(OJ) {
+        if app.state::<exam::ExamSession>().needs_sign_in() {
+            existing.navigate(desktop.login.clone())?;
+        }
         existing.show()?;
         return existing.set_focus();
     }
 
     std::fs::create_dir_all(&desktop.data_dir)?;
     let origin = desktop.login.origin();
+    let navigation_app = app.clone();
     let popup_origin = origin.clone();
     let popup_app = app.clone();
     #[cfg(test)]
@@ -237,6 +241,9 @@ fn open_browser(app: &AppHandle, desktop: &Desktop) -> tauri::Result<()> {
     .devtools(false)
     .on_navigation(move |url| {
         let allowed = permits(&origin, url);
+        if !allowed {
+            report_denied_origin(&navigation_app, &origin, url);
+        }
         #[cfg(test)]
         if !allowed && let Some(report) = &blocked {
             let _ = report.send(("navigation", url.clone()));
@@ -245,6 +252,9 @@ fn open_browser(app: &AppHandle, desktop: &Desktop) -> tauri::Result<()> {
     })
     .on_new_window(move |url, _| {
         let allowed = permits(&popup_origin, &url);
+        if !allowed {
+            report_denied_origin(&popup_app, &popup_origin, &url);
+        }
         #[cfg(test)]
         if !allowed && let Some(report) = &blocked_popup {
             let _ = report.send(("popup", url.clone()));
@@ -276,6 +286,12 @@ fn open_browser(app: &AppHandle, desktop: &Desktop) -> tauri::Result<()> {
     Ok(())
 }
 
+fn report_denied_origin(app: &AppHandle, allowed: &url::Origin, url: &Url) {
+    if let Some(sessions) = app.try_state::<exam::ExamSession>() {
+        sessions.navigation_denied(allowed, url);
+    }
+}
+
 fn read_cookies(
     browser: &WebviewWindow,
     identity: Url,
@@ -305,8 +321,14 @@ async fn inspect_session(app: AppHandle) -> Result<(), &'static str> {
     if !app.state::<Preflight>().is_admitted() {
         return Err(PREFLIGHT_BLOCKED);
     }
+    let retry = app.state::<exam::ExamSession>().cookie_retry();
     let observation = match current_cookies(&app).await {
-        Ok(_) => SessionObservation::CookieAvailable,
+        Ok(cookies) => {
+            if let Some(retry) = retry {
+                retry.submit(cookies).await;
+            }
+            SessionObservation::CookieAvailable
+        }
         Err(ReadSessionError::Invalid(AccodingError::MissingSession)) => {
             SessionObservation::CookieMissing
         }

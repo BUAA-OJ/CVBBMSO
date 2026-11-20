@@ -3,23 +3,27 @@ use std::{
     future::pending,
     io::{self, Read, Write},
     path::Path,
+    time::Duration,
 };
 
-use cvbbmso_accoding::AccodingError;
-use cvbbmso_exam::{ClientView, Exam, ExamConfig, ExamError, ExamHandle};
-use cvbbmso_protocol::error_code;
+use cvbbmso_accoding::{AccodingCookies, AccodingError};
+use cvbbmso_exam::{ClientView, Exam, ExamConfig, ExamError, ExamHandle, UiNotice};
+use cvbbmso_protocol::{ExecutionState, error_code};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, EventTarget, Manager, RunEvent, State, async_runtime};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
+    time::sleep,
 };
+use url::{Origin, Url};
 use uuid::Uuid;
 
 use super::{Desktop, ReadSessionError, UI, current_cookies};
-use crate::{monitor::MonitorError, preflight::Preflight};
+use crate::{monitor::MonitorError, policy::denied_target_origin, preflight::Preflight};
 
 const STATUS_EVENT: &str = "cvbbmso-status";
+const COOKIE_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -137,6 +141,7 @@ pub(super) struct ExamSession {
     requests: mpsc::Sender<Request>,
     snapshot: watch::Receiver<Option<ClientView>>,
     exit: watch::Sender<Exit>,
+    notices: watch::Sender<Option<mpsc::Sender<Notice>>>,
 }
 
 impl ExamSession {
@@ -144,12 +149,35 @@ impl ExamSession {
         let (requests, incoming) = mpsc::channel(8);
         let (publish, snapshot) = watch::channel(None);
         let (exit, exiting) = watch::channel(Exit::Running);
+        let (notices, _) = watch::channel(None);
         app.manage(Self {
             requests,
             snapshot,
             exit,
+            notices,
         });
         async_runtime::spawn(run(app.clone(), incoming, publish, exiting, Uuid::new_v4()));
+    }
+
+    pub(super) fn needs_sign_in(&self) -> bool {
+        self.snapshot.borrow().as_ref().is_some_and(|view| {
+            view.state.execution != ExecutionState::Finished
+                && view.last_error_code.as_deref() == Some(error_code::ACCODING_AUTH_EXPIRED)
+        })
+    }
+
+    pub(super) fn cookie_retry(&self) -> Option<CookieRetry> {
+        self.notices.borrow().clone().map(CookieRetry)
+    }
+
+    pub(super) fn navigation_denied(&self, allowed: &Origin, url: &Url) {
+        let current = self.notices.borrow().clone();
+        if let Some(current) = current
+            && let Some(target_origin) = denied_target_origin(allowed, url)
+        {
+            // WebView callbacks cannot wait for the runtime's queue to drain.
+            let _ = current.try_send(Notice::Navigation(target_origin));
+        }
     }
 }
 
@@ -176,14 +204,115 @@ pub(super) fn exit_drained(app: &AppHandle) -> bool {
     *app.state::<ExamSession>().exit.borrow() == Exit::Drained
 }
 
+type ConnectedExam = (ExamHandle, AccodingCookies);
+
 struct Opening {
-    task: JoinHandle<Result<ExamHandle, ExamCommandError>>,
+    task: JoinHandle<Result<ConnectedExam, ExamCommandError>>,
     reply: Reply,
 }
 
 struct Active {
     handle: ExamHandle,
     updates: watch::Receiver<ClientView>,
+    inbox: Option<NoticeInbox>,
+}
+
+#[derive(Clone)]
+enum Notice {
+    Cookies(AccodingCookies),
+    Navigation(String),
+}
+
+pub(super) struct CookieRetry(mpsc::Sender<Notice>);
+
+impl CookieRetry {
+    pub(super) async fn submit(self, cookies: AccodingCookies) {
+        // The sender belongs to the session that was active before the read.
+        let _ = self.0.send(Notice::Cookies(cookies)).await;
+    }
+}
+
+impl From<Notice> for UiNotice {
+    fn from(notice: Notice) -> Self {
+        match notice {
+            Notice::Cookies(cookies) => Self::CookiesUpdated(cookies),
+            Notice::Navigation(target_origin) => Self::NavigationDenied { target_origin },
+        }
+    }
+}
+
+struct NoticeInbox {
+    incoming: mpsc::Receiver<Notice>,
+    pending: Option<Notice>,
+}
+
+impl NoticeInbox {
+    fn start(app: &AppHandle, initial: AccodingCookies) -> Self {
+        let (outgoing, incoming) = mpsc::channel(16);
+        app.state::<ExamSession>()
+            .notices
+            .send_replace(Some(outgoing.clone()));
+        tokio::spawn(sample_cookies(app.clone(), initial, outgoing));
+        Self {
+            incoming,
+            pending: None,
+        }
+    }
+
+    async fn deliver(&mut self, handle: &ExamHandle) {
+        if self.pending.is_none() {
+            self.pending = self.incoming.recv().await;
+        }
+        let Some(notice) = self.pending.clone() else {
+            return pending().await;
+        };
+        // Keep the notice in the inbox if the actor's select cancels this send.
+        let _ = handle.notify(notice.into()).await;
+        self.pending = None;
+    }
+}
+
+async fn forward_notice(delivery: Option<(&ExamHandle, &mut NoticeInbox)>) {
+    match delivery {
+        Some((handle, inbox)) => inbox.deliver(handle).await,
+        None => pending().await,
+    }
+}
+
+async fn sample_cookies(app: AppHandle, mut last: AccodingCookies, outgoing: mpsc::Sender<Notice>) {
+    loop {
+        let observed = tokio::select! {
+            biased;
+            () = outgoing.closed() => return,
+            result = async {
+                sleep(COOKIE_SAMPLE_INTERVAL).await;
+                current_cookies(&app).await
+            } => result,
+        };
+        if let Ok(cookies) = observed
+            && !same_cookies(&last, &cookies)
+        {
+            last = cookies.clone();
+            if outgoing.send(Notice::Cookies(cookies)).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+fn same_cookies(previous: &AccodingCookies, observed: &AccodingCookies) -> bool {
+    fn ordered_pairs(header: &[u8]) -> Vec<&[u8]> {
+        let mut pairs: Vec<_> = header
+            .split(|byte| *byte == b';')
+            .map(<[u8]>::trim_ascii)
+            .collect();
+        // Preserve the precedence of duplicate names from different cookie paths.
+        pairs.sort_by_key(|pair| pair.split(|byte| *byte == b'=').next());
+        pairs
+    }
+    let previous = previous.header_value();
+    let observed = observed.header_value();
+    previous == observed || ordered_pairs(previous.as_bytes()) == ordered_pairs(observed.as_bytes())
 }
 
 async fn run(
@@ -195,14 +324,21 @@ async fn run(
 ) {
     let mut opening: Option<Opening> = None;
     let mut active: Option<Active> = None;
+    let sessions = app.state::<ExamSession>();
     loop {
+        let (view_updates, delivery) = active.as_mut().map_or((None, None), |active| {
+            (
+                Some(&mut active.updates),
+                active.inbox.as_mut().map(|inbox| (&active.handle, inbox)),
+            )
+        });
         tokio::select! {
             biased;
             _ = exit.changed() => {
                 let requested = *exit.borrow();
                 if let Exit::Requested(code) = requested {
-                    let result = clear(&mut opening, &mut active, &snapshot).await;
-                    app.state::<ExamSession>().exit.send_replace(Exit::Drained);
+                    let result = clear(&sessions, &mut opening, &mut active, &snapshot).await;
+                    sessions.exit.send_replace(Exit::Drained);
                     app.exit(if result.is_err() && code == 0 { 1 } else { code });
                 }
                 return;
@@ -218,30 +354,41 @@ async fn run(
                     });
                 }
                 Some(Request::Close(reply)) => {
-                    let _ = reply.send(clear(&mut opening, &mut active, &snapshot).await);
+                    let _ = reply.send(clear(&sessions, &mut opening, &mut active, &snapshot).await);
                 }
                 None => {
-                    let _ = clear(&mut opening, &mut active, &snapshot).await;
+                    let _ = clear(&sessions, &mut opening, &mut active, &snapshot).await;
                     return;
                 }
             },
             result = joining(&mut opening) => {
                 if let Some(Opening { reply, .. }) = opening.take() {
-                    let result = result.map(|handle| {
+                    let result = result.map(|(handle, cookies)| {
                         let mut updates = handle.subscribe();
                         let view = updates.borrow_and_update().clone();
-                        active = Some(Active { handle, updates });
+                        let inbox = (view.state.execution != ExecutionState::Finished)
+                            .then(|| NoticeInbox::start(&app, cookies));
+                        active = Some(Active { handle, updates, inbox });
                         publish(&app, &snapshot, view);
                     });
                     let _ = reply.send(result);
                 }
             }
-            view = next_view(&mut active) => publish(&app, &snapshot, view),
+            view = next_view(view_updates) => {
+                if view.state.execution == ExecutionState::Finished
+                    && let Some(active) = &mut active
+                {
+                    sessions.notices.send_replace(None);
+                    active.inbox = None;
+                }
+                publish(&app, &snapshot, view);
+            }
+            () = forward_notice(delivery) => {}
         }
     }
 }
 
-async fn joining(opening: &mut Option<Opening>) -> Result<ExamHandle, ExamCommandError> {
+async fn joining(opening: &mut Option<Opening>) -> Result<ConnectedExam, ExamCommandError> {
     match opening {
         Some(opening) => (&mut opening.task)
             .await
@@ -250,26 +397,33 @@ async fn joining(opening: &mut Option<Opening>) -> Result<ExamHandle, ExamComman
     }
 }
 
-async fn next_view(active: &mut Option<Active>) -> ClientView {
-    if let Some(active) = active
-        && active.updates.changed().await.is_ok()
+async fn next_view(updates: Option<&mut watch::Receiver<ClientView>>) -> ClientView {
+    if let Some(updates) = updates
+        && updates.changed().await.is_ok()
     {
-        return active.updates.borrow_and_update().clone();
+        return updates.borrow_and_update().clone();
     }
     pending().await
 }
 
 async fn clear(
+    sessions: &ExamSession,
     opening: &mut Option<Opening>,
     active: &mut Option<Active>,
     snapshot: &watch::Sender<Option<ClientView>>,
 ) -> Result<(), ExamCommandError> {
+    sessions.notices.send_replace(None);
     snapshot.send_replace(None);
     let handle = if let Some(opening) = opening.take() {
         let _ = opening.reply.send(Err(ExamCommandError::SessionClosed));
         // Finish an in-flight open before releasing the slot, so a new open
         // cannot overlap journal or recorder recovery for the same candidate.
-        opening.task.await.ok().and_then(Result::ok)
+        opening
+            .task
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|(handle, _)| handle)
     } else {
         active.take().map(|active| active.handle)
     };
@@ -310,7 +464,7 @@ async fn connect(
     app: AppHandle,
     exam_id: Uuid,
     instance_id: Uuid,
-) -> Result<ExamHandle, ExamCommandError> {
+) -> Result<ConnectedExam, ExamCommandError> {
     let desktop = app.state::<Desktop>();
     let monitor = desktop.monitor.as_ref().map_err(|error| match error {
         MonitorError::Configuration => ExamCommandError::MonitorUnconfigured,
@@ -336,8 +490,9 @@ async fn connect(
         device_id,
         instance_id,
     };
-    Exam::connect(config, exam_id, cookies)
+    Exam::connect(config, exam_id, cookies.clone())
         .await
+        .map(|handle| (handle, cookies))
         .map_err(ExamCommandError::from)
 }
 

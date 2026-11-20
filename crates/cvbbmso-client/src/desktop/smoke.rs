@@ -61,16 +61,7 @@ pub(super) fn run(detected: bool, exam_identity: Option<PathBuf>) -> tauri::Resu
     let exam_smoke = exam_identity.is_some();
     let app = builder()
         .setup(move |app| {
-            let deployed = Desktop::deployed(data_dir.clone(), None)?;
-            assert!(matches!(deployed.monitor, Err(MonitorError::Configuration)));
-            for invalid in ["", "http://monitor.example.org"] {
-                assert!(
-                    Desktop::deployed(data_dir.clone(), Some(invalid)).is_err_and(|error| error
-                        .downcast_ref::<io::Error>()
-                        .is_some_and(|error| error.kind() == io::ErrorKind::InvalidInput))
-                );
-            }
-            println!("Missing monitor configuration is allowed; invalid origins fail startup.");
+            let deployed = check_deployment(&data_dir)?;
             let requests = Arc::new(AtomicUsize::new(0));
             let (fixture, foreign, hits) =
                 async_runtime::block_on(start_fixture(requests.clone()))?;
@@ -106,7 +97,9 @@ pub(super) fn run(detected: bool, exam_identity: Option<PathBuf>) -> tauri::Resu
                             .map_err(Into::into);
                     }
                     if let Some(connections) = exam_connections {
-                        let closed = exams::exercise(&app, &ui, connections).await?;
+                        let closed =
+                            exams::exercise(&app, &ui, connections, foreign, &hits, &mut decisions)
+                                .await?;
                         exit_peer.send(closed)?;
                     } else {
                         exercise(&app, &ui, &deployed, &base, foreign, &hits, &mut decisions)
@@ -156,23 +149,45 @@ pub(super) fn run(detected: bool, exam_identity: Option<PathBuf>) -> tauri::Resu
     }
 }
 
+fn check_deployment(data_dir: &Path) -> Result<Desktop, Box<dyn std::error::Error>> {
+    let deployed = Desktop::deployed(data_dir.to_path_buf(), None)?;
+    assert!(matches!(deployed.monitor, Err(MonitorError::Configuration)));
+    for invalid in ["", "http://monitor.example.org"] {
+        assert!(
+            Desktop::deployed(data_dir.to_path_buf(), Some(invalid)).is_err_and(|error| error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::InvalidInput))
+        );
+    }
+    println!("Missing monitor configuration is allowed; invalid origins fail startup.");
+    Ok(deployed)
+}
+
 fn start_monitor(
     requests: Arc<AtomicUsize>,
     exam_identity: Option<&Path>,
-) -> io::Result<(Monitor, Option<mpsc::Receiver<exams::Connection>>)> {
+) -> io::Result<(Monitor, Option<exams::Fixture>)> {
     let exam_smoke = exam_identity.is_some();
+    let auth = Arc::new(exams::Auth::new());
+    let http_auth = auth.clone();
     let router = Router::new().route(
         "/api/exams",
         get(move |headers: HeaderMap| {
             let requests = requests.clone();
+            let auth = http_auth.clone();
             async move {
                 requests.fetch_add(1, Ordering::Relaxed);
-                exam_list(&headers, exam_smoke)
+                if exam_smoke {
+                    auth.enrollment(&headers)
+                } else {
+                    exam_list(&headers, false)
+                }
             }
         }),
     );
     let (addr, cert, connections) = if let Some(identity) = exam_identity {
-        let (addr, cert, connections) = async_runtime::block_on(exams::serve(router, identity))?;
+        let (addr, cert, connections) =
+            async_runtime::block_on(exams::serve(router, identity, auth))?;
         (addr, cert, Some(connections))
     } else {
         let (addr, cert, _) = async_runtime::block_on(tls::serve(router));
@@ -196,13 +211,10 @@ async fn start_fixture(
     let hits = Arc::new(AtomicUsize::new(0));
     let counter = hits.clone();
     tokio::spawn(async move {
-        let router = Router::new().route(
-            "/",
-            get(move || async move {
-                counter.fetch_add(1, Ordering::Relaxed);
-                Html("<title>Unexpected origin</title>")
-            }),
-        );
+        let router = Router::new().fallback(move || async move {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Html("<title>Unexpected origin</title>")
+        });
         axum::serve(foreign, router).await.unwrap();
     });
     tokio::spawn(async move {
@@ -240,6 +252,14 @@ async fn start_fixture(
                         Html("<title>Fixture updated</title>"),
                     )
                 }),
+            )
+            .route(
+                "/relogin/{mode}",
+                get(
+                    |axum::extract::Path(mode): axum::extract::Path<String>| async move {
+                        fixture_relogin(&mode)
+                    },
+                ),
             )
             .route(
                 "/expired",
@@ -283,6 +303,25 @@ async fn start_fixture(
     Ok((fixture_addr, foreign_addr, hits))
 }
 
+fn fixture_relogin(mode: &str) -> Response {
+    let (cookie, page) = match mode {
+        "other" => (
+            "connect.sid=other-candidate; Path=/; HttpOnly",
+            "<title>Fixture other candidate</title>",
+        ),
+        "same" => (
+            "connect.sid=renewed-candidate; Path=/; HttpOnly",
+            "<title>Fixture renewed candidate</title>",
+        ),
+        "empty" => (
+            "connect.sid=; Path=/; Max-Age=0; HttpOnly",
+            "<title>Fixture session cleared</title>",
+        ),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    ([(header::SET_COOKIE, cookie)], Html(page)).into_response()
+}
+
 fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
     let cookie = headers
         .get(header::COOKIE)
@@ -290,20 +329,11 @@ fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
         .unwrap_or_default();
     let mut parts = cookie.split("; ").collect::<Vec<_>>();
     parts.sort_unstable();
-    let items = match parts.as_slice() {
-        ["_aux=synthetic", "connect.sid=synthetic-v1"] => vec![],
-        ["_aux=synthetic", "connect.sid=synthetic-v2"] => {
-            let start_at = OffsetDateTime::from_unix_timestamp(1_797_729_600).unwrap();
-            let end_at = OffsetDateTime::from_unix_timestamp(1_797_733_200).unwrap();
-            let summary = |id, title: &str| {
-                ExamSummary::new(id, title.into(), start_at, end_at, ExamPhase::Scheduled).unwrap()
-            };
-            let mut items = vec![summary(exams::FIRST, EXAM_TITLE)];
-            if include_second_exam {
-                items.push(summary(exams::SECOND, "Second fixture exam"));
-            }
-            items
-        }
+    let (user_id, enrolled) = match parts.as_slice() {
+        ["_aux=synthetic", "connect.sid=synthetic-v1"] => (42, false),
+        ["_aux=synthetic", "connect.sid=synthetic-v2"] => (42, true),
+        ["_aux=synthetic", "connect.sid=renewed-candidate"] if include_second_exam => (42, true),
+        ["_aux=synthetic", "connect.sid=other-candidate"] if include_second_exam => (43, true),
         ["_aux=synthetic", "connect.sid=unavailable"] => {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
@@ -315,8 +345,25 @@ fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
         }
         _ => return StatusCode::UNAUTHORIZED.into_response(),
     };
+    let start_at = OffsetDateTime::from_unix_timestamp(1_797_729_600).unwrap();
+    let end_at = OffsetDateTime::from_unix_timestamp(1_797_733_200).unwrap();
+    let summary = |id, title: &str| {
+        ExamSummary::new(id, title.into(), start_at, end_at, ExamPhase::Scheduled).unwrap()
+    };
+    let mut items = vec![];
+    if enrolled {
+        items.push(summary(exams::FIRST, EXAM_TITLE));
+        if include_second_exam {
+            items.push(summary(exams::SECOND, "Second fixture exam"));
+        }
+    }
     Json(ExamListResponse {
-        user: AccodingUser::new(42, "test-student".into(), "Test Student".into()).unwrap(),
+        user: AccodingUser::new(
+            user_id,
+            format!("test-student-{user_id}"),
+            "Test Student".into(),
+        )
+        .unwrap(),
         items,
     })
     .into_response()
