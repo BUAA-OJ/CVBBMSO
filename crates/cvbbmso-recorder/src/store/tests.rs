@@ -114,6 +114,45 @@ fn ignores_a_video_without_metadata() {
 }
 
 #[test]
+fn keeps_an_unsealed_video_before_reusing_its_index() {
+    let directory = TempDir::new().expect("temp dir");
+    let mut current = store(&directory);
+    write_video(&current, 1, b"old unsealed video");
+
+    let meta = current
+        .write_segment(b"abc", timestamp(0), timestamp(30))
+        .expect("seal");
+
+    assert_eq!(meta.index, 1);
+    assert_eq!(meta.sha256.as_str(), ABC_DIGEST);
+    let orphan = fs::read_dir(segments_dir(&directory))
+        .expect("segments")
+        .map(|entry| entry.expect("entry").path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "orphan")
+        })
+        .expect("preserved orphan");
+    assert_eq!(
+        fs::read(orphan).expect("preserved video"),
+        b"old unsealed video"
+    );
+    assert_eq!(fs::read(current.video_path(1)).expect("new video"), b"abc");
+}
+
+#[test]
+fn exclusive_ownership_follows_the_last_live_store() {
+    let directory = TempDir::new().expect("temp dir");
+    let current = store(&directory);
+    let worker_store = current.clone();
+    drop(current);
+
+    assert!(SegmentStore::open(directory.path()).is_err());
+    drop(worker_store);
+    assert!(SegmentStore::open(directory.path()).is_ok());
+}
+
+#[test]
 fn fails_on_unreadable_metadata() {
     let directory = TempDir::new().expect("temp dir");
     let mut store = store(&directory);

@@ -14,6 +14,19 @@ use crate::RecordingError;
 use crate::container::{MkvFile, Mp4Writer};
 
 impl SegmentStore {
+    /// The first sealed track defines the format a resumed capture must use.
+    pub(crate) fn existing_video_layout(
+        &self,
+    ) -> Result<Option<(u32, u32, crate::container::AvcConfig)>, RecordingError> {
+        self.segments
+            .first_key_value()
+            .map(|(_, meta)| {
+                let file = self.parse_segment(meta)?;
+                Ok((file.width, file.height, file.config))
+            })
+            .transpose()
+    }
+
     /// Merges every sealed segment into `final.mp4` and returns its digest.
     ///
     /// Segments are concatenated in media order: the first sample of a segment

@@ -45,9 +45,20 @@ pub(crate) struct SampledFrame {
 ///
 /// Rejects invalid policies before opening the backend. Returns platform capture
 /// failures and sink failures unchanged. The caller handles reporting the fault.
+#[cfg(test)]
 pub(crate) fn run(
     policy: RecordingPolicy,
     stopped: &AtomicBool,
+    sink: impl FnMut(SampledFrame) -> Result<ControlFlow<()>, RecordingError>,
+) -> Result<(), RecordingError> {
+    run_started(policy, stopped, || {}, sink)
+}
+
+/// Runs the desktop sampler, announcing when the capture backend is ready.
+pub(crate) fn run_started(
+    policy: RecordingPolicy,
+    stopped: &AtomicBool,
+    started: impl FnOnce(),
     sink: impl FnMut(SampledFrame) -> Result<ControlFlow<()>, RecordingError>,
 ) -> Result<(), RecordingError> {
     RecordingPolicy::new(policy.segment_duration_secs, policy.fps)
@@ -58,6 +69,7 @@ pub(crate) fn run(
         return Ok(());
     }
     let mut desktop = Desktop::open(fps.get())?;
+    started();
     let mut clock = MonotonicClock(Instant::now());
     sample(&mut desktop, &mut clock, fps, stopped, sink)
 }

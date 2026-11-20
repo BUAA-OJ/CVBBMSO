@@ -1,7 +1,6 @@
 //! H.264 encoding of captured frames.
 
-// `Recorder::start` reaches this module once the capture pipeline is wired; the
-// platform probe exercises it until then.
+// Some accessors are used by only one platform adapter or its hardware probes.
 #![allow(dead_code)]
 
 #[cfg(windows)]
@@ -11,31 +10,10 @@ mod windows;
 mod macos;
 
 #[cfg(windows)]
-#[allow(unused_imports)] // Wired into `Recorder::start` with the encoding milestone.
-pub(crate) use windows::{DEFAULT_BITRATE, Encoder, available_encoders};
+pub(crate) use windows::{DEFAULT_BITRATE, Encoder};
 
 #[cfg(target_os = "macos")]
-#[allow(unused_imports)] // Wired into `Recorder::start` with the encoding milestone.
-pub(crate) use macos::{DEFAULT_BITRATE, Encoder, available_encoders};
-
-#[cfg(not(any(windows, target_os = "macos")))]
-#[allow(unused_imports)] // Wired into `Recorder::start` with the encoding milestone.
-pub(crate) use unsupported::available_encoders;
-
-#[cfg(not(any(windows, target_os = "macos")))]
-mod unsupported {
-    use crate::RecordingError;
-
-    /// Reports the encoders Media Foundation offers for the recording policy.
-    ///
-    /// # Errors
-    ///
-    /// Always returns [`RecordingError::Encoder`]: this crate has no encoder for
-    /// the current platform.
-    pub(crate) fn available_encoders() -> Result<Vec<String>, RecordingError> {
-        Err(RecordingError::Encoder(None))
-    }
-}
+pub(crate) use macos::{DEFAULT_BITRATE, Encoder};
 
 /// Reusable, top-down NV12 frame with BT.709 limited-range samples.
 ///
