@@ -20,3 +20,9 @@ pub fn permits(origin: &Origin, url: &Url) -> bool {
         && url.username().is_empty()
         && url.password().is_none()
 }
+
+pub fn denied_target_origin(allowed: &Origin, url: &Url) -> Option<String> {
+    let target = url.origin();
+    (matches!(target, Origin::Tuple(..)) && &target != allowed)
+        .then(|| target.ascii_serialization())
+}

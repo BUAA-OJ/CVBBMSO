@@ -6,7 +6,7 @@ mod cookie_scope;
 mod policy;
 
 use cookie_scope::matches_cookie;
-use policy::{IDENTITY_URL, LOGIN_URL, permits, server_origin};
+use policy::{IDENTITY_URL, LOGIN_URL, denied_target_origin, permits, server_origin};
 use url::Url;
 
 #[test]
@@ -46,6 +46,27 @@ fn monitor_configuration_accepts_only_an_https_origin() {
         "https://monitor.example.org/#anchor",
     ] {
         assert!(server_origin(invalid).is_none(), "{invalid}");
+    }
+}
+
+#[test]
+fn denied_navigation_reports_only_a_distinct_tuple_origin() {
+    let allowed = Url::parse(LOGIN_URL).unwrap().origin();
+    let target =
+        Url::parse("https://user:private@EXAMPLE.org:8443/private?token=value#anchor").unwrap();
+    assert_eq!(
+        denied_target_origin(&allowed, &target).as_deref(),
+        Some("https://example.org:8443")
+    );
+    for target in [
+        LOGIN_URL,
+        "mailto:user@example.org",
+        "data:text/html,private",
+    ] {
+        assert_eq!(
+            denied_target_origin(&allowed, &Url::parse(target).unwrap()),
+            None
+        );
     }
 }
 
