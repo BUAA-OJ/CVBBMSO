@@ -61,7 +61,7 @@ pub(crate) struct Desktop {
     // first. The handler is also retained by the stream for its callbacks.
     stream: Retained<SCStream>,
     // Kept alive because `ScreenCaptureKit` does not retain stream outputs.
-    handler: Retained<StreamHandler>,
+    _handler: Retained<StreamHandler>,
     // The sample handler queue outlives every callback it dispatches.
     _queue: dispatch2::DispatchRetained<DispatchQueue>,
     // The stream and its dispatch queue are used from the creating thread.
@@ -173,7 +173,7 @@ impl Desktop {
         Ok(Self {
             slot,
             stream,
-            handler,
+            _handler: handler,
             _queue: queue,
             _thread: std::marker::PhantomData,
         })

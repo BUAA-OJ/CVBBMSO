@@ -1,18 +1,18 @@
 //! Sealed segment files of one candidate recording.
 
-// Sealing is driven by the capture pipeline, which lands with the platform
-// milestone; until then the sealing path is reached only from tests.
-#![allow(dead_code)]
-
+mod lock;
 mod merge;
 mod recovery;
 
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use cvbbmso_protocol::{ProtocolError, RecordingManifest, SegmentMeta, Sha256Digest};
@@ -43,7 +43,7 @@ const HASH_BUFFER_SIZE: usize = 64 * 1024;
 /// a normal segment is only a few megabytes. This bound leaves ample room for
 /// hardware encoders that overshoot the target or for longer rotations while
 /// keeping the whole-file parse from buffering an arbitrary artifact.
-const MAX_SEGMENT_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_SEGMENT_BYTES: u64 = 512 * 1024 * 1024;
 /// Upper bound on the bytes read into memory for one segment metadata file.
 ///
 /// `SegmentMeta` is a fixed record of about 150 serialized bytes. 64 KiB leaves
@@ -86,6 +86,8 @@ pub(crate) struct SegmentStore {
     segments: BTreeMap<u32, SegmentMeta>,
     limits: ReadLimits,
     temporary: PathBuf,
+    // Store snapshots keep the directory owned while a blocking task is live.
+    _lock: Arc<File>,
 }
 
 impl SegmentStore {
@@ -106,6 +108,7 @@ impl SegmentStore {
         let recording_dir = candidate_dir.join(RECORDING_DIR);
         let segments_dir = recording_dir.join(SEGMENTS_DIR);
         fs::create_dir_all(&segments_dir)?;
+        let lock = Arc::new(lock::open(&recording_dir.join(".lock"))?);
         // Temporary files are not removed here. A merge task may still be
         // writing one, and an interrupted attempt's file must never be adopted
         // or truncated by recovery.
@@ -127,6 +130,7 @@ impl SegmentStore {
             segments,
             limits,
             temporary,
+            _lock: lock,
         })
     }
 
@@ -134,6 +138,12 @@ impl SegmentStore {
     #[must_use]
     pub(crate) fn segments(&self) -> Vec<SegmentMeta> {
         self.segments.values().cloned().collect()
+    }
+
+    /// Recovers the disk state if a capture worker could not return its store.
+    pub(crate) fn refresh(mut self) -> Result<Self, RecordingError> {
+        self.segments = recovery::recover(&self.segments_dir(), self.limits.segment_metadata)?;
+        Ok(self)
     }
 
     /// Path of the merged recording.
@@ -165,6 +175,33 @@ impl SegmentStore {
         self.segments_dir().join(file_name(index, VIDEO_EXTENSION))
     }
 
+    /// Saves a complete MKV and publishes its metadata as the commit marker.
+    pub(crate) fn write_segment(
+        &mut self,
+        bytes: &[u8],
+        start_at: OffsetDateTime,
+        end_at: OffsetDateTime,
+    ) -> Result<SegmentMeta, RecordingError> {
+        let index = self.next_index();
+        self.require_unsealed(index)?;
+        if bytes.len() as u64 > self.limits.segment_video {
+            return Err(invalid_input("encoded segment exceeds the read limit"));
+        }
+        let video = self.video_path(index);
+        preserve_unsealed_video(&video)?;
+        let mut file = create_exclusive(&video)?;
+        let saved = file.write_all(bytes).and_then(|()| file.sync_all());
+        drop(file);
+        let result = saved
+            .map_err(RecordingError::from)
+            .and_then(|()| self.seal(index, start_at, end_at));
+        if result.is_err() {
+            // Only remove the unpublished video created by this call.
+            let _ = fs::remove_file(&video);
+        }
+        result
+    }
+
     /// Seals the finished video file of `index` and persists its metadata.
     ///
     /// The caller must have finished writing the video file. The digest is
@@ -181,6 +218,16 @@ impl SegmentStore {
         start_at: OffsetDateTime,
         end_at: OffsetDateTime,
     ) -> Result<SegmentMeta, RecordingError> {
+        self.require_unsealed(index)?;
+        let digest = hash_file(&self.video_path(index))?;
+        let meta = SegmentMeta::new(index, start_at, end_at, digest).map_err(rejected_segment)?;
+        let json = serde_json::to_vec(&meta).map_err(io::Error::other)?;
+        write_atomically(&self.meta_path(index), &json)?;
+        self.segments.insert(index, meta.clone());
+        Ok(meta)
+    }
+
+    fn require_unsealed(&self, index: u32) -> Result<(), RecordingError> {
         let next = self.next_index();
         if index != next {
             return Err(invalid_input(format!(
@@ -188,15 +235,11 @@ impl SegmentStore {
             )));
         }
         // A sealed segment is evidence: never publish over an existing one.
-        if self.meta_path(index).try_exists()? {
-            return Err(invalid_input(format!("segment {index} is already sealed")));
+        match fs::symlink_metadata(self.meta_path(index)) {
+            Ok(_) => Err(invalid_input(format!("segment {index} is already sealed"))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
         }
-        let digest = hash_file(&self.video_path(index))?;
-        let meta = SegmentMeta::new(index, start_at, end_at, digest).map_err(rejected_segment)?;
-        let json = serde_json::to_vec(&meta).map_err(io::Error::other)?;
-        write_atomically(&self.meta_path(index), &json)?;
-        self.segments.insert(index, meta.clone());
-        Ok(meta)
     }
 
     /// Builds the manifest of the sealed segments.
@@ -223,13 +266,52 @@ fn file_name(index: u32, extension: &str) -> String {
 
 /// Publishes `bytes` at `path` by writing a sibling temporary file first.
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), RecordingError> {
-    let temporary = path.with_extension(TEMP_EXTENSION);
-    let mut file = File::create(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    let (temporary, mut file) = loop {
+        let temporary = sibling(path, TEMP_EXTENSION);
+        match create_exclusive(&temporary) {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let saved = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
-    fs::rename(&temporary, path)?;
-    Ok(())
+    let published = saved.and_then(|()| fs::hard_link(&temporary, path));
+    let _ = fs::remove_file(&temporary);
+    published.map_err(RecordingError::from)
+}
+
+fn create_exclusive(path: &Path) -> io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{}.{sequence}.{suffix}", std::process::id()));
+    PathBuf::from(name)
+}
+
+/// Keeps legacy or crash-left videos while making their unsealed index reusable.
+fn preserve_unsealed_video(video: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(video) {
+        Ok(meta) if !meta.is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsealed video path is not a regular file",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    loop {
+        match fs::hard_link(video, sibling(video, "orphan")) {
+            Ok(()) => return fs::remove_file(video),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Reads `path` into memory, failing when it holds more than `limit` bytes.

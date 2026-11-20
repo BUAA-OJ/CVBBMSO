@@ -104,11 +104,11 @@ stateDiagram-v2
     Opened --> Capturing: start
     Capturing --> Capturing: 分片封存 / SegmentFinalized
     Capturing --> Opened: stop / 封存当前片段
-    Capturing --> Finalizing: finish
+    Capturing --> Opened: finish / 停止并封存
     Opened --> Finalizing: finish / 恢复后收尾
     Finalizing --> Complete: 生成 RecordingManifest
     Capturing --> Failed: Fault
-    Finalizing --> Failed: Fault / finish 失败
+    Finalizing --> Failed: finish 返回错误
     Failed --> Capturing: start / 重试
     Failed --> Finalizing: finish / 收尾已有分片
     Failed --> Opened: stop / 丢弃未封存片段
@@ -125,7 +125,7 @@ stateDiagram-v2
 
 ## M3 私有采样与原始帧验收
 
-私有 `capture::run` 是同步的采样线程入口，由专用线程调用；后端在同一线程内创建、使用和销毁，以保持 COM 线程归属。它接收 `RecordingPolicy`、停止标志及同步帧消费者。编码器与 `Recorder::start/stop` 的流水线集成属于 M4/M5；本阶段通过独立硬件测试验收采样器。
+私有 `capture::run` 是同步的采样线程入口，由专用线程调用；后端在同一线程内创建、使用和销毁，以保持 COM 线程归属。它接收 `RecordingPolicy`、停止标志及同步帧消费者。原始帧测试可以单独验收采样器，正式录制由 M5 接入编码和封存。
 
 - 按单调时间的绝对采样点执行，每个 `fps` 定义的采样槽至多交付一帧；采样点按有理数计算并向上取整到纳秒，避免 15 fps 等帧率的累计舍入漂移。
 - 消费者同步处理当前帧，不维护积压队列。采集或消费落后时跳过已过去的采样槽，不突发补帧。时间戳取本次发起取帧时的实际单调时间，相对采样开始计算，不使用 GPU 拷贝或消费者处理完成的时间；分片封存仍单独记录实际 UTC 起止时间。
@@ -167,6 +167,26 @@ Windows 的 `set_color_attributes` 设置 `MF_MT_YUV_MATRIX = BT709`、`MF_MT_VI
 
 硬件验收测试 `encodes_frames_into_an_elementary_stream` 用真实 MFT 编码十帧、写入 MKV 并重新解析；`merges_encoded_segments_into_a_movie` 进一步把两个真实编码分片合并为 MP4。两者均默认忽略；编码结果的第三方可播放性应在桌面环境用 ffprobe 或播放器人工确认。
 
+## M5 正式录制与分片轮转
+
+`open` 验证并保留 `RecordingPolicy`。同一个 `recording/` 目录由一个实例独占，录制和合并任务在运行期间持有相同的文件锁。进程结束会释放锁。旧版目录无需迁移，既有分片仍按原文件名和哈希恢复。
+
+`start` 等到平台采集初始化成功后返回。首帧到达时创建 H.264 编码器，录制中的采集、编码或封存错误通过 `Fault` 通知运行时。采样频率取策略的 `fps`。BGRA 样本转为 BT.709 limited-range NV12，奇数宽高在右边或底边补黑像素。主显示器尺寸在同一次录制中变化时报告采集故障，已封存分片保留。
+
+以一段首个采样点为起点，当下一帧达到 `segment_duration_secs` 时轮转。录制线程排空并销毁前段的编码器，再用新编码器接收轮转后的第一帧。前段的延迟样本仍写入前段，新段请求关键帧并检查首个输出样本含有 IDR。继续录制时核对编码尺寸和 AVC 配置与已封存分片一致。Windows Media Foundation 会对已排空的编码器恢复输入提出额外要求，因此每段使用独立编码器。[Microsoft 的排空说明](https://learn.microsoft.com/en-us/windows/win32/medfound/mft-message-command-drain)
+
+封存先保存并同步完整 MKV，计算哈希，随后独占发布同编号 JSON。JSON 是封存标记。异常退出若留下只有 MKV 的旧文件，再次使用该序号前会把旧文件保存在同目录的 `*.orphan` 中。已封存分片、旧文件和其他写入者的临时文件均不得覆盖。进程故障或采集错误只会舍弃当前尚未封存的分片。下一次录制从最后一个已封存序号继续。
+
+`stop` 先请求采样线程停止，再等待编码器排空和当前分片封存。排空或封存失败时，等待停录的方法返回错误。取消等待时仍保留停止请求和任务，下一次调用继续等待同一结果。`finish` 停录后合并已封存分片，重复成功调用返回同一摘要。公开事件接收端保持有界。通道满时，分片元信息按序等待转发，停录、封存和合并可以继续。结束流程应以返回的 manifest 补齐尚未消费的分片事件，并按序号去重。
+
+合成帧验收通过公开 `Recorder` 方法走采样后的完整路径，覆盖跨段封存与 MP4 合并。需要运行平台编码器时，可显式执行以下测试。
+
+```sh
+cargo test -p cvbbmso-recorder --locked records_synthetic_frames_across_rotation_with_the_native_encoder -- --ignored
+```
+
+设置 `CVBBMSO_RECORDER_TEST_MP4` 可将合成帧 MP4 写到指定文件用于独立解码。该测试使用合成帧，不读取屏幕。
+
 ## M6 合并与最终产物
 
 `finish` 按 `index` 升序读取已封存分片，合并为单视频轨 MP4：
@@ -176,7 +196,7 @@ Windows 的 `set_color_attributes` 设置 `MF_MT_YUV_MATRIX = BT709`、`MF_MT_VI
 - 样本按媒体顺序拼接：每段先以该段首帧时间戳为零点归一化，下一分片的首帧紧接上一分片末帧之后，缺口不会在最终视频中形成冻结画面，非零起点也不会产生额外停顿。实际 UTC 起止时间仍由分片元信息承担证据职责。
 - 最后一段的尾帧时长显式传给 MP4 写入器：取该段最后两个样本的间隔，单帧分片取 1 ms；`stts`、`mdhd`、`mvhd` 共用同一时长。
 - MP4 由私有写入器直接生成：`ftyp`、`moov`（`mvhd`、单 `trak`、`avc1` + `avcC` + `colr`、`stts`、`stsc`、`stsz`、`stss`，偏移表按大小选择 `stco` 或 `co64`）与 `mdat`。`colr` 使用 BT.709 limited-range 的 `nclx`；样本沿用四字节长度前缀，正好匹配 `avcC` 的 `lengthSizeMinusOne = 3`。MKV 分片的视频轨同样写 `Colour`，其中包含矩阵、范围、原色和居中色度位置。
-- 每次 `open` 为后续合并生成独有的同目录临时文件名 `final.mp4.<pid>.<sequence>.tmp`；合并用 `create_new` 独占创建该文件，绝不截断或覆盖已有文件，写入并同步后再重命名为 `final.mp4`。本次尝试失败时只删除它自己创建的文件，不把半成品发布为最终文件；`open` 不清理临时文件，避免删除仍在写入的文件，崩溃遗留的临时文件不进入 manifest，下次合并使用新的文件名。跨进程互斥、父目录权限和完整文件系统防护留待 M5 接线时评估。分片清单为空时仍由 `finish` 返回 `NoSegments`。
+- 每次 `open` 为后续合并生成独有的同目录临时文件名 `final.mp4.<pid>.<sequence>.tmp`；合并用 `create_new` 独占创建该文件，绝不截断或覆盖已有文件，写入并同步后再重命名为 `final.mp4`。本次尝试失败时只删除它自己创建的文件，不把半成品发布为最终文件；`open` 不清理临时文件，避免删除仍在写入的文件，崩溃遗留的临时文件不进入 manifest，下次合并使用新的文件名。合并任务在持有 M5 目录锁期间发布最终文件。分片清单为空时仍由 `finish` 返回 `NoSegments`。
 - `finish` 在 `spawn_blocking` 中完成解析、哈希、写盘与最终文件哈希，避免在 Tokio worker 上执行长磁盘操作；成功后将 manifest 缓存，后续调用返回同一摘要。合并产生的临时文件不进入 manifest。
 - 合并任务由 `Recorder` 的 `Finalizing` 状态持有。取消 `finish` 的等待只取消当前等待，不丢弃任务或结果；后续 `finish` 等待同一个任务，成功后返回缓存摘要，失败被观察并进入 `Failed` 后才允许新一轮尝试。`stop` 不丢弃进行中的合并，因此不会因等待超时或重试产生两个同时写入同一临时文件的合并。调用方须在完成收尾前保留同一个 `Recorder`；直接销毁 recorder 不能强制终止已经运行的 blocking I/O。
 - 恢复旧分片时，合并输出同时为 `avcC` 与样本内 SPS 补齐居中色度 VUI。样本大小表和实际 `mdat` 使用同一修补规则；原 MKV/JSON 字节及封存哈希不变。缺少色度 VUI 的旧分片可合并；畸形或不支持的 SPS、错误的 NAL 长度前缀返回 `Merge`，不能发布色度位置不明确的最终文件。
