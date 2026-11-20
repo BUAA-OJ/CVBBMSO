@@ -27,6 +27,7 @@ use url::Url;
 use uuid::Uuid;
 
 pub use error::ExamError;
+pub use monitor::Monitor;
 
 use crate::runtime::{Launch, Request, Timing};
 
@@ -107,10 +108,7 @@ impl Exam {
         exam_id: Uuid,
         cookies: AccodingCookies,
     ) -> Result<ExamHandle, ExamError> {
-        if config.server_base.scheme() != "https" {
-            return Err(ExamError::Http(None));
-        }
-        let monitor = monitor::Monitor::new(config.server_base.clone())?;
+        let monitor = Monitor::new(config.server_base.clone(), None)?;
         let oj_user_id = monitor.enrollment(&cookies, exam_id).await?;
         runtime::launch(
             Launch {
