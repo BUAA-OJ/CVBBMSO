@@ -109,6 +109,7 @@ impl Case {
         check_blocked_preflight(app, ui, requests, detected).await?;
         if detected {
             ui.eval("document.querySelector('#vm-quit').click()")?;
+            confirm_close(ui).await?;
             return Ok(true);
         }
         if !self.pauses_install() {
@@ -119,6 +120,7 @@ impl Case {
             check_cleanup_failure(app, ui, admission).await?;
             cleanup_checked.store(true, Ordering::SeqCst);
             ui.eval("document.querySelector('#admission-exit').click()")?;
+            confirm_close(ui).await?;
         }
         Ok(true)
     }
@@ -189,7 +191,7 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
                         check_admission_retry(&ui, &admission).await?;
                         exercise(&app, &ui, &base, foreign, &hits, &mut decisions).await?;
                     }
-                    ui.close().map_err(Into::into)
+                    check_close_confirmation(&ui, &admission).await
                 }
                 .await;
                 if let Err(error) = exercised {
@@ -375,6 +377,7 @@ async fn check_exit_during_install(
     )
     .await?;
     ui.close()?;
+    confirm_close(ui).await?;
     wait_for(
         ui,
         "document.querySelector('#admission-status').textContent.includes('关闭客户端')",
@@ -384,6 +387,7 @@ async fn check_exit_during_install(
     assert!(!exam::exit_drained(app));
     assert_eq!(admission.shutdowns(), 0);
     ui.close()?;
+    confirm_close(ui).await?;
     wait_for(
         ui,
         "document.querySelector('#admission-status').textContent.includes('关闭客户端')",
@@ -689,6 +693,41 @@ fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
         items,
     })
     .into_response()
+}
+
+async fn confirm_close(ui: &WebviewWindow) -> Result<(), Error> {
+    wait_for(
+        ui,
+        "document.querySelector('#exit-confirmation').open",
+        "exit confirmation",
+    )
+    .await?;
+    ui.eval("document.querySelector('#confirm-exit').click()")?;
+    Ok(())
+}
+
+async fn check_close_confirmation(
+    ui: &WebviewWindow,
+    admission: &FakeAdmission,
+) -> Result<(), Error> {
+    ui.close()?;
+    wait_for(
+        ui,
+        "document.querySelector('#exit-confirmation').open",
+        "exit confirmation",
+    )
+    .await?;
+    assert_eq!(admission.shutdowns(), 0);
+    ui.eval("document.querySelector('#exit-confirmation button').click()")?;
+    wait_for(
+        ui,
+        "!document.querySelector('#exit-confirmation').open",
+        "exit cancellation",
+    )
+    .await?;
+    assert_eq!(admission.shutdowns(), 0);
+    ui.close()?;
+    confirm_close(ui).await
 }
 
 async fn evaluate(window: &WebviewWindow, script: &str) -> Result<Value, Error> {
@@ -997,6 +1036,7 @@ async fn check_ipc(ui: &WebviewWindow, oj: &WebviewWindow) -> Result<(), Error> 
                 invoke("open_exam", { exam_id: "00000000-0000-0000-0000-000000000010" }),
                 invoke("get_exam_status"),
                 invoke("close_exam"),
+                invoke("confirm_exit"),
                 invoke("plugin:event|listen", {
                     event: "accoding-session",
                     target: { kind: "Any" },

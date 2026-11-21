@@ -1,4 +1,25 @@
 const { core, event, window: tauriWindow } = window.__TAURI__;
+const exitConfirmation = document.querySelector("#exit-confirmation");
+const confirmExit = document.querySelector("#confirm-exit");
+const exitError = document.querySelector("#exit-error");
+await event.listen("confirm-exit", () => {
+  if (!exitConfirmation.open) {
+    exitError.hidden = true;
+    exitConfirmation.showModal();
+  }
+});
+confirmExit.addEventListener("click", async () => {
+  confirmExit.disabled = true;
+  try {
+    await core.invoke("confirm_exit");
+    exitConfirmation.close();
+  } catch {
+    exitError.textContent = "无法退出客户端，请重试。";
+    exitError.hidden = false;
+  } finally {
+    confirmExit.disabled = false;
+  }
+});
 const preflight = document.querySelector("#vm-preflight");
 const vmStatus = document.querySelector("#vm-status");
 const vmDiagnostic = document.querySelector("#vm-diagnostic");

@@ -152,6 +152,7 @@ fn builder() -> tauri::Builder<Wry> {
             exam::open_exam,
             exam::get_exam_status,
             exam::close_exam,
+            confirm_exit,
         ])
         .on_window_event(|window, event| {
             #[cfg(target_os = "macos")]
@@ -163,7 +164,11 @@ fn builder() -> tauri::Builder<Wry> {
                 match window.label() {
                     UI => {
                         api.prevent_close();
-                        window.app_handle().exit(0);
+                        let _ = window.app_handle().emit_to(
+                            EventTarget::webview(UI),
+                            "confirm-exit",
+                            (),
+                        );
                     }
                     // Keep the current page and session cookies in the existing WebView.
                     OJ if window.hide().is_ok() => api.prevent_close(),
@@ -171,6 +176,15 @@ fn builder() -> tauri::Builder<Wry> {
                 }
             }
         })
+}
+
+#[tauri::command]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Tauri injects the application handle by value"
+)]
+fn confirm_exit(app: AppHandle) {
+    app.exit(0);
 }
 
 fn build_ui(app: &AppHandle) -> tauri::Result<WebviewWindow> {

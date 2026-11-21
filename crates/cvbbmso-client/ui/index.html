@@ -56,5 +56,14 @@
         </div>
       </div>
     </main>
+    <dialog id="exit-confirmation" aria-labelledby="exit-heading" aria-describedby="exit-description">
+      <h2 id="exit-heading">确定退出客户端？</h2>
+      <p id="exit-description">退出将断开监考连接，并停止当前录像。</p>
+      <form method="dialog" class="actions">
+        <button type="submit" autofocus>取消</button>
+        <button id="confirm-exit" type="button">确定退出</button>
+      </form>
+      <p id="exit-error" role="status" hidden></p>
+    </dialog>
   </body>
 </html>
