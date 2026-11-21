@@ -11,7 +11,7 @@ messages are written in English.
 Keep this file general. Implementation decisions belong in the crate document
 and in code comments, not here.
 
-## 1. Compatibility Policy
+## Compatibility Policy
 
 Do not add backward-compatibility logic for an old feature unless the user
 explicitly requests it, or the feature is explicitly documented as already
@@ -32,7 +32,7 @@ document in the same change. If removing a path would require a data migration
 for users already in production, treat that as a deployment decision and
 confirm it with the user first.
 
-## 2. Development Standards
+## Development Standards
 
 Write idiomatic Rust and keep the design boring.
 
@@ -68,7 +68,7 @@ Write idiomatic Rust and keep the design boring.
 - **Keep changes scoped.** Do not refactor unrelated code, rename public items,
   or reformat untouched files in the same change.
 
-## 3. Error Handling
+## Error Handling
 
 - Public APIs return typed errors, never strings or boxed trait objects.
   Convert to a dynamic error only at the binary boundary.
@@ -83,7 +83,7 @@ Write idiomatic Rust and keep the design boring.
   carry transport status codes or user-facing copy; that mapping belongs to
   the caller.
 
-## 4. Testing
+## Testing
 
 - Unit tests live next to the code in `#[cfg(test)]` modules; integration
   tests live in a dedicated tests directory of the package.
@@ -98,7 +98,7 @@ Write idiomatic Rust and keep the design boring.
   platform is unavailable.
 - A bug fix includes a regression test that fails before the fix.
 
-## 5. Toolchain, Formatting, and Lints
+## Toolchain, Formatting, and Lints
 
 - Keep the Rust toolchain pinned in `rust-toolchain.toml`; local builds and CI
   use the same release. Update `Cargo.toml` and the CI workflow together when
@@ -114,7 +114,7 @@ Write idiomatic Rust and keep the design boring.
 - Public items must be documented, including panics, errors, and blocking
   behavior.
 
-## 6. Git
+## Git
 
 - Use Conventional Commits with English subjects, for example
   `feat(server): reject expired cookies` or
@@ -124,7 +124,7 @@ Write idiomatic Rust and keep the design boring.
 - CI must enforce formatting, lints, tests, cross-platform compilation checks,
   and dependency auditing.
 
-## 7. Validation Commands
+## Validation Commands
 
 Run the smallest relevant checks after changes:
 
