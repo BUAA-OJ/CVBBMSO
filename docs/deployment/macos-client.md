@@ -6,15 +6,15 @@
 
 客户端在普通会话完成前置检查，再通过 `SMAppService` 注册随应用签名的 LaunchDaemon。系统需要批准时，在「系统设置 → 通用 → 登录项与扩展」允许 CVBBMSO 的后台服务，回客户端重试。服务核对调用方的签名，使用同一版本内置的 Accoding 和监考 HTTPS 来源。守卫成功安装并通过内核规则检查后，客户端才能继续准入。启动前应退出旧客户端或另一场会话。
 
-`edu.buaa.accoding.cvbbmso.egress` 是签名标识、launchd 标签和 XPC Mach 服务名。plist 位于 `Contents/Library/LaunchDaemons`，执行文件位于 `/Applications/CVBBMSO.app/Contents/MacOS/cvbbmso-egress-service`。launchd 按 Team ID、签名标识和 Developer ID 类型执行 SpawnConstraint，签名校验也覆盖 App 封存和 helper。系统授权后，daemon 在 root 保护的 `/Library/Application Support/com.cvbbmso` 内保存验签且与运行中代码匹配的恢复副本。watchdog 和恢复任务从这份副本启动，方便应用更新、崩溃或 XPC 断开后的清理。[Apple launchd 启动约束](https://developer.apple.com/documentation/security/applying-launch-environment-and-library-constraints)
+`edu.buaa.accoding.cvbbmso.egress` 是签名标识、launchd 标签和 XPC Mach 服务名。plist 位于 `Contents/Library/LaunchDaemons`，执行文件位于 `/Applications/CVBBMSO.app/Contents/MacOS/cvbbmso-egress-service`。launchd 按 Team ID、签名标识和 Developer ID 类型执行 SpawnConstraint，签名校验也覆盖 App 封存和 helper。系统授权后，daemon 在 root 保护的 `/Library/Application Support/com.cvbbmso` 内保存验签且与运行中代码匹配的恢复副本。副本版本不匹配时原子替换。daemon 确认副本支持 V2 租约后，为看门狗和 launchd 恢复任务分配同一个独立代次，登记后才改变主 PF 规则。两个恢复进程均从这份副本启动。[Apple launchd 启动约束](https://developer.apple.com/documentation/security/applying-launch-environment-and-library-constraints)
 
 ### PF 与恢复
 
-应用优先使用已加载且符合 Network 契约的 `com.cvbbmso.egress` 入口。自动激活限于已匹配的 macOS 原始规则和当前未启用的 PF。服务检查启用引用、规则、表和状态。对原厂启动规则，Apple 的 AirDrop 和应用防火墙调度入口可保留，实际子规则必须为空。对空内核规则集，只加入 CVBBMSO 入口。两种情况均先经 `pfctl -n` 解析，再只加载过滤段。系统配置文件继续由宿主维护。正常退出时，服务先清空自己的规则和表，释放自己的 PF 引用，再尝试恢复原过滤段。异常退出还由看门狗及租约负责清理。每次更新和关停由持有守卫的 XPC 会话独占。
+应用优先使用已加载且符合 Network 契约的双向 `anchor "com.cvbbmso.egress"` 入口。自动激活限于已匹配的 macOS 原始规则和当前未启用的 PF。服务检查启用引用、规则、表和状态。对原厂启动规则，Apple 的 AirDrop 和应用防火墙调度入口可保留，实际子规则必须为空。对空内核规则集，只加入 CVBBMSO 入口。两种情况均先经 `pfctl -n` 解析，再只加载过滤段。系统配置文件继续由宿主维护。正常退出时，服务先清空自己的规则和表，释放自己的 PF 引用，再尝试恢复原过滤段。异常退出还由看门狗及租约负责清理。每次更新和关停由持有守卫的 XPC 会话独占。
 
-发现自定义 PF、规则变化或未知参考状态时，准入暂停。已有宿主 PF 管理流程的机器，应由管理员按[旧部署手册](../../deploy/macos-egress/README.md)配置兼容入口，保留宿主策略。PF 与其它管理程序之间没有公开的原子比较并替换接口，自动激活前后都检查快照。管理员应在宿主策略更新完成后再启动客户端。
+发现自定义 PF、规则变化或未知参考状态时，准入暂停。管理员应按宿主 PF 流程，将旧的 `out` 或 `out quick` 入口替换为[双向入口](../../deploy/macos-egress/README.md)，先确认旧守卫已退出，再检查新规则并加载。PF 与其它管理程序之间没有公开的原子比较并替换接口，自动激活前后都检查快照。管理员应在宿主策略更新完成后再启动客户端。
 
-如果其他服务启用 PF 或规则在会话期间变化，清理先处理 CVBBMSO 的专用规则与启用引用。无法证明原规则可安全恢复时保留退出后的空入口以及 `/Library/Application Support/com.cvbbmso/managed-pf.v1`。管理员可检查恢复记录和宿主管理规则，按宿主流程恢复。退出客户端并确认守卫已清理后，再移除应用或在系统设置中停用后台服务。旧版管理员配置的固定 helper 和 PF 入口继续适用。
+如果其他服务启用 PF 或规则在会话期间变化，清理先处理 CVBBMSO 的专用规则与启用引用。无法证明原规则可安全恢复时保留退出后的空入口以及 `/Library/Application Support/com.cvbbmso/managed-pf.v1`。管理员可检查恢复记录和宿主管理规则，按宿主流程恢复。从旧版升级时，新版只在持有受保护的 `managed-pf.v1` 且内核规则精确匹配旧版自动配置的空闲快照时，才会撤除旧的自动 `out` 入口。若无法核实，保留记录，由管理员按宿主流程恢复后重试。退出客户端并确认守卫及恢复任务已清理后，再移除应用或在系统设置中停用后台服务。
 
 ## 构建和核验 DMG
 

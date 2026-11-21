@@ -21,8 +21,9 @@ anchor "com.apple/*"
 load anchor "com.apple" from "/etc/pf.anchors/com.apple""#;
 const STOCK_FILTER: &str = "scrub-anchor \"com.apple/*\"\nanchor \"com.apple/*\"\n";
 const MANAGED_FILTER: &str =
-    "scrub-anchor \"com.apple/*\"\nanchor \"com.cvbbmso.egress\" out\nanchor \"com.apple/*\"\n";
+    "scrub-anchor \"com.apple/*\"\nanchor \"com.cvbbmso.egress\"\nanchor \"com.apple/*\"\n";
 const LIVE_SCRUB: &str = "scrub-anchor \"com.apple/*\" all fragment reassemble";
+const LEGACY_ROOT_RULE: &str = "anchor \"com.cvbbmso.egress\" out all";
 const LIVE_APPLE: &str = "anchor \"com.apple/*\" all";
 const LIVE_NAT: &[&str] = &[
     "nat-anchor \"com.apple/*\" all",
@@ -41,7 +42,7 @@ impl Stock {
             (Self::Boot, false) => STOCK_FILTER,
             (Self::Boot, true) => MANAGED_FILTER,
             (Self::Empty, false) => "",
-            (Self::Empty, true) => "anchor \"com.cvbbmso.egress\" out\n",
+            (Self::Empty, true) => "anchor \"com.cvbbmso.egress\"\n",
         }
     }
 }
@@ -49,7 +50,7 @@ impl Stock {
 pub(super) fn authorize(commands: &dyn Commands) -> Result<(), NetworkError> {
     if verify_deployment(commands).is_ok() {
         // The dedicated anchor itself must be reserved even on managed hosts.
-        if empty_sections(commands, ANCHOR, &["nat", "Anchors"])? {
+        if empty_sections(commands, ANCHOR, &["rules", "nat", "Tables", "Anchors"])? {
             return Ok(());
         }
         return Err(NetworkError::MacosUnsupportedPfConfiguration);
@@ -126,15 +127,19 @@ fn apple_dispatch_is_idle(commands: &dyn Commands) -> Result<bool, NetworkError>
 fn quiescent_stock(
     commands: &dyn Commands,
     stock: Stock,
-    managed: bool,
+    entry: Option<&str>,
 ) -> Result<bool, NetworkError> {
-    let (expected_rules, expected_anchors): (&[&str], &[&str]) = match (stock, managed) {
-        (Stock::Boot, false) => (&[LIVE_SCRUB, LIVE_APPLE], &["com.apple"]),
-        (Stock::Boot, true) => (&[LIVE_SCRUB, ROOT_RULE, LIVE_APPLE], &["com.apple", ANCHOR]),
-        (Stock::Empty, false) => (&[], &[]),
-        (Stock::Empty, true) => (&[ROOT_RULE], &[ANCHOR]),
-    };
-    let expected_nat = if stock == Stock::Boot { LIVE_NAT } else { &[] };
+    let apple = stock == Stock::Boot;
+    let expected_rules = apple
+        .then_some(LIVE_SCRUB)
+        .into_iter()
+        .chain(entry)
+        .chain(apple.then_some(LIVE_APPLE));
+    let expected_anchors = apple
+        .then_some("com.apple")
+        .into_iter()
+        .chain(entry.map(|_| ANCHOR));
+    let expected_nat = if apple { LIVE_NAT } else { &[] };
     let status = commands.output(PFCTL, &["-s", "info"])?;
     let references = commands.output(PFCTL, &["-s", "References"])?;
     let rules = commands.output(PFCTL, &["-s", "rules"])?;
@@ -148,13 +153,14 @@ fn quiescent_stock(
         )
         || !lines(&rules)
             .filter(|line| *line != "FILTER RULES:")
-            .eq(expected_rules.iter().copied())
-        || !lines(&anchors).eq(expected_anchors.iter().copied())
+            .eq(expected_rules)
+        || !lines(&anchors).eq(expected_anchors)
         || !lines(&commands.output(PFCTL, &["-s", "nat"])?).eq(expected_nat.iter().copied())
         || !commands.output(PFCTL, &["-s", "states"])?.trim().is_empty()
         || !commands.output(PFCTL, &["-s", "Tables"])?.trim().is_empty()
-        || (stock == Stock::Boot && !apple_dispatch_is_idle(commands)?)
-        || (managed && !empty_sections(commands, ANCHOR, &["rules", "nat", "Tables", "Anchors"])?)
+        || (apple && !apple_dispatch_is_idle(commands)?)
+        || (entry.is_some()
+            && !empty_sections(commands, ANCHOR, &["rules", "nat", "Tables", "Anchors"])?)
     {
         return Ok(false);
     }
@@ -169,9 +175,9 @@ fn activate_stock(commands: &dyn Commands) -> Result<(), NetworkError> {
     if !stock_on_disk(commands)? {
         return Err(NetworkError::MacosUnsupportedPfConfiguration);
     }
-    let stock = if quiescent_stock(commands, Stock::Boot, false)? {
+    let stock = if quiescent_stock(commands, Stock::Boot, None)? {
         Stock::Boot
-    } else if quiescent_stock(commands, Stock::Empty, false)? {
+    } else if quiescent_stock(commands, Stock::Empty, None)? {
         Stock::Empty
     } else {
         return Err(NetworkError::MacosUnsupportedPfConfiguration);
@@ -183,7 +189,7 @@ fn activate_stock(commands: &dyn Commands) -> Result<(), NetworkError> {
         return Err(NetworkError::MacosUnsupportedPfConfiguration);
     }
     commands.write(JOURNAL, stock.filter(false))?;
-    match replace_filter(commands, stock, false) {
+    match replace_filter(commands, stock, None, Some(ROOT_RULE)) {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = restore(commands);
@@ -195,21 +201,26 @@ fn activate_stock(commands: &dyn Commands) -> Result<(), NetworkError> {
 fn replace_filter(
     commands: &dyn Commands,
     stock: Stock,
-    was_managed: bool,
+    before: Option<&str>,
+    after: Option<&str>,
 ) -> Result<(), NetworkError> {
-    commands.write(FILTER_FILE, stock.filter(!was_managed))?;
+    commands.write(FILTER_FILE, stock.filter(after.is_some()))?;
     commands.run(PFCTL, &["-n", "-R", "-o", "none", "-f", FILTER_FILE])?;
     // PF has no public compare-and-swap interface for the main ruleset.
     // Recheck immediately before the filter-only transaction and never rewrite
     // an unexpected snapshot to try to recover from a competing change.
-    if !stock_on_disk(commands)? || !quiescent_stock(commands, stock, was_managed)? {
+    if !stock_on_disk(commands)? || !quiescent_stock(commands, stock, before)? {
         return Err(NetworkError::MacosUnsupportedPfConfiguration);
     }
     commands.run(PFCTL, &["-R", "-o", "none", "-f", FILTER_FILE])?;
-    if !quiescent_stock(commands, stock, !was_managed)? {
+    if !quiescent_stock(commands, stock, after)? {
         return Err(NetworkError::MacosUnsupportedPfConfiguration);
     }
     Ok(())
+}
+
+pub(super) fn has_journal(commands: &dyn Commands) -> Result<bool, NetworkError> {
+    Ok(commands.read(JOURNAL)?.is_some())
 }
 
 pub(super) fn restore(commands: &dyn Commands) -> Result<(), NetworkError> {
@@ -224,8 +235,15 @@ pub(super) fn restore(commands: &dyn Commands) -> Result<(), NetworkError> {
     if !stock_on_disk(commands)? {
         return Err(NetworkError::MacosUnsupportedPfConfiguration);
     }
-    if !quiescent_stock(commands, stock, false)? {
-        replace_filter(commands, stock, true)?;
+    if !quiescent_stock(commands, stock, None)? {
+        // Older packaged clients used an outbound-only entry. Only a saved
+        // stock baseline and an exact, idle snapshot permit its removal.
+        let entry = if quiescent_stock(commands, stock, Some(ROOT_RULE))? {
+            ROOT_RULE
+        } else {
+            LEGACY_ROOT_RULE
+        };
+        replace_filter(commands, stock, Some(entry), None)?;
     }
     commands.remove(FILTER_FILE)?;
     commands.remove(JOURNAL)
@@ -242,7 +260,7 @@ mod tests {
         recorder
     }
 
-    fn stock(recorder: &Recorder, managed: bool) {
+    fn stock(recorder: &Recorder, entry: Option<&str>) {
         recorder.reply(
             &["-a", "com.apple", "-s", "rules"],
             Ok("anchor \"200.AirDrop/*\" all\nanchor \"250.ApplicationFirewall/*\" all"),
@@ -253,15 +271,15 @@ mod tests {
         );
         recorder.reply(&["-s", "info"], Ok("Status: Disabled for 0 days"));
         recorder.reply(&["-s", "References"], Ok("No pf_enabled references"));
-        let rules = if managed {
-            format!("{LIVE_SCRUB}\n{ROOT_RULE}\n{LIVE_APPLE}\n")
+        let rules = if let Some(entry) = entry {
+            format!("{LIVE_SCRUB}\n{entry}\n{LIVE_APPLE}\n")
         } else {
             format!("{LIVE_SCRUB}\n{LIVE_APPLE}\n")
         };
         recorder.reply(&["-s", "rules"], Ok(&rules));
         recorder.reply(
             &["-s", "Anchors"],
-            Ok(if managed {
+            Ok(if entry.is_some() {
                 "  com.apple\n  com.cvbbmso.egress"
             } else {
                 "  com.apple"
@@ -273,9 +291,9 @@ mod tests {
     #[test]
     fn activates_only_filter_and_journals_the_exact_stock_baseline() {
         let recorder = stock_disk();
-        stock(&recorder, false);
-        stock(&recorder, false);
-        stock(&recorder, true);
+        stock(&recorder, None);
+        stock(&recorder, None);
+        stock(&recorder, Some(ROOT_RULE));
         assert_eq!(activate_stock(&recorder), Ok(()));
         assert_eq!(recorder.contents(JOURNAL).as_deref(), Some(STOCK_FILTER));
         assert_eq!(
@@ -290,7 +308,7 @@ mod tests {
     #[test]
     fn stops_on_host_changes_before_loading_and_keeps_recovery_evidence() {
         let recorder = stock_disk();
-        stock(&recorder, false);
+        stock(&recorder, None);
         recorder.reply(&["-s", "info"], Ok("Status: Enabled"));
         assert_eq!(
             activate_stock(&recorder),
@@ -304,11 +322,96 @@ mod tests {
     fn restores_stock_only_after_release_of_the_last_pf_reference() {
         let recorder = stock_disk();
         recorder.write(JOURNAL, STOCK_FILTER).unwrap();
-        stock(&recorder, true);
-        stock(&recorder, true);
-        stock(&recorder, false);
+        stock(&recorder, Some(ROOT_RULE));
+        stock(&recorder, Some(ROOT_RULE));
+        stock(&recorder, Some(ROOT_RULE));
+        stock(&recorder, None);
         assert_eq!(restore(&recorder), Ok(()));
         assert!(recorder.contents(JOURNAL).is_none());
+    }
+
+    #[test]
+    fn recovery_retries_the_old_managed_entry_before_retiring_its_lease() {
+        use super::super::lifecycle::recover_job;
+        use crate::egress::cleanup::Job;
+        use crate::egress::managed::RECOVERY_SERVICE;
+        use crate::egress::state::GuardState;
+
+        let recorder = stock_disk();
+        recorder.write(JOURNAL, STOCK_FILTER).unwrap();
+        state::write(&recorder, &GuardState::new(1234, None)).unwrap();
+        let job = Job::Legacy;
+        job.schedule(&recorder, RECOVERY_SERVICE).unwrap();
+
+        recorder.reply(&["-s", "Anchors"], Ok(ANCHOR));
+        for _ in 0..3 {
+            stock(&recorder, Some("pass in all"));
+        }
+        assert_eq!(
+            recover_job(&recorder, &job, true),
+            Err(NetworkError::MacosUnsupportedPfConfiguration)
+        );
+        assert!(
+            recorder
+                .calls()
+                .iter()
+                .all(|call| !matches!(call, Call::Run(_, args)
+                if args.first().is_some_and(|arg| arg == "-R" || arg == "bootout")))
+        );
+        assert_eq!(recorder.contents(JOURNAL).as_deref(), Some(STOCK_FILTER));
+        let owner = state::read(&recorder).unwrap().unwrap();
+        assert_eq!(owner.parent, 1234);
+        assert_eq!(owner.generation, None);
+        assert_eq!(Job::pending(&recorder).unwrap(), None);
+
+        recorder.reply(&["-s", "Anchors"], Ok(ANCHOR));
+        for _ in 0..3 {
+            stock(&recorder, Some(LEGACY_ROOT_RULE));
+        }
+        stock(&recorder, None);
+        assert_eq!(recover_job(&recorder, &job, true), Ok(()));
+        assert!(recorder.contents(JOURNAL).is_none());
+        assert!(state::read(&recorder).unwrap().is_none());
+        assert_eq!(Job::pending(&recorder).unwrap(), None);
+        let calls = recorder.calls();
+        let restore = calls
+            .iter()
+            .position(|call| {
+                matches!(call, Call::Run(_, args)
+            if args.first().is_some_and(|arg| arg == "-R"))
+            })
+            .unwrap();
+        let bootout = calls
+            .iter()
+            .position(|call| {
+                matches!(call, Call::Run(_, args)
+            if args.first().is_some_and(|arg| arg == "bootout"))
+            })
+            .unwrap();
+        assert!(restore < bootout);
+    }
+
+    #[test]
+    fn an_admins_outbound_only_entry_cannot_be_automatically_adopted() {
+        let recorder = stock_disk();
+        // The running PF configuration has an administrator entry without a
+        // managed journal. The installed disk files happen to be stock.
+        for _ in 0..3 {
+            stock(&recorder, Some(LEGACY_ROOT_RULE));
+        }
+        assert_eq!(restore(&recorder), Ok(()));
+        assert_eq!(verify_deployment(&recorder), Err(NetworkError::Platform));
+        assert_eq!(
+            activate_stock(&recorder),
+            Err(NetworkError::MacosUnsupportedPfConfiguration)
+        );
+        assert!(recorder.contents(JOURNAL).is_none());
+        assert!(
+            recorder
+                .calls()
+                .iter()
+                .all(|call| matches!(call, Call::Output(..)))
+        );
     }
 
     #[test]
@@ -325,7 +428,7 @@ mod tests {
     #[test]
     fn does_not_reload_if_an_apple_dispatcher_has_live_child_rules() {
         let recorder = stock_disk();
-        stock(&recorder, false);
+        stock(&recorder, None);
         recorder.reply(
             &["-a", "com.apple/200.AirDrop", "-s", "rules"],
             Ok("pass in on en0 all"),
@@ -354,7 +457,7 @@ mod tests {
         assert_eq!(recorder.contents(JOURNAL).as_deref(), Some(""));
         assert_eq!(
             recorder.contents(FILTER_FILE).as_deref(),
-            Some("anchor \"com.cvbbmso.egress\" out\n")
+            Some("anchor \"com.cvbbmso.egress\"\n")
         );
     }
 }

@@ -71,6 +71,12 @@ jobs:
         run: |
           rustc +1.88.0 -Vv
           cargo +1.88.0 check --workspace --all-targets --locked
+      - name: Test Windows filter plans without installing WFP rules
+        if: matrix.os == 'windows-latest'
+        run: cargo +1.88.0 test --locked -p cvbbmso-network --lib egress::backend::windows
+      - name: Test macOS egress with substitutes and PF syntax checks
+        if: matrix.os == 'macos-latest'
+        run: cargo +1.88.0 test --locked -p cvbbmso-network --lib 'egress::'
 
   desktop-smoke:
     name: Desktop Release smoke (${{ matrix.os }})

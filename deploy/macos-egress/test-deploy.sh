@@ -15,7 +15,7 @@ sha1=${sha1%% *}
 sha2="$(/usr/bin/shasum -a 256 < "$fixture/v2")"
 sha2=${sha2%% *}
 
-valid_rules=$'FILTER RULES:\n\n scrub-anchor "com.apple/*" all\n scrub out all\n no scrub out all\n anchor "com.cvbbmso.egress" out all\n block drop out all'
+valid_rules=$'FILTER RULES:\n\n scrub-anchor "com.apple/*" all\n scrub out all\n no scrub out all\n anchor "com.cvbbmso.egress" all\n block drop out all'
 fixture_rules=$valid_rules
 interfaces=$'lo0 (skip)\nen0'
 translation='nat on en0 from 192.0.2.0/24 to any -> 198.51.100.1'
@@ -24,6 +24,8 @@ tables_inside=
 nested=
 anchors='  com.apple'
 launch_status=absent
+system_jobs=
+versioned_job="com.cvbbmso.egress-cleanup.v2.10000000000000000000000000000000"
 
 run() (
     # Exercise deployment logic with the real Darwin filesystem tools. Only
@@ -57,11 +59,18 @@ run() (
     }
     # shellcheck disable=SC2329
     launchctl() {
+        if [[ $* == 'print system' ]]; then
+            if [[ $launch_status == system_error ]]; then
+                return 1
+            fi
+            printf '%s\n' "$system_jobs"
+            return
+        fi
         [[ $* == 'print system/com.cvbbmso.egress-cleanup' ]] || {
             printf 'Unexpected launchctl command: %s\n' "$*" >> "$fixture/unexpected"; exit 97;
         }
         case $launch_status in
-            absent) echo 'Could not find service "com.cvbbmso.egress-cleanup" in domain for system' >&2; return 113 ;;
+            absent|system_error) echo 'Could not find service "com.cvbbmso.egress-cleanup" in domain for system' >&2; return 113 ;;
             loaded) return 0 ;;
             error) echo 'Permission denied' >&2; return 1 ;;
         esac
@@ -94,11 +103,13 @@ reject 'Unexpected checksum' install_helper "$fixture/v1" "$sha2" "$sha1"
 reject 'approved previous checksum' install_helper "$fixture/v2" "$sha2"
 reject 'The reserved PF entry is still loaded' remove_helper "$sha1"
 
-fixture_rules=$'pass out quick all\nanchor "com.cvbbmso.egress" out all'
+fixture_rules=$'pass out quick all\nanchor "com.cvbbmso.egress" all'
 reject 'first live PF filter rule' check_installation "$sha1"
+fixture_rules='anchor "com.cvbbmso.egress" out all'
+reject 'in both directions' check_installation "$sha1"
 fixture_rules='anchor "com.cvbbmso.egress" out quick all'
 reject 'first live PF filter rule' check_installation "$sha1"
-fixture_rules="$valid_rules"$'\nanchor "com.cvbbmso.egress" out all'
+fixture_rules="$valid_rules"$'\nanchor "com.cvbbmso.egress" all'
 reject 'without quick or duplicates' check_installation "$sha1"
 fixture_rules=$'scrub out all\nblock drop out all'
 reject 'first live PF filter rule' check_installation "$sha1"
@@ -119,10 +130,22 @@ launch_status=loaded
 reject 'recovery job is loaded' install_helper "$fixture/v2" "$sha2" "$sha1"
 launch_status=error
 reject 'Cannot establish' check_installation "$sha1"
+launch_status=system_error
+reject 'versioned guard recovery jobs are absent' check_installation "$sha1"
 launch_status=absent
-touch "$state/pf.enable"
-reject 'Complete recovery first' install_helper "$fixture/v2" "$sha2" "$sha1"
-rm "$state/pf.enable"
+system_jobs=$'services = {\n  0 0 '$versioned_job$'\n}'
+reject 'versioned guard recovery job is loaded' install_helper "$fixture/v2" "$sha2" "$sha1"
+system_jobs=
+definition="$fixture/root/Library/LaunchDaemons/$versioned_job.plist"
+touch "$definition"
+reject 'recovery definition is present' check_installation "$sha1"
+rm "$definition"
+for record in pf.enable pf.enable.capture pf.enable.releasing egress-cleanup.pending managed-pf.v1; do
+    touch "$state/$record"
+    reject 'Complete recovery first' install_helper "$fixture/v2" "$sha2" "$sha1"
+    rm "$state/$record"
+done
+touch "$state/egress.lease-counter"
 
 chmod g+w "$helper_dir"
 reject 'Group or other users can write' check_installation "$sha1"
@@ -153,6 +176,7 @@ anchors='  com.apple'
 reject 'Unexpected checksum' remove_helper "$sha1"
 run remove_helper "$sha2"
 run remove_helper "$sha2"
+[[ -f $state/egress.lease-counter ]]
 [[ ! -e $helper && ! -e $fixture/unexpected ]]
 [[ -z $(ls -A "$helper_dir") ]]
 cmp pf-entry.conf "$fixture/pf.conf"
@@ -171,7 +195,7 @@ EOF
 } > "$fixture/host.conf"
 ./deploy.sh lint "$fixture/host.conf"
 /sbin/pfctl -n -o none -v -f "$fixture/host.conf" > "$fixture/parsed"
-grep -Fx 'anchor "com.cvbbmso.egress" out all' "$fixture/parsed"
+grep -Fx 'anchor "com.cvbbmso.egress" all' "$fixture/parsed"
 grep -Fx 'block drop out inet proto tcp from any to 203.0.113.1 port = 443' "$fixture/parsed"
 printf '%s\n' 'anchor "com.cvbbmso.egress" nonsense' > "$fixture/invalid.conf"
 if ./deploy.sh lint "$fixture/invalid.conf" > "$fixture/invalid.log" 2>&1; then

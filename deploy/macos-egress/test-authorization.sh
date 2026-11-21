@@ -43,7 +43,7 @@ EOF
 } > "$scratch/candidate.conf"
 /sbin/pfctl -n -R -o none -v -f "$scratch/stock.conf" > "$scratch/stock"
 /sbin/pfctl -n -R -o none -v -f "$scratch/candidate.conf" > "$scratch/candidate"
-/usr/bin/grep -Fx 'anchor "com.cvbbmso.egress" out all' "$scratch/candidate"
-/usr/bin/grep -Fvx 'anchor "com.cvbbmso.egress" out all' "$scratch/candidate" > "$scratch/candidate-without-entry"
+/usr/bin/grep -Fx 'anchor "com.cvbbmso.egress" all' "$scratch/candidate"
+/usr/bin/grep -Fvx 'anchor "com.cvbbmso.egress" all' "$scratch/candidate" > "$scratch/candidate-without-entry"
 /usr/bin/diff -u "$scratch/stock" "$scratch/candidate-without-entry"
 printf '%s\n' 'Apple signing requirements and parser-only PF filter change passed.'
