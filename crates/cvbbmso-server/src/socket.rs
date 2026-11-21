@@ -99,16 +99,16 @@ async fn first_message(
     }
 }
 
-async fn read_frames(
+pub(super) async fn read_frames(
     reader: &mut (impl Stream<Item = Result<Message, axum::Error>> + Unpin),
     hub: &Hub,
     connection: Connection,
     mut deadline: Instant,
 ) {
-    let mut buffered = None;
+    let mut buffered: Option<ReceivedMessage> = None;
     let (reason, error) = loop {
         let incoming = match buffered.take() {
-            Some(incoming) => incoming,
+            Some(incoming) => incoming.before(deadline),
             None => next_message(reader, deadline).await,
         };
         let (message, received_at) = match incoming {
@@ -136,17 +136,15 @@ async fn read_frames(
             biased;
             renewed = &mut write => renewed,
             () = retrying.notified() => {
-                // Check for closure during retry backoff. Keep at most one
-                // later message and submit it only after this write settles.
+                // Keep the next message's receive time so it can be checked
+                // against the deadline returned by the pending write.
                 tokio::select! {
                     biased;
-                    incoming = next_message(reader, deadline) => {
-                        if matches!(incoming, Ok(None)) {
+                    incoming = read_message(reader) => {
+                        if matches!(incoming.message, Ok(None)) {
                             break (DisconnectReason::Closed, None);
                         }
-                        if !matches!(incoming, Err(ReadError::Timeout)) {
-                            buffered = Some(incoming);
-                        }
+                        buffered = Some(incoming);
                         write.await
                     }
                     renewed = &mut write => renewed,
@@ -166,36 +164,55 @@ enum ReadError {
     Malformed(&'static str),
 }
 
+struct ReceivedMessage {
+    received_at: Instant,
+    message: Result<Option<ClientMessage>, &'static str>,
+}
+
+impl ReceivedMessage {
+    fn before(self, deadline: Instant) -> Result<Option<(ClientMessage, Instant)>, ReadError> {
+        if self.received_at >= deadline {
+            return Err(ReadError::Timeout);
+        }
+        self.message
+            .map(|message| message.map(|message| (message, self.received_at)))
+            .map_err(ReadError::Malformed)
+    }
+}
+
 async fn next_message(
     reader: &mut (impl Stream<Item = Result<Message, axum::Error>> + Unpin),
     deadline: Instant,
 ) -> Result<Option<(ClientMessage, Instant)>, ReadError> {
+    time::timeout_at(deadline, read_message(reader))
+        .await
+        .map_err(|_| ReadError::Timeout)?
+        .before(deadline)
+}
+
+async fn read_message(
+    reader: &mut (impl Stream<Item = Result<Message, axum::Error>> + Unpin),
+) -> ReceivedMessage {
     loop {
-        let frame = time::timeout_at(deadline, reader.next())
-            .await
-            .map_err(|_| ReadError::Timeout)?;
+        let frame = reader.next().await;
         let received_at = Instant::now();
-        if received_at >= deadline {
-            return Err(ReadError::Timeout);
-        }
-        match frame {
-            Some(Ok(Message::Text(text))) => {
-                let message = serde_json::from_str(&text)
-                    .map_err(|_| ReadError::Malformed("invalid JSON message"))?;
-                return Ok(Some((message, received_at)));
+        let message = match frame {
+            Some(Ok(Message::Text(text))) => serde_json::from_str(&text)
+                .map(Some)
+                .map_err(|_| "invalid JSON message"),
+            Some(Ok(Message::Binary(_))) => Err("binary frame received"),
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+                // A stream of ready control frames must still yield to the read timeout.
+                tokio::task::consume_budget().await;
+                continue;
             }
-            Some(Ok(Message::Binary(_))) => {
-                return Err(ReadError::Malformed("binary frame received"));
-            }
-            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-            Some(Err(error)) => {
-                return match frame_error(&error) {
-                    Some(reason) => Err(ReadError::Malformed(reason)),
-                    None => Ok(None),
-                };
-            }
-            Some(Ok(Message::Close(_))) | None => return Ok(None),
-        }
+            Some(Err(error)) => frame_error(&error).map_or(Ok(None), Err),
+            Some(Ok(Message::Close(_))) | None => Ok(None),
+        };
+        return ReceivedMessage {
+            received_at,
+            message,
+        };
     }
 }
 

@@ -602,3 +602,110 @@ impl SocketError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::extract::ws::Message;
+    use cvbbmso_protocol::{ClientIncident, ExamEvent, IncidentCode};
+    use futures_util::{StreamExt, stream};
+    use tokio::time;
+
+    use super::*;
+    use crate::socket::read_frames;
+
+    #[tokio::test(start_paused = true)]
+    async fn prefetched_event_survives_a_heartbeat_write_crossing_the_old_deadline() {
+        let (requests, mut pending) = mpsc::channel(1);
+        let hub = Hub(requests);
+        let connection = Connection {
+            student: StudentKey {
+                exam_id: Uuid::new_v4(),
+                oj_user_id: 1,
+            },
+            id: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+        };
+        let heartbeat_at = Instant::now();
+        let old_deadline = heartbeat_at + Duration::from_secs(1);
+        let renewed_deadline = heartbeat_at + Duration::from_secs(25);
+        let event = ClientMessage::Event {
+            seq: 1,
+            event: ExamEvent::Incident(ClientIncident {
+                code: IncidentCode::NavigationDenied,
+                occurred_at: OffsetDateTime::UNIX_EPOCH,
+                detail: None,
+            }),
+        };
+        let heartbeat = serde_json::to_string(&ClientMessage::Heartbeat).unwrap();
+        let event_text = serde_json::to_string(&event).unwrap();
+        let (read_event, event_read) = oneshot::channel();
+        let reader = stream::iter([Ok(Message::Text(heartbeat.into()))])
+            .chain(stream::once(async move {
+                sleep_until(old_deadline).await;
+                read_event.send(()).unwrap();
+                Ok(Message::Text(event_text.into()))
+            }))
+            .chain(stream::pending());
+        tokio::pin!(reader);
+
+        let simulate_writes = async {
+            // Simulate SQLite returning busy once, then settling only after the
+            // next frame is ready at the old heartbeat deadline.
+            for expected_attempt in [1, 2] {
+                let Some(Request::Receive {
+                    message: ClientMessage::Heartbeat,
+                    attempt,
+                    received_at,
+                    processed,
+                    ..
+                }) = pending.recv().await
+                else {
+                    panic!("expected a heartbeat write");
+                };
+                assert_eq!(attempt, expected_attempt);
+                assert_eq!(received_at, heartbeat_at);
+                assert!(Instant::now() < old_deadline);
+                if attempt == 1 {
+                    assert!(
+                        processed
+                            .send(ReceiveOutcome::Retry(
+                                ClientMessage::Heartbeat,
+                                old_deadline
+                            ))
+                            .is_ok()
+                    );
+                } else {
+                    event_read.await.unwrap();
+                    assert!(
+                        processed
+                            .send(ReceiveOutcome::Continue(renewed_deadline))
+                            .is_ok()
+                    );
+                    break;
+                }
+            }
+            let Some(Request::Receive {
+                message,
+                received_at,
+                processed,
+                ..
+            }) = pending.recv().await
+            else {
+                panic!("expected the prefetched event after the heartbeat");
+            };
+            assert_eq!(message, event);
+            assert!(received_at >= old_deadline);
+            assert!(received_at < renewed_deadline);
+            assert!(processed.send(ReceiveOutcome::Stop).is_ok());
+        };
+
+        time::timeout(Duration::from_secs(30), async {
+            tokio::join!(
+                read_frames(&mut reader, &hub, connection, old_deadline),
+                simulate_writes
+            );
+        })
+        .await
+        .unwrap();
+    }
+}
