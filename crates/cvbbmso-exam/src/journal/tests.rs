@@ -47,12 +47,26 @@ fn manifest() -> ExamEvent {
     )
 }
 
-fn seqs(journal: &Journal) -> Vec<u64> {
+fn seqs(journal: &Journal) -> Vec<i64> {
     journal.messages_after(0).map(|(seq, _)| seq).collect()
 }
 
 async fn open(dir: &tempfile::TempDir) -> Journal {
     Journal::open(dir.path()).await.unwrap()
+}
+
+fn write_legacy_snapshot(dir: &tempfile::TempDir, seq: u64) {
+    let runtime = dir.path().join(RUNTIME_DIR);
+    std::fs::create_dir_all(&runtime).unwrap();
+    let next_seq = u128::from(seq) + 1;
+    let event = serde_json::to_string(&incident(0)).unwrap();
+    std::fs::write(
+        runtime.join(JOURNAL_FILE),
+        format!(
+            r#"{{"next_seq":{next_seq},"queue":[{{"seq":{seq},"event":{event}}}],"segments":[],"finalized":false,"state":{{"execution":"ready","recording":"idle"}}}}"#
+        ),
+    )
+    .unwrap();
 }
 
 #[tokio::test]
@@ -81,7 +95,7 @@ async fn a_fresh_journal_continues_after_the_server_position() {
 }
 
 #[tokio::test]
-async fn sync_drops_confirmed_events_and_resends_the_rest_in_order() {
+async fn sync_skips_confirmed_events_on_replay_and_keeps_them_until_end_ack() {
     let dir = tempfile::tempdir().unwrap();
     let mut journal = open(&dir).await;
     journal.anchor(0);
@@ -90,9 +104,37 @@ async fn sync_drops_confirmed_events_and_resends_the_rest_in_order() {
     }
 
     journal.anchor(2);
-    assert_eq!(seqs(&journal), [3, 4]);
+    assert_eq!(
+        journal
+            .messages_after(2)
+            .map(|(seq, _)| seq)
+            .collect::<Vec<_>>(),
+        [3, 4]
+    );
     journal.anchor(4);
-    assert_eq!(seqs(&journal), Vec::<u64>::new());
+    assert_eq!(journal.messages_after(4).count(), 0);
+    assert_eq!(seqs(&journal), [1, 2, 3, 4]);
+    journal.clear_events();
+    assert!(seqs(&journal).is_empty());
+}
+
+#[tokio::test]
+async fn a_server_watermark_ahead_of_a_legacy_snapshot_preserves_retained_events() {
+    let dir = tempfile::tempdir().unwrap();
+    write_legacy_snapshot(&dir, 3);
+    let mut journal = open(&dir).await;
+    assert_eq!(seqs(&journal), [3]);
+
+    journal.anchor(7);
+    assert_eq!(journal.append(segment(1)), Some(8));
+    journal.save().await.unwrap();
+
+    let mut journal = open(&dir).await;
+    assert_eq!(seqs(&journal), [3, 8]);
+    journal.anchor(7);
+    let (seq, _) = journal.messages_after(7).next().unwrap();
+    assert_eq!(seq, 8);
+    assert_eq!(journal.append(incident(10)), Some(9));
 }
 
 #[tokio::test]
@@ -155,7 +197,7 @@ async fn clearing_events_keeps_numbering_and_segment_identity() {
     journal.clear_events();
 
     journal.anchor(0);
-    assert_eq!(seqs(&journal), Vec::<u64>::new());
+    assert!(seqs(&journal).is_empty());
     assert!(journal.append(segment(1)).is_none());
     assert_eq!(journal.append(incident(60)), Some(3));
 }
@@ -210,17 +252,37 @@ async fn sequence_exhaustion_survives_reopening_without_wrapping() {
     let mut journal = open(&dir).await;
     journal.append(segment(1));
     journal.append(segment(2));
-    journal.anchor(u64::MAX - 1);
-    assert_eq!(seqs(&journal), [u64::MAX]);
-    assert!(journal.has_unnumbered_events());
+    journal.anchor(i64::MAX - 1);
+    assert_eq!(seqs(&journal), [i64::MAX]);
+    assert!(journal.has_unsendable_events());
     journal.save().await.unwrap();
 
     let mut journal = open(&dir).await;
-    assert_eq!(seqs(&journal), [u64::MAX]);
-    journal.anchor(u64::MAX);
+    assert_eq!(seqs(&journal), [i64::MAX]);
+    journal.anchor(i64::MAX);
     assert_eq!(journal.append(segment(3)), None);
-    assert!(journal.has_unnumbered_events());
-    assert_eq!(seqs(&journal), Vec::<u64>::new());
+    assert!(journal.has_unsendable_events());
+    assert_eq!(seqs(&journal), [i64::MAX]);
+    assert_eq!(journal.messages_after(i64::MAX).count(), 0);
+}
+
+#[tokio::test]
+async fn a_legacy_unsigned_sequence_beyond_the_wire_limit_is_preserved() {
+    let dir = tempfile::tempdir().unwrap();
+    write_legacy_snapshot(&dir, u64::MAX);
+    let mut journal = open(&dir).await;
+    assert!(journal.has_unsendable_events());
+    assert_eq!(journal.messages_after(0).count(), 0);
+    journal.anchor(i64::MAX);
+    assert_eq!(journal.append(segment(1)), None);
+    journal.save().await.unwrap();
+
+    let journal = open(&dir).await;
+    assert!(journal.has_unsendable_events());
+    assert_eq!(journal.data.queue.len(), 2);
+    assert_eq!(journal.data.queue[0].seq, Some(u64::MAX));
+    assert_eq!(journal.data.queue[0].event, incident(0));
+    assert_eq!(journal.data.queue[1].event, segment(1));
 }
 
 #[tokio::test]

@@ -1,8 +1,8 @@
 //! Durable runtime journal of one candidate.
 //!
 //! The journal owns the reliable event queue: every event is written here
-//! before it is sent, and stays until the server confirms it through
-//! `sync.ack_event_through` or the exam closes with its final `CommandAck`.
+//! before it is sent, and stays until the exam closes with its final
+//! `CommandAck`. The server's `sync.ack_event_through` controls replay.
 //! It also records which recorder segments and manifest were already queued
 //! and the client state reached, so a restarted process resumes where it
 //! stopped.
@@ -30,8 +30,9 @@ const RUNTIME_DIR: &str = "runtime";
 const JOURNAL_FILE: &str = "journal.json";
 /// Name a corrupt snapshot is moved to before the journal starts afresh.
 const CORRUPT_FILE: &str = "journal.json.corrupt";
-/// One past the last wire sequence number, representing exhaustion.
-const EXHAUSTED: u128 = (u64::MAX as u128) + 1;
+const MAX_WIRE_SEQ: u64 = i64::MAX.cast_unsigned();
+/// Old snapshots can store numbers above the current wire limit.
+const LEGACY_EXHAUSTED: u128 = (u64::MAX as u128) + 1;
 
 /// Durable runtime state of one candidate in one exam.
 pub(crate) struct Journal {
@@ -41,9 +42,12 @@ pub(crate) struct Journal {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Data {
-    /// Next sequence number or `EXHAUSTED`; `None` until the first sync.
+    /// Next sequence number, including past the wire limit; `None` before the first sync.
     next_seq: Option<u128>,
-    /// Events not yet confirmed by the server, in recording order.
+    /// Server watermark covering any gaps in retained sequence numbers.
+    #[serde(default)]
+    ack_event_through: u64,
+    /// Reliable events retained until the final command acknowledgement.
     queue: VecDeque<Entry>,
     /// Segment indexes already queued, so recovered segments are not repeated.
     segments: BTreeSet<u32>,
@@ -55,6 +59,7 @@ struct Data {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Entry {
+    /// Keep the old unsigned representation to preserve existing snapshots.
     seq: Option<u64>,
     event: ExamEvent,
 }
@@ -63,6 +68,7 @@ impl Default for Data {
     fn default() -> Self {
         Self {
             next_seq: None,
+            ack_event_through: 0,
             queue: VecDeque::new(),
             segments: BTreeSet::new(),
             finalized: false,
@@ -91,20 +97,29 @@ impl Data {
     }
 
     fn has_valid_numbering(&self) -> bool {
-        if self
-            .next_seq
-            .is_some_and(|seq| !(1..=EXHAUSTED).contains(&seq))
+        let after_ack = u128::from(self.ack_event_through) + 1;
+        if self.ack_event_through > MAX_WIRE_SEQ
+            || match self.next_seq {
+                Some(next) => !(after_ack..=LEGACY_EXHAUSTED).contains(&next),
+                None => self.ack_event_through != 0,
+            }
         {
             return false;
         }
         let mut expected = self.next_seq;
         for entry in self.queue.iter().rev() {
             match entry.seq {
-                Some(seq) if seq > 0 && expected == Some(u128::from(seq) + 1) => {
+                Some(seq)
+                    if seq > 0
+                        && expected.is_some_and(|next| {
+                            let seq = u128::from(seq);
+                            seq + 1 == next || (seq < next && next <= after_ack)
+                        }) =>
+                {
                     expected = Some(u128::from(seq));
                 }
-                None if expected == self.next_seq && matches!(expected, None | Some(EXHAUSTED)) => {
-                }
+                None if expected == self.next_seq
+                    && expected.is_none_or(|next| next > u128::from(MAX_WIRE_SEQ)) => {}
                 _ => return false,
             }
         }
@@ -114,7 +129,9 @@ impl Data {
 
 fn take_sequence(next: &mut Option<u128>) -> Option<u64> {
     let next = next.as_mut()?;
-    let seq = u64::try_from(*next).ok()?;
+    let seq = u64::try_from(*next)
+        .ok()
+        .filter(|&seq| seq <= MAX_WIRE_SEQ)?;
     *next += 1;
     Some(seq)
 }
@@ -154,7 +171,7 @@ impl Journal {
     /// Returns `None` for a segment whose index was already queued, for a
     /// second recording manifest, and for any event recorded before numbering
     /// is anchored or after the sequence space is exhausted.
-    pub(crate) fn append(&mut self, event: ExamEvent) -> Option<u64> {
+    pub(crate) fn append(&mut self, event: ExamEvent) -> Option<i64> {
         let repeated = match &event {
             ExamEvent::SegmentFinalized(meta) => !self.data.segments.insert(meta.index),
             ExamEvent::RecordingFinalized(_) => std::mem::replace(&mut self.data.finalized, true),
@@ -165,19 +182,20 @@ impl Journal {
         }
         let seq = take_sequence(&mut self.data.next_seq);
         self.data.queue.push_back(Entry { seq, event });
-        seq
+        seq.and_then(|seq| i64::try_from(seq).ok())
     }
 
     /// Applies `sync.ack_event_through` and numbers any unnumbered events.
     ///
     /// The first call anchors numbering after the server's position. Later
     /// calls never move numbering backwards.
-    pub(crate) fn anchor(&mut self, ack_event_through: u64) {
+    pub(crate) fn anchor(&mut self, ack_event_through: i64) {
+        let Ok(ack_event_through) = u64::try_from(ack_event_through) else {
+            return;
+        };
+        self.data.ack_event_through = self.data.ack_event_through.max(ack_event_through);
         let after_ack = u128::from(ack_event_through) + 1;
         self.data.next_seq = Some(self.data.next_seq.unwrap_or(after_ack).max(after_ack));
-        self.data
-            .queue
-            .retain(|entry| entry.seq.is_none_or(|seq| seq > ack_event_through));
 
         for entry in &mut self.data.queue {
             if entry.seq.is_none() {
@@ -186,21 +204,23 @@ impl Journal {
         }
     }
 
-    /// Whether events are still waiting for a sequence number.
-    pub(crate) fn has_unnumbered_events(&self) -> bool {
+    /// Whether the queue contains events that cannot yet be sent on the wire.
+    pub(crate) fn has_unsendable_events(&self) -> bool {
         self.data
             .queue
             .back()
-            .is_some_and(|entry| entry.seq.is_none())
+            .is_some_and(|entry| entry.seq.is_none_or(|seq| seq > MAX_WIRE_SEQ))
     }
 
     /// Returns numbered messages beyond the current session's send position.
     pub(crate) fn messages_after(
         &self,
-        through: u64,
-    ) -> impl Iterator<Item = (u64, ClientMessage)> + '_ {
+        through: i64,
+    ) -> impl Iterator<Item = (i64, ClientMessage)> + '_ {
         self.data.queue.iter().filter_map(move |entry| {
-            let seq = entry.seq.filter(|&seq| seq > through)?;
+            let seq = i64::try_from(entry.seq?)
+                .ok()
+                .filter(|&seq| seq > through)?;
             Some((
                 seq,
                 ClientMessage::Event {

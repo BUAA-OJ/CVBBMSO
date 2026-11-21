@@ -79,7 +79,7 @@ fn segment(index: u32) -> SegmentMeta {
     .unwrap()
 }
 
-fn sync(phase: ExamPhase, ack_event_through: u64) -> ServerMessage {
+fn sync(phase: ExamPhase, ack_event_through: i64) -> ServerMessage {
     let now = OffsetDateTime::now_utc();
     ServerMessage::Sync {
         server_time: now,
@@ -113,6 +113,7 @@ struct Script(Arc<Mutex<ScriptState>>);
 struct ScriptState {
     calls: Vec<&'static str>,
     start_failures: u32,
+    no_segments: bool,
 }
 
 impl Script {
@@ -149,13 +150,22 @@ impl Capture for FakeCapture {
     }
 
     fn finish(&mut self) -> impl Future<Output = Result<RecordingManifest, RecordingError>> + Send {
-        self.script.0.lock().unwrap().calls.push("finish");
-        let manifest = RecordingManifest::new(
-            (1..=self.segment_count).map(segment).collect(),
-            Sha256Digest::parse(&"b".repeat(64)).unwrap(),
-        )
-        .unwrap();
-        async move { Ok(manifest) }
+        let no_segments = {
+            let mut script = self.script.0.lock().unwrap();
+            script.calls.push("finish");
+            script.no_segments
+        };
+        let segment_count = self.segment_count;
+        async move {
+            if no_segments {
+                return Err(RecordingError::NoSegments);
+            }
+            Ok(RecordingManifest::new(
+                (1..=segment_count).map(segment).collect(),
+                Sha256Digest::parse(&"b".repeat(64)).unwrap(),
+            )
+            .unwrap())
+        }
     }
 }
 
@@ -382,14 +392,14 @@ fn expect_result(message: &ClientMessage, id: u128, status: CommandStatus) {
     assert_eq!((*command_id, *actual), (Uuid::from_u128(id), status));
 }
 
-fn expect_event(message: ClientMessage) -> (u64, ExamEvent) {
+fn expect_event(message: ClientMessage) -> (i64, ExamEvent) {
     match message {
         ClientMessage::Event { seq, event } => (seq, event),
         other => panic!("expected an event, got {other:?}"),
     }
 }
 
-fn expect_incident(message: ClientMessage, code: IncidentCode) -> (u64, Option<String>) {
+fn expect_incident(message: ClientMessage, code: IncidentCode) -> (i64, Option<String>) {
     match expect_event(message) {
         (seq, ExamEvent::Incident(incident)) if incident.code == code => (seq, incident.detail),
         other => panic!("expected a {code:?} incident, got {other:?}"),
@@ -493,7 +503,7 @@ async fn reconnecting_resends_only_unconfirmed_events() {
             .send(RecorderEvent::SegmentFinalized(segment(index)))
             .await
             .unwrap();
-        assert_eq!(expect_event(conn.recv().await).0, u64::from(index));
+        assert_eq!(expect_event(conn.recv().await).0, i64::from(index));
     }
 
     drop(conn);
@@ -998,6 +1008,72 @@ async fn end_result_waits_for_the_tail_segment_and_manifest_to_be_saved_and_sent
 }
 
 #[tokio::test]
+async fn failed_end_replays_unconfirmed_evidence_and_clears_it_after_ack() {
+    let mut harness = Harness::new().await;
+    harness.script.0.lock().unwrap().no_segments = true;
+    let (mut conn, handle) = harness.connected(ExamPhase::Running).await;
+    let mut view = handle.subscribe();
+    start_recording(&mut conn).await;
+    handle
+        .notify(UiNotice::NavigationDenied {
+            target_origin: "https://example.org".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        expect_incident(conn.recv().await, IncidentCode::NavigationDenied).0,
+        1
+    );
+
+    let finalizing = state(ExecutionState::Finalizing, RecordingState::Failed);
+    conn.send(command(2, CommandName::EndExam)).await;
+    expect_status(
+        &conn.recv().await,
+        state(ExecutionState::Finalizing, RecordingState::Finalizing),
+    );
+    let failure_event = conn.recv().await;
+    assert_eq!(
+        expect_incident(failure_event.clone(), IncidentCode::RecordingFailed).0,
+        2
+    );
+    expect_status(&conn.recv().await, finalizing);
+    let failure = |id| ClientMessage::CommandResult {
+        command_id: Uuid::from_u128(id),
+        status: CommandStatus::Failed,
+        error_code: Some(error_code::RECORDING_FINISH_FAILED.into()),
+    };
+    assert_eq!(conn.recv().await, failure(2));
+    drop(conn);
+
+    let mut conn = harness.accept().await;
+    let ClientMessage::Hello(hello) = conn.recv().await else {
+        panic!("expected hello before replay");
+    };
+    assert_eq!(hello.state, finalizing);
+    conn.send(sync(ExamPhase::Ended, 1)).await;
+    conn.send(command(3, CommandName::EndExam)).await;
+    assert_eq!(conn.recv().await, failure_event);
+    assert_eq!(conn.recv().await, failure(3));
+    let journal = Journal::open(&harness.candidate_dir()).await.unwrap();
+    assert_eq!(journal.messages_after(0).count(), 2);
+
+    conn.send(ack(3)).await;
+    conn.closed().await;
+    let finished = state(ExecutionState::Finished, RecordingState::Failed);
+    timeout(
+        WAIT,
+        view.wait_for(|view| view.state == finished && !view.connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let journal = Journal::open(&harness.candidate_dir()).await.unwrap();
+    assert_eq!(journal.state(), finished);
+    assert_eq!(journal.messages_after(0).count(), 0);
+    assert_eq!(harness.script.calls(), ["start", "finish"]);
+}
+
+#[tokio::test]
 async fn capture_is_retried_after_start_exam_reports_failure() {
     let mut harness = Harness::new().await;
     let (mut conn, _handle) = harness.connected(ExamPhase::Running).await;
@@ -1023,7 +1099,7 @@ async fn capture_is_retried_after_start_exam_reports_failure() {
 }
 
 #[tokio::test]
-async fn restart_replays_finalized_evidence_without_running_finish_again() {
+async fn restart_replies_to_a_fresh_end_command_after_the_original_ack_is_lost() {
     let mut harness = Harness::new().await;
     let (mut conn, handle) = harness.connected(ExamPhase::Running).await;
     start_recording(&mut conn).await;
@@ -1057,12 +1133,30 @@ async fn restart_replays_finalized_evidence_without_running_finish_again() {
 
     let mut restarted = Harness::new().await;
     std::mem::swap(&mut restarted.data, &mut harness.data);
-    let (mut conn, handle) = restarted.connected(ExamPhase::Ended).await;
-    assert_eq!(expect_event(conn.recv().await), (1, segment));
-    assert_eq!(expect_event(conn.recv().await), (2, manifest));
+    let pending = restarted.launch();
+    let mut conn = restarted.accept().await;
+    let ClientMessage::Hello(hello) = conn.recv().await else {
+        panic!("expected hello before sync");
+    };
+    assert_eq!(
+        hello.state,
+        state(ExecutionState::Finalizing, RecordingState::Complete)
+    );
+    // The server committed the original end result, but its ACK never arrived.
+    conn.send(sync(ExamPhase::Ended, 2)).await;
+    let handle = pending.await.unwrap().unwrap();
+    conn.send(ack(2)).await;
     conn.send(command(3, CommandName::EndExam)).await;
     expect_result(&conn.recv().await, 3, CommandStatus::Completed);
     assert_eq!(restarted.script.calls(), Vec::<&str>::new());
+    let journal = Journal::open(&restarted.candidate_dir()).await.unwrap();
+    assert_eq!(
+        journal
+            .messages_after(0)
+            .map(|(_, message)| expect_event(message))
+            .collect::<Vec<_>>(),
+        [(1, segment), (2, manifest)]
+    );
     conn.send(ack(3)).await;
     conn.closed().await;
     handle.shutdown().await.unwrap();

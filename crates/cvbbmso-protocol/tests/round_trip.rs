@@ -164,7 +164,7 @@ fn arb_client_message() -> impl Strategy<Value = ClientMessage> {
         ),
         Just(ClientMessage::Heartbeat),
         arb_client_state().prop_map(|state| ClientMessage::Status { state }),
-        (any::<u64>(), arb_event()).prop_map(|(seq, event)| ClientMessage::Event { seq, event }),
+        (1..=i64::MAX, arb_event()).prop_map(|(seq, event)| ClientMessage::Event { seq, event }),
         (
             arb_uuid(),
             arb_command_status(),
@@ -187,7 +187,7 @@ fn arb_server_message() -> impl Strategy<Value = ServerMessage> {
             arb_phase(),
             arb_ordered_times(),
             arb_policy(),
-            any::<u64>()
+            0..=i64::MAX
         )
             .prop_map(
                 |(server_time, phase, (start_at, end_at), recording_policy, ack)| {
