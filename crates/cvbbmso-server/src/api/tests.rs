@@ -37,6 +37,11 @@ use tower::ServiceExt;
 use super::*;
 use crate::hub::Manager;
 
+mod extremes;
+mod peer;
+
+use peer::{TestPeer, result};
+
 const STUDENT: i64 = 17;
 const OTHER_STUDENT: i64 = 29;
 const COOKIE: &str = "site=\"%2B=\"; connect.sid=s%3Aexample==; aux=value";
@@ -821,6 +826,154 @@ async fn resumes_event_sequence_across_connections() {
     );
 }
 
+async fn reconnect_after_runtime_loss() -> (Fixture, TestSocket, ExamEvent) {
+    let fixture = Fixture::new().await;
+    fixture.clock.store(START, Ordering::Relaxed);
+    let ClientMessage::Hello(mut client) = hello(ExecutionState::Ready, RecordingState::Idle)
+    else {
+        unreachable!()
+    };
+    let mut socket = open_socket(&fixture, &ClientMessage::Hello(client.clone()), 0).await;
+    let first_command = command(&mut socket, CommandName::StartExam, START).await;
+    confirm(&mut socket, first_command).await;
+    let original = ExamEvent::SegmentFinalized(
+        SegmentMeta::new(
+            1,
+            instant(START),
+            instant(START + 15),
+            Sha256Digest::parse(&"a".repeat(64)).unwrap(),
+        )
+        .unwrap(),
+    );
+    send(
+        &mut socket,
+        &ClientMessage::Event {
+            seq: 1,
+            event: original.clone(),
+        },
+    )
+    .await;
+    close_socket(&fixture, &mut socket).await;
+    let AdminOutput::Student(previous) = fixture
+        .admin(AdminOperation::StudentsShow {
+            exam_id: fixture.exam_id,
+            oj_user_id: STUDENT,
+        })
+        .await
+    else {
+        panic!("expected student");
+    };
+    assert!(!previous.connected);
+    assert_eq!(previous.execution, ExecutionState::Recording);
+
+    // The same device starts a new process without its saved execution state.
+    client.instance_id = Uuid::new_v4();
+    fixture.clock.store(START + 30, Ordering::Relaxed);
+    let mut socket = fixture.upgrade(&fixture.path(), COOKIE).await.unwrap();
+    send(&mut socket, &ClientMessage::Hello(client)).await;
+    assert_eq!(
+        message(&mut socket).await,
+        ServerMessage::Sync {
+            server_time: instant(START + 30),
+            phase: ExamPhase::Running,
+            start_at: instant(START),
+            end_at: instant(END),
+            recording_policy: RecordingPolicy::new(30, 15).unwrap(),
+            ack_event_through: 1,
+        }
+    );
+    let restarted = command(&mut socket, CommandName::StartExam, START).await;
+    assert_ne!(restarted, first_command);
+    confirm(&mut socket, restarted).await;
+    let mut kinds = incidents(&fixture)
+        .await
+        .into_iter()
+        .map(|incident| incident.kind)
+        .collect::<Vec<_>>();
+    kinds.sort_unstable();
+    assert_eq!(
+        kinds,
+        [
+            "connection_lost",
+            "connection_restored",
+            "process_restarted"
+        ]
+    );
+    (fixture, socket, original)
+}
+
+#[tokio::test]
+async fn runtime_loss_reconnects_ready_and_continues_recording() {
+    let (fixture, mut socket, original) = reconnect_after_runtime_loss().await;
+    let next = ExamEvent::SegmentFinalized(
+        SegmentMeta::new(
+            2,
+            instant(START + 30),
+            instant(START + 45),
+            Sha256Digest::parse(&"b".repeat(64)).unwrap(),
+        )
+        .unwrap(),
+    );
+    send(
+        &mut socket,
+        &ClientMessage::Event {
+            seq: 2,
+            event: next.clone(),
+        },
+    )
+    .await;
+    close_socket(&fixture, &mut socket).await;
+    assert_eq!(
+        events(&fixture)
+            .await
+            .into_iter()
+            .map(|event| (event.seq, event.event))
+            .collect::<Vec<_>>(),
+        [(1, original), (2, next)]
+    );
+    let state = hello(ExecutionState::Recording, RecordingState::Capturing);
+    let mut socket = open_socket(&fixture, &state, 2).await;
+    fixture.clock.store(END, Ordering::Relaxed);
+    fixture.state.hub.trigger_schedule().await;
+    command(&mut socket, CommandName::EndExam, END).await;
+    close_socket(&fixture, &mut socket).await;
+}
+
+#[tokio::test]
+async fn runtime_loss_with_reset_sequence_rejects_conflicting_event() {
+    let (fixture, mut socket, original) = reconnect_after_runtime_loss().await;
+    let conflicting = ExamEvent::SegmentFinalized(
+        SegmentMeta::new(
+            2,
+            instant(START + 30),
+            instant(START + 45),
+            Sha256Digest::parse(&"b".repeat(64)).unwrap(),
+        )
+        .unwrap(),
+    );
+    send(
+        &mut socket,
+        &ClientMessage::Event {
+            seq: 1,
+            event: conflicting,
+        },
+    )
+    .await;
+    socket_error(&mut socket, error_code::PROTOCOL_ERROR).await;
+    fixture.state.hub.barrier().await;
+    assert_eq!(
+        events(&fixture)
+            .await
+            .into_iter()
+            .map(|event| (event.seq, event.event))
+            .collect::<Vec<_>>(),
+        [(1, original)]
+    );
+    let state = hello(ExecutionState::Recording, RecordingState::Capturing);
+    let mut socket = open_socket(&fixture, &state, 1).await;
+    close_socket(&fixture, &mut socket).await;
+}
+
 #[tokio::test]
 async fn replays_end_handshake_after_ack_loss() {
     let fixture = Fixture::new().await;
@@ -910,67 +1063,41 @@ async fn successful_end_waits_for_a_contiguous_manifest() {
 
 #[tokio::test]
 async fn replacement_ignores_old_close_timeout_and_event_notices() {
-    use crate::hub::{Connection, Peer};
     use cvbbmso_domain::DisconnectReason;
-    use tokio::{sync::oneshot, time::Instant};
+    use tokio::time::Instant;
 
     let fixture = Fixture::new().await;
-    let student = StudentKey {
-        exam_id: fixture.exam_id,
-        oj_user_id: STUDENT,
-    };
-    let previous = Connection {
-        student,
-        id: Uuid::new_v4(),
-        request_id: Uuid::new_v4(),
-    };
-    let ClientMessage::Hello(previous_hello) =
-        hello(ExecutionState::Recording, RecordingState::Capturing)
-    else {
-        unreachable!()
-    };
-    let (frames, mut outgoing) = mpsc::channel(2);
-    let (close, closing) = oneshot::channel();
-    let (admitted, admission) = oneshot::channel();
-    assert!(
-        fixture
-            .state
-            .hub
-            .connect(
-                previous,
-                previous_hello,
-                Peer {
-                    frames,
-                    close,
-                    admitted
-                }
-            )
-            .await
-    );
-    admission.await.unwrap();
-    assert!(matches!(
-        outgoing.recv().await,
-        Some(ServerMessage::Sync { .. })
-    ));
+    let previous = TestPeer::connect(
+        &fixture,
+        STUDENT,
+        ExecutionState::Recording,
+        RecordingState::Capturing,
+        0,
+    )
+    .await;
 
     let state = hello(ExecutionState::Ready, RecordingState::Idle);
     let mut current = open_socket(&fixture, &state, 0).await;
-    assert!(closing.await.unwrap().is_none());
+    assert!(previous.closing.await.unwrap().is_none());
     fixture
         .state
         .hub
-        .end(previous, DisconnectReason::Closed, None)
+        .end(previous.connection, DisconnectReason::Closed, None)
         .await;
     fixture
         .state
         .hub
-        .end(previous, DisconnectReason::HeartbeatTimeout, None)
+        .end(
+            previous.connection,
+            DisconnectReason::HeartbeatTimeout,
+            None,
+        )
         .await;
     assert!(
         fixture
             .state
             .hub
-            .receive(previous, navigation(1, "stale"), Instant::now())
+            .receive(previous.connection, navigation(1, "stale"), Instant::now())
             .await
             .is_none()
     );
@@ -997,29 +1124,11 @@ async fn replacement_ignores_old_close_timeout_and_event_notices() {
 
 #[tokio::test]
 async fn heartbeat_renews_the_exact_deadline_and_timeout_is_recorded_once() {
-    use crate::hub::{Connection, Peer};
     use cvbbmso_domain::DisconnectReason;
-    use tokio::{
-        sync::oneshot,
-        time::{self, Instant},
-    };
+    use tokio::sync::oneshot;
+    use tokio::time::{self, Instant};
 
     let fixture = Fixture::new().await;
-    let student = StudentKey {
-        exam_id: fixture.exam_id,
-        oj_user_id: STUDENT,
-    };
-    let connection = Connection {
-        student,
-        id: Uuid::new_v4(),
-        request_id: Uuid::new_v4(),
-    };
-    let ClientMessage::Hello(hello) = hello(ExecutionState::Ready, RecordingState::Idle) else {
-        unreachable!()
-    };
-    let (frames, mut outgoing) = mpsc::channel(2);
-    let (close, mut closing) = oneshot::channel();
-    let (admitted, admission) = oneshot::channel();
     time::pause();
     // SQLite performs work on another thread. Keep Tokio from advancing time
     // automatically while that work is in flight.
@@ -1028,26 +1137,15 @@ async fn heartbeat_renews_the_exact_deadline_and_timeout_is_recorded_once() {
             tokio::task::yield_now().await;
         }
     });
-    assert!(
-        fixture
-            .state
-            .hub
-            .connect(
-                connection,
-                hello,
-                Peer {
-                    frames,
-                    close,
-                    admitted
-                }
-            )
-            .await
-    );
-    let original_deadline = admission.await.unwrap();
-    assert!(matches!(
-        outgoing.recv().await,
-        Some(ServerMessage::Sync { .. })
-    ));
+    let mut peer = TestPeer::connect(
+        &fixture,
+        STUDENT,
+        ExecutionState::Ready,
+        RecordingState::Idle,
+        0,
+    )
+    .await;
+    let original_deadline = peer.deadline;
 
     time::advance(TIMEOUT.checked_sub(Duration::from_secs(1)).unwrap()).await;
     let received_at = Instant::now();
@@ -1055,7 +1153,7 @@ async fn heartbeat_renews_the_exact_deadline_and_timeout_is_recorded_once() {
         fixture
             .state
             .hub
-            .receive(connection, ClientMessage::Heartbeat, received_at)
+            .receive(peer.connection, ClientMessage::Heartbeat, received_at)
             .await
             .is_some()
     );
@@ -1064,11 +1162,11 @@ async fn heartbeat_renews_the_exact_deadline_and_timeout_is_recorded_once() {
     fixture
         .state
         .hub
-        .end(connection, DisconnectReason::HeartbeatTimeout, None)
+        .end(peer.connection, DisconnectReason::HeartbeatTimeout, None)
         .await;
     fixture.state.hub.barrier().await;
     assert!(matches!(
-        closing.try_recv(),
+        peer.closing.try_recv(),
         Err(oneshot::error::TryRecvError::Empty)
     ));
     assert!(incidents(&fixture).await.is_empty());
@@ -1077,13 +1175,13 @@ async fn heartbeat_renews_the_exact_deadline_and_timeout_is_recorded_once() {
     fixture
         .state
         .hub
-        .end(connection, DisconnectReason::HeartbeatTimeout, None)
+        .end(peer.connection, DisconnectReason::HeartbeatTimeout, None)
         .await;
-    assert!(closing.await.unwrap().is_none());
+    assert!(peer.closing.await.unwrap().is_none());
     fixture
         .state
         .hub
-        .end(connection, DisconnectReason::HeartbeatTimeout, None)
+        .end(peer.connection, DisconnectReason::HeartbeatTimeout, None)
         .await;
     fixture.state.hub.barrier().await;
     let incidents = incidents(&fixture).await;
@@ -1145,51 +1243,21 @@ async fn recovers_online_state_after_restart_and_reissues_pending_command() {
 
 #[tokio::test]
 async fn undeliverable_command_disconnects_and_reconnect_gets_a_new_command() {
-    use crate::hub::{Connection, Peer};
-    use tokio::sync::oneshot;
-
     let fixture = Fixture::new().await;
     let state = hello(ExecutionState::Ready, RecordingState::Idle);
-    let ClientMessage::Hello(hello) = state.clone() else {
-        unreachable!();
-    };
-    let student = StudentKey {
-        exam_id: fixture.exam_id,
-        oj_user_id: STUDENT,
-    };
-    let connection = Connection {
-        student,
-        id: Uuid::new_v4(),
-        request_id: Uuid::new_v4(),
-    };
-    let (frames, mut outgoing) = mpsc::channel(2);
-    let (close, closing) = oneshot::channel();
-    let (admitted, admission) = oneshot::channel();
-    assert!(
-        fixture
-            .state
-            .hub
-            .connect(
-                connection,
-                hello,
-                Peer {
-                    frames,
-                    close,
-                    admitted
-                }
-            )
-            .await
-    );
-    admission.await.unwrap();
-    assert!(matches!(
-        outgoing.recv().await,
-        Some(ServerMessage::Sync { .. })
-    ));
-    drop(outgoing);
+    let peer = TestPeer::connect(
+        &fixture,
+        STUDENT,
+        ExecutionState::Ready,
+        RecordingState::Idle,
+        0,
+    )
+    .await;
+    drop(peer.outgoing);
 
     fixture.clock.store(START, Ordering::Relaxed);
     fixture.state.hub.trigger_schedule().await;
-    assert!(closing.await.unwrap().is_none());
+    assert!(peer.closing.await.unwrap().is_none());
     let incidents = incidents(&fixture).await;
     assert_eq!(incidents.len(), 1);
     assert_eq!(incidents[0].detail.as_deref(), Some("closed"));
