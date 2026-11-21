@@ -135,6 +135,8 @@ impl AdminService {
 - `hello.instance_id` 与上次不同，且上次状态为 `recording` 或 `finalizing` 时，写入 `process_restarted`。
 - 旧记录在线且未完成时，写入 `connection_lost`（`detail = "replaced"`）和 `connection_restored`。旧记录离线且未完成时，只写入 `connection_restored`。首次连接直接建立记录。
 
+同一连接中的 `status` 只允许执行阶段保持或前进：`ready` 可保持或进入 `recording` / `finalizing`，`recording` 可保持或进入 `finalizing`，`finalizing` 只能保持。`recording → ready`、`finalizing → ready/recording` 返回 `InvalidInput`，事务不修改原状态；server 映射为 `PROTOCOL_ERROR` 并关闭连接。同一执行阶段内仍允许合法的 `recording` 字段变化，包括录屏故障与恢复。`status` 上报 `finished` 不会提交终态；服务端已提交 `finished` 后，后续合法 `status` 均不覆盖终态。这项顺序限制不适用于重连 `hello`；考试进行中丢失本地状态的客户端仍可用 `ready/idle` 重连，由服务端生成新开始命令。
+
 `receive` 持久化可靠事件并推进确认位置。`record_command_result` 校验命令失败码，并拒绝已知事件缺口；成功结束还须确认录像摘要和此前事件已连续落库。回执与考生状态一起提交，服务端在提交成功后发出 `CommandAck`。`disconnect` 在同一事务将当前记录设为离线，并为未完成的考生写入 `connection_lost`。已完成的考生静默转为离线。
 
 `due_commands` 根据服务端时钟生成开始/结束命令；实际网络推送由服务端执行。命令由当前在线考生触发；离线考生的命令在 `connect` 时按状态生成。每个命令使用新的唯一 `command_id`。

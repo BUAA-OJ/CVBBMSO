@@ -20,77 +20,68 @@ async fn runtime(fixture: &Fixture, user: i64) -> StudentRuntime {
 }
 
 #[tokio::test]
-async fn same_session_state_regression_suppresses_start_until_reconnect() {
-    for (execution, recording) in [
-        (ExecutionState::Recording, RecordingState::Capturing),
-        (ExecutionState::Finalizing, RecordingState::Finalizing),
-    ] {
-        let fixture = Fixture::new().await;
-        fixture.clock.store(START, Ordering::Relaxed);
-        let mut peer = TestPeer::connect(
-            &fixture,
-            STUDENT,
-            ExecutionState::Ready,
-            RecordingState::Idle,
-            0,
-        )
-        .await;
-        let old_start = peer.command(CommandName::StartExam, START).await;
-        peer.result(&fixture, old_start, CommandStatus::Completed)
-            .await;
-        for state in [
+async fn same_session_status_regression_is_rejected_and_reconnect_restores_recording() {
+    for (from, to) in [
+        (
             ClientState {
-                execution,
-                recording,
+                execution: ExecutionState::Recording,
+                recording: RecordingState::Capturing,
             },
             ClientState {
                 execution: ExecutionState::Ready,
                 recording: RecordingState::Idle,
             },
-        ] {
-            assert!(
-                peer.receive(&fixture, ClientMessage::Status { state })
-                    .await
-            );
-        }
-        for _ in 0..2 {
-            fixture.state.hub.trigger_schedule().await;
-            peer.no_output(&fixture).await;
-        }
-        // Replaying an already archived result only ACKs; it does not repair state.
-        peer.result(&fixture, old_start, CommandStatus::Completed)
-            .await;
-        assert_eq!(
-            runtime(&fixture, STUDENT).await.execution,
-            ExecutionState::Ready
-        );
-        fixture
-            .state
-            .hub
-            .end(peer.connection, DisconnectReason::Closed, None)
-            .await;
+        ),
+        (
+            ClientState {
+                execution: ExecutionState::Finalizing,
+                recording: RecordingState::Finalizing,
+            },
+            ClientState {
+                execution: ExecutionState::Ready,
+                recording: RecordingState::Idle,
+            },
+        ),
+        (
+            ClientState {
+                execution: ExecutionState::Finalizing,
+                recording: RecordingState::Failed,
+            },
+            ClientState {
+                execution: ExecutionState::Recording,
+                recording: RecordingState::Failed,
+            },
+        ),
+    ] {
+        let fixture = Fixture::new().await;
+        fixture.clock.store(START, Ordering::Relaxed);
+        let state = hello(ExecutionState::Ready, RecordingState::Idle);
+        let mut socket = open_socket(&fixture, &state, 0).await;
+        let old_start = command(&mut socket, CommandName::StartExam, START).await;
+        confirm(&mut socket, old_start).await;
+        send(&mut socket, &ClientMessage::Status { state: from }).await;
+        send(&mut socket, &navigation(1, "before invalid status")).await;
+        send(&mut socket, &ClientMessage::Status { state: to }).await;
+        socket_error(&mut socket, error_code::PROTOCOL_ERROR).await;
         fixture.state.hub.barrier().await;
+        let previous = runtime(&fixture, STUDENT).await;
+        assert!(!previous.connected);
+        assert_eq!(previous.execution, from.execution);
+        assert_eq!(events(&fixture).await.len(), 1);
 
-        let mut resumed = TestPeer::connect(
-            &fixture,
-            STUDENT,
-            ExecutionState::Ready,
-            RecordingState::Idle,
-            0,
-        )
-        .await;
-        let new_start = resumed.command(CommandName::StartExam, START).await;
+        let mut resumed = open_socket(&fixture, &state, 1).await;
+        let new_start = command(&mut resumed, CommandName::StartExam, START).await;
         assert_ne!(old_start, new_start);
-        resumed
-            .result(&fixture, new_start, CommandStatus::Completed)
-            .await;
+        confirm(&mut resumed, new_start).await;
+        confirm(&mut resumed, new_start).await;
         assert_eq!(
             runtime(&fixture, STUDENT).await.execution,
             ExecutionState::Recording
         );
         fixture.clock.store(END, Ordering::Relaxed);
         fixture.state.hub.trigger_schedule().await;
-        resumed.command(CommandName::EndExam, END).await;
+        command(&mut resumed, CommandName::EndExam, END).await;
+        close_socket(&fixture, &mut resumed).await;
     }
 }
 

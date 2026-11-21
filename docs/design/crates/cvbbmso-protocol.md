@@ -124,7 +124,7 @@ pub enum ExamEvent {
 | `finished` | `complete` | 正常结束 |
 | `finished` | `failed` | 结束但录像摘要失败 |
 
-`ClientHello.state` 描述连接时的客户端状态，服务端据此决定生成什么命令。上报 `finished` 时须与服务端已提交的 `end_exam` 终态一致。丢失 ACK 的客户端可用 `finalizing` 重连，收到新命令后重报终态。`Status` 用于状态对齐，结束由 `command_result` 驱动。
+`ClientHello.state` 描述连接时的客户端状态，服务端据此决定生成什么命令。上报 `finished` 时须与服务端已提交的 `end_exam` 终态一致。丢失 ACK 的客户端可用 `finalizing` 重连，收到新命令后重报终态。`Status` 用于状态对齐，结束由 `command_result` 驱动。同一连接中，`Status.execution` 只允许在 `ready → recording → finalizing` 的顺序上保持或前进，可跳过中间阶段；倒退按 `PROTOCOL_ERROR` 关闭连接，原状态不变。同阶段仍允许合法的采集状态变化。`Status` 上报 `finished` 不提交终态，且不能覆盖已提交终态。重连 `Hello` 按前述恢复规则独立处理，不受同一连接的阶段顺序限制。
 
 ## HTTP 接口
 

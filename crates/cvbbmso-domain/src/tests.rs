@@ -543,6 +543,102 @@ async fn replacement_issues_a_fresh_command_and_records_incidents() {
     );
 }
 
+fn valid_states() -> [ClientState; 8] {
+    [
+        state(ExecutionState::Ready, RecordingState::Idle),
+        state(ExecutionState::Recording, RecordingState::Capturing),
+        state(ExecutionState::Recording, RecordingState::Failed),
+        state(ExecutionState::Finalizing, RecordingState::Finalizing),
+        state(ExecutionState::Finalizing, RecordingState::Complete),
+        state(ExecutionState::Finalizing, RecordingState::Failed),
+        state(ExecutionState::Finished, RecordingState::Complete),
+        state(ExecutionState::Finished, RecordingState::Failed),
+    ]
+}
+
+async fn persisted_state(f: &Fixture) -> ClientState {
+    let key = db::StudentKey::new(f.exam, USER).unwrap();
+    db::Runtime::get(&f.service.admin().0.database, &key)
+        .await
+        .unwrap()
+        .state()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn status_updates_follow_execution_transition_matrix() {
+    for from in valid_states()
+        .into_iter()
+        .filter(|state| state.execution != ExecutionState::Finished)
+    {
+        for to in valid_states() {
+            let f = Fixture::memory().await;
+            f.set(START);
+            f.connect(hello(from.execution, from.recording)).await;
+            let result = f
+                .service
+                .receive(f.exam, USER, ClientMessage::Status { state: to })
+                .await;
+            let regression = matches!(
+                (from.execution, to.execution),
+                (ExecutionState::Recording, ExecutionState::Ready)
+                    | (
+                        ExecutionState::Finalizing,
+                        ExecutionState::Ready | ExecutionState::Recording
+                    )
+            );
+            let expected = if regression {
+                assert!(
+                    matches!(result, Err(DomainError::InvalidInput)),
+                    "{from:?} -> {to:?}: {result:?}"
+                );
+                from
+            } else {
+                result.unwrap();
+                if to.execution == ExecutionState::Finished {
+                    from
+                } else {
+                    to
+                }
+            };
+            assert_eq!(persisted_state(&f).await, expected, "{from:?} -> {to:?}");
+            assert!(f.runtime().await.connected);
+            assert!(f.incidents().await.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn status_updates_cannot_replace_a_committed_terminal_state() {
+    for recording in [RecordingState::Complete, RecordingState::Failed] {
+        let f = Fixture::memory().await;
+        f.set(END);
+        let outcome = f
+            .connect(hello(ExecutionState::Finalizing, recording))
+            .await;
+        let end = command(&outcome.commands[0], CommandName::EndExam, END);
+        let (status, error) = if recording == RecordingState::Complete {
+            let (event, _) = recording_event(1, 'b');
+            f.receive(event).await;
+            (CommandStatus::Completed, None)
+        } else {
+            (
+                CommandStatus::Failed,
+                Some(error_code::RECORDING_FINISH_FAILED),
+            )
+        };
+        f.report(end, CommandName::EndExam, status, error)
+            .await
+            .unwrap();
+        let committed = state(ExecutionState::Finished, recording);
+        for reported in valid_states() {
+            f.receive(ClientMessage::Status { state: reported }).await;
+            assert_eq!(persisted_state(&f).await, committed);
+        }
+        f.connect(hello(ExecutionState::Finished, recording)).await;
+    }
+}
+
 #[tokio::test]
 async fn end_success_requires_the_contiguous_manifest() {
     let f = Fixture::memory().await;

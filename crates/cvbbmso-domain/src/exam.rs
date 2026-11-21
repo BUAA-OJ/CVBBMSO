@@ -416,9 +416,19 @@ async fn receive(
         }
         ClientMessage::Status { state } => {
             validate_state(state)?;
-            if runtime.state()?.execution != ExecutionState::Finished
-                && state.execution != ExecutionState::Finished
+            let execution = runtime.state()?.execution;
+            if execution != ExecutionState::Finished && state.execution != ExecutionState::Finished
             {
+                if matches!(
+                    (execution, state.execution),
+                    (ExecutionState::Recording, ExecutionState::Ready)
+                        | (
+                            ExecutionState::Finalizing,
+                            ExecutionState::Ready | ExecutionState::Recording
+                        )
+                ) {
+                    return Err(DomainError::InvalidInput);
+                }
                 update_state(tx, key, state).await?;
             }
         }
