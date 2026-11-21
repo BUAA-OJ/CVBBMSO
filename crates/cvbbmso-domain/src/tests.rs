@@ -1053,35 +1053,39 @@ async fn failed_runtime_update_rolls_back_end_command_result() {
 }
 
 #[tokio::test]
-async fn migration_strips_only_historical_audit_change_counts() {
+async fn one_initial_migration_creates_the_final_tables() {
     use migration::{Migrator, MigratorTrait};
+    use sea_orm::Statement;
 
-    let f = Fixture::memory().await;
-    let database = f.service.admin().0.database;
-    Migrator::down(&database, Some(1)).await.unwrap();
-    let mut operation = serde_json::json!({
-        "operation": "participants_import",
-        "exam_id": f.exam,
-        "oj_user_ids": [USER],
-    });
-    let expected = operation.to_string();
-    operation["change_count"] = 1.into();
-    let stored = audit::Entity::insert(audit::ActiveModel {
-        actor: Set("tester".into()),
-        operation: Set(operation.to_string()),
-        occurred_at: Set(db::stored_time(time(START)).unwrap()),
-        ..Default::default()
-    })
-    .exec(&database)
-    .await
-    .unwrap();
-    Migrator::up(&database, None).await.unwrap();
-    let restored = audit::Entity::find_by_id(stored.last_insert_id)
-        .one(&database)
+    let fixture = Fixture::memory().await;
+    let database = fixture.service.admin().0.database;
+    assert_eq!(
+        Migrator::get_applied_migrations(&database)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let tables = database
+        .query_all_raw(Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name",
+        ))
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(restored.operation, expected);
+    let names = tables
+        .iter()
+        .map(|row| row.try_get_by_index::<String>(0).unwrap());
+    assert!(names.eq([
+        "admin_audit",
+        "commands",
+        "enrollments",
+        "events",
+        "exams",
+        "incidents",
+        "seaql_migrations",
+        "student_runtimes",
+    ]));
 }
 
 #[tokio::test]
@@ -1104,91 +1108,6 @@ async fn initial_migration_rolls_back_database_with_evidence() {
         f.service.check_enrollment(f.exam, USER).await,
         Err(DomainError::NotFound)
     ));
-}
-
-#[tokio::test]
-async fn upgrades_existing_evidence_with_integer_event_sequences() {
-    use migration::{Migrator, MigratorTrait};
-
-    use crate::entity::event;
-
-    let f = Fixture::memory().await;
-    f.set(END);
-    let outcome = f
-        .connect(hello(ExecutionState::Finalizing, RecordingState::Complete))
-        .await;
-    let command_id = command(&outcome.commands[0], CommandName::EndExam, END);
-    let (finalized, manifest) = recording_event(1, 'b');
-    f.receive(finalized).await;
-    f.receive(incident_event(2, time(END))).await;
-    f.report(
-        command_id,
-        CommandName::EndExam,
-        CommandStatus::Completed,
-        None,
-    )
-    .await
-    .unwrap();
-    f.receive(incident_event(i64::MAX, time(END))).await;
-    let database = f.service.admin().0.database;
-    let audit_rows = || async {
-        audit::Entity::find()
-            .all(&database)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| {
-                (
-                    row.actor,
-                    row.occurred_at,
-                    db::decode::<serde_json::Value>(&row.operation).unwrap(),
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    let audits = audit_rows().await;
-    let result = stored_command::Entity::find_by_id(command_id.to_string())
-        .one(&database)
-        .await
-        .unwrap()
-        .unwrap();
-    let incident_ids = |incidents: Vec<IncidentRecord>| {
-        incidents
-            .into_iter()
-            .map(|record| record.id)
-            .collect::<Vec<_>>()
-    };
-    let incidents = incident_ids(f.incidents().await);
-
-    Migrator::down(&database, Some(2)).await.unwrap();
-    Migrator::up(&database, None).await.unwrap();
-    assert_eq!(
-        stored_command::Entity::find_by_id(command_id.to_string())
-            .one(&database)
-            .await
-            .unwrap(),
-        Some(result)
-    );
-    let restored_audits = audit_rows().await;
-    assert_eq!(restored_audits.len(), audits.len());
-    assert!(audits.iter().all(|row| restored_audits.contains(row)));
-    assert_eq!(incident_ids(f.incidents().await), incidents);
-    assert!(matches!(
-        f.admin(AdminOperation::RecordingsShow { exam_id: f.exam, oj_user_id: USER })
-            .await,
-        AdminOutput::Recording(stored) if stored == manifest
-    ));
-    assert!(
-        event::Entity::find_by_id((f.exam.to_string(), USER, i64::MAX))
-            .one(&database)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    let outcome = f
-        .connect(hello(ExecutionState::Finished, RecordingState::Complete))
-        .await;
-    sync(&outcome, ExamPhase::Ended, 2);
 }
 
 #[tokio::test]

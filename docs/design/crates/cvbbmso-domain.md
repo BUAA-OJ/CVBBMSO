@@ -248,6 +248,8 @@ pub struct IncidentRecord {
 | 录像摘要 | 保存在 `recording_finalized` 可靠事件中的分片元信息和合并文件摘要 |
 | 管理审计 | actor、操作、目标、时间 |
 
+`crates/cvbbmso-domain/migration/` 维护 SQLite 迁移。首次打开空库时，一条初始迁移创建七张业务表，录像摘要存放在可靠事件表中。
+
 ## 考试阶段与调度
 
 `phase` 由服务端时钟推导：
