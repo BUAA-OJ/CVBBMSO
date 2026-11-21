@@ -88,7 +88,9 @@ cvbbmso-cli recordings show --exam <exam-id> --oj-user-id 12345
 | `events list` | `EventRecord[]` | 客户端上报的 `seq`、`event`、`received_at` |
 | `incidents list` | `IncidentRecord[]` | 服务端及客户端异常的发生时间与上下文 |
 | `incidents show` | `IncidentRecord` | 单个异常的完整信息 |
-| `recordings show` | `RecordingManifest` | 分片元信息及合并录像 SHA-256；没有 manifest 时返回 `NotFound` |
+| `recordings show` | `RecordingSummary` | 分片数 `segment_count` 和合并录像 SHA-256 `merged_sha256`；没有摘要时返回 `NotFound` |
+
+通过 `events list` 查看已上报的 `segment_finalized` 分片明细。
 
 `StudentRuntime` 的核心字段为 `exam_id: uuid`、`oj_user_id: i64`、`connected: bool`、`execution: ExecutionState`、`last_seen_at: datetime?`；`ExecutionState` 为 `ready` / `recording` / `finalizing` / `finished`。`EventRecord` 为 `exam_id`、`oj_user_id`、`seq`、`event`、`received_at`，其中 `event` 遵循 [cvbbmso-protocol](cvbbmso-protocol.md)。`IncidentRecord` 为 `id`、`exam_id`、`oj_user_id`、`source`、`kind`、`occurred_at`、`detail`，字段定义见 [cvbbmso-domain](cvbbmso-domain.md)。`detail` 是可选字符串，用于记录 `heartbeat_timeout`、`replaced`、`capture stream stopped` 等上下文。
 

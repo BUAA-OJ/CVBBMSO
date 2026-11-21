@@ -207,7 +207,7 @@ impl ExamService {
     ///
     /// The caller must resolve the command ID in that connection's session
     /// and handle duplicate acknowledgements there. A successful end requires
-    /// a manifest within the student's contiguous reliable event history.
+    /// a recording summary within the student's contiguous reliable event history.
     ///
     /// # Errors
     ///

@@ -5,8 +5,8 @@ use std::sync::{
 
 use cvbbmso_protocol::{
     ClientHello, ClientIncident, ClientMessage, ClientState, CommandName, CommandStatus, ExamEvent,
-    ExamPhase, ExecutionState, IncidentCode, Platform, RecordingManifest, RecordingPolicy,
-    RecordingState, SegmentMeta, ServerMessage, Sha256Digest, error_code,
+    ExamPhase, ExecutionState, IncidentCode, Platform, RecordingPolicy, RecordingState,
+    RecordingSummary, ServerMessage, Sha256Digest, error_code,
 };
 use sea_orm::{ConnectionTrait, EntityTrait, PaginatorTrait, Set};
 use time::{Duration, OffsetDateTime, UtcOffset};
@@ -216,25 +216,18 @@ fn incident_event(seq: i64, timestamp: OffsetDateTime) -> ClientMessage {
     }
 }
 
-fn recording_event(seq: i64, hash: char) -> (ClientMessage, RecordingManifest) {
-    let segment = SegmentMeta::new(
+fn recording_event(seq: i64, hash: char) -> (ClientMessage, RecordingSummary) {
+    let summary = RecordingSummary::new(
         1,
-        time(START),
-        time(START + 1),
-        Sha256Digest::parse(&"a".repeat(64)).unwrap(),
-    )
-    .unwrap();
-    let manifest = RecordingManifest::new(
-        vec![segment],
         Sha256Digest::parse(&hash.to_string().repeat(64)).unwrap(),
     )
     .unwrap();
     (
         ClientMessage::Event {
             seq,
-            event: ExamEvent::RecordingFinalized(manifest.clone()),
+            event: ExamEvent::RecordingFinalized(summary.clone()),
         },
-        manifest,
+        summary,
     )
 }
 
@@ -409,11 +402,11 @@ async fn time_boundaries_determine_command_candidates() {
 }
 
 #[tokio::test]
-async fn out_of_order_events_preserve_ack_and_reject_conflicting_manifests() {
+async fn out_of_order_events_preserve_ack_and_reject_conflicting_recording_summaries() {
     let f = Fixture::memory().await;
     let hello = ready();
     f.connect(hello.clone()).await;
-    let (third, manifest) = recording_event(3, 'c');
+    let (third, summary) = recording_event(3, 'c');
     f.receive(third).await;
     sync(&f.connect(hello.clone()).await, ExamPhase::Scheduled, 0);
     let (first, _) = recording_event(1, 'b');
@@ -485,7 +478,7 @@ async fn out_of_order_events_preserve_ack_and_reject_conflicting_manifests() {
     else {
         panic!("expected recording")
     };
-    assert_eq!(recording, manifest);
+    assert_eq!(recording, summary);
 
     f.receive(incident_event(i64::MAX, occurred_at)).await;
     let AdminOutput::Events(events) = f
@@ -640,7 +633,26 @@ async fn status_updates_cannot_replace_a_committed_terminal_state() {
 }
 
 #[tokio::test]
-async fn end_success_requires_the_contiguous_manifest() {
+async fn rejects_a_recording_summary_with_the_same_hash_and_different_count() {
+    let f = Fixture::memory().await;
+    f.connect(ready()).await;
+    let (event, summary) = recording_event(1, 'c');
+    f.receive(event).await;
+    let conflicting = RecordingSummary::new(2, summary.merged_sha256).unwrap();
+    for seq in [1, 2] {
+        let event = ClientMessage::Event {
+            seq,
+            event: ExamEvent::RecordingFinalized(conflicting.clone()),
+        };
+        assert!(matches!(
+            f.service.receive(f.exam, USER, event).await,
+            Err(DomainError::InvalidInput)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn end_success_requires_the_contiguous_recording_summary() {
     let f = Fixture::memory().await;
     f.set(END);
     let outcome = f

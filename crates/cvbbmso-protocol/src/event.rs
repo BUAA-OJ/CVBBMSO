@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ClientIncident, RecordingManifest, SegmentMeta};
+use crate::{ClientIncident, RecordingSummary, SegmentMeta};
 
 /// A reliable client event carried by a `ClientMessage::Event`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,7 +12,7 @@ pub enum ExamEvent {
     /// One segment has been sealed and hashed.
     SegmentFinalized(SegmentMeta),
     /// The recording has been merged and hashed.
-    RecordingFinalized(RecordingManifest),
+    RecordingFinalized(RecordingSummary),
     /// A client incident occurred.
     Incident(ClientIncident),
 }

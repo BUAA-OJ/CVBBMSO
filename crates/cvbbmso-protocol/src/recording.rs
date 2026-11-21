@@ -1,4 +1,6 @@
-//! Recording parameters and manifests.
+//! Recording parameters, segments, and summaries.
+
+use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, UtcOffset};
@@ -113,54 +115,30 @@ struct RawSegmentMeta {
     sha256: Sha256Digest,
 }
 
-/// Summary of a finished recording.
+/// Number of sealed segments and SHA-256 of the merged recording.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "RawRecordingManifest")]
-pub struct RecordingManifest {
-    /// Sealed segments, non-empty and contiguous from index one.
-    pub segments: Vec<SegmentMeta>,
+#[serde(deny_unknown_fields)]
+pub struct RecordingSummary {
+    /// Number of sealed segments.
+    pub segment_count: NonZeroU32,
     /// SHA-256 of the merged video file.
     pub merged_sha256: Sha256Digest,
 }
 
-impl RecordingManifest {
-    /// Creates a manifest, requiring a non-empty list whose indices start at
-    /// one and increase by exactly one.
+impl RecordingSummary {
+    /// Creates a summary for a recording with at least one sealed segment.
     ///
     /// # Errors
     ///
-    /// Returns [`ProtocolError::InvalidSegmentOrder`] when the list is empty,
-    /// does not start at index one, or is not contiguous.
-    pub fn new(
-        segments: Vec<SegmentMeta>,
-        merged_sha256: Sha256Digest,
-    ) -> Result<Self, ProtocolError> {
-        let starts_at_one = segments.first().is_some_and(|segment| segment.index == 1);
-        let is_contiguous = segments
-            .windows(2)
-            .all(|pair| pair[0].index.checked_add(1) == Some(pair[1].index));
-        if !starts_at_one || !is_contiguous {
-            return Err(ProtocolError::InvalidSegmentOrder);
-        }
+    /// Returns [`ProtocolError::InvalidSegmentCount`] when the count is zero.
+    pub fn new(segment_count: u32, merged_sha256: Sha256Digest) -> Result<Self, ProtocolError> {
+        let segment_count =
+            NonZeroU32::new(segment_count).ok_or(ProtocolError::InvalidSegmentCount)?;
         Ok(Self {
-            segments,
+            segment_count,
             merged_sha256,
         })
     }
-}
-
-impl TryFrom<RawRecordingManifest> for RecordingManifest {
-    type Error = ProtocolError;
-
-    fn try_from(raw: RawRecordingManifest) -> Result<Self, Self::Error> {
-        Self::new(raw.segments, raw.merged_sha256)
-    }
-}
-
-#[derive(Deserialize)]
-struct RawRecordingManifest {
-    segments: Vec<SegmentMeta>,
-    merged_sha256: Sha256Digest,
 }
 
 #[cfg(test)]
@@ -216,37 +194,5 @@ mod tests {
     fn segment_range_must_be_ordered() {
         let result = SegmentMeta::new(1, timestamp(30), timestamp(0), digest('a'));
         assert_eq!(result, Err(ProtocolError::InvalidTimeRange));
-    }
-
-    #[test]
-    fn manifest_requires_contiguous_indices_from_one() {
-        let first = SegmentMeta::new(1, timestamp(0), timestamp(30), digest('a')).expect("segment");
-        let duplicate =
-            SegmentMeta::new(1, timestamp(30), timestamp(60), digest('b')).expect("segment");
-        let second =
-            SegmentMeta::new(2, timestamp(30), timestamp(60), digest('b')).expect("segment");
-        let third =
-            SegmentMeta::new(3, timestamp(60), timestamp(90), digest('c')).expect("segment");
-
-        assert_eq!(
-            RecordingManifest::new(Vec::new(), digest('c')),
-            Err(ProtocolError::InvalidSegmentOrder)
-        );
-        assert_eq!(
-            RecordingManifest::new(vec![first.clone(), duplicate], digest('c')),
-            Err(ProtocolError::InvalidSegmentOrder)
-        );
-        assert_eq!(
-            RecordingManifest::new(vec![second.clone(), first.clone()], digest('c')),
-            Err(ProtocolError::InvalidSegmentOrder)
-        );
-        assert_eq!(
-            RecordingManifest::new(vec![second, third], digest('c')),
-            Err(ProtocolError::InvalidSegmentOrder)
-        );
-        assert!(
-            RecordingManifest::new(vec![first], digest('c')).is_ok(),
-            "manifest may contain a single segment"
-        );
     }
 }

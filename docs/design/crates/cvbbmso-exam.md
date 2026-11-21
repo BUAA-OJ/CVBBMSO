@@ -57,7 +57,7 @@ impl ExamHandle {
     pub async fn notify(&self, notice: UiNotice) -> Result<(), ExamError>;
 
     /// 停止采集并封存当前片段，关闭 WebSocket，保留已封存分片。
-    /// 合并与最终 manifest 由后续 Recorder::finish 完成。
+    /// 合并与录像摘要 由后续 Recorder::finish 完成。
     pub async fn shutdown(self) -> Result<(), ExamError>;
 }
 ```
@@ -86,7 +86,7 @@ impl ExamHandle {
 ### 命令语义
 
 - `start_exam` 表示“确保采集正在运行”：已在采集时幂等成功；有已封存分片但采集已停止时恢复采集；启动失败时按有限退避重试。
-- `end_exam` 表示“停止采集、finalize 并收尾”：已在 finalize 或已完成时返回同一 manifest；没有可收尾分片时按失败处理。
+- `end_exam` 表示“停止采集、finalize 并收尾”：已在 finalize 或已完成时返回同一录像摘要；没有可收尾分片时按失败处理。
 - 每个 `command_id` 唯一；重连时由服务端根据 `hello.state` 和 `phase` 生成新命令。
 - `status` 仅用于状态对齐；命令确认由 `CommandAck` 负责，结束由 `command_result` 驱动。
 
@@ -113,9 +113,9 @@ stateDiagram-v2
 
 ## 生命周期、离线与认证
 
-- **正常完成**：收到 `end_exam` 后停止采集并执行 `finish`。将 `recording_finalized` 写入本地队列，按序补齐本场尚未送达的可靠事件，再发送 `command_result(completed)` 并等待 `CommandAck`。收到 ACK 后才清理本场事件、进入 `finished` 并关闭 WebSocket。等待 ACK 有界；超时则保留事件和收尾结果并重连，以新命令的 ID 回复终态。
+- **正常完成**：收到 `end_exam` 后停止采集并执行 `finish`。将 `finish` 返回的录像摘要作为 `recording_finalized` 写入本地队列，按序补齐本场尚未送达的可靠事件，再发送 `command_result(completed)` 并等待 `CommandAck`。收到 ACK 后才清理本场事件、进入 `finished` 并关闭 WebSocket。等待 ACK 有界；超时则保留事件和收尾结果并重连，以新命令的 ID 回复终态。
 - **finalize 失败**：`finish` 进行有限重试；仍失败时将 `recording_failed` 入队，按序补齐本场尚未送达的可靠事件，再发送 `command_result(failed, RECORDING_FINISH_FAILED)`。收到 `CommandAck` 后才清理本场事件并以 `finished/failed` 关闭。没有可收尾分片（`NoSegments`）亦走失败路径。
-- **主动关闭**：`ExamHandle::shutdown` 调用 `Recorder::stop` 停止采集并封存当前片段，关闭 WebSocket；合并与 manifest 由后续 `finish` 完成。已封存分片保留，下次 `Recorder::open` 恢复。服务端按普通断开记录 `connection_lost`。
+- **主动关闭**：`ExamHandle::shutdown` 调用 `Recorder::stop` 停止采集并封存当前片段，关闭 WebSocket；合并与录像摘要 由后续 `finish` 完成。已封存分片保留，下次 `Recorder::open` 恢复。服务端按普通断开记录 `connection_lost`。
 - **断网跨过结束时间**：客户端使用 `sync.server_time` 计算服务端时钟偏移；到达 `end_at + 60s` 后调用 `Recorder::stop` 封存当前片段，进入 `finalizing/finalizing`，等待 `end_exam`。重连后按服务端下发的 `end_exam` 执行 `finish` 并完成收尾。
 - **Cookie 过期**：运行时继续录屏，保持本地事件队列；通过 `ClientView` 通知 UI 重新登录，并按退避策略重试连接。认证失效期间录像继续。
 - **断线重连**：保留 `instance_id` 和本地状态；完成 `hello/sync` 后补发事件。服务端根据 `hello.state` 决定是否生成新的 `start_exam` / `end_exam`。

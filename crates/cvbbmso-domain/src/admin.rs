@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use cvbbmso_protocol::{
-    ExamEvent, ExamSummary, ExecutionState, RecordingManifest, RecordingPolicy, RecordingState,
+    ExamEvent, ExamSummary, ExecutionState, RecordingPolicy, RecordingState, RecordingSummary,
 };
 use sea_orm::{
     ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QueryTrait, Set,
@@ -154,7 +154,7 @@ pub enum AdminOutput {
     /// A single incident record.
     Incident(IncidentRecord),
     /// The reported recording summary.
-    Recording(RecordingManifest),
+    Recording(RecordingSummary),
 }
 
 /// An active enrollment.
@@ -620,8 +620,8 @@ async fn recording(tx: &DatabaseTransaction, key: &StudentKey) -> Result<AdminOu
     if Runtime::get(tx, key).await?.state()?.recording != RecordingState::Complete {
         return Err(DomainError::NotFound);
     }
-    let (_, manifest) = stored_events::recording(tx, key)
+    let (_, summary) = stored_events::recording(tx, key)
         .await?
         .ok_or(DomainError::NotFound)?;
-    Ok(AdminOutput::Recording(manifest))
+    Ok(AdminOutput::Recording(summary))
 }

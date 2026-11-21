@@ -191,7 +191,7 @@ pub enum AdminOutput {
     Events(Vec<EventRecord>),
     Incidents(Vec<IncidentRecord>),
     Incident(IncidentRecord),
-    Recording(cvbbmso_protocol::RecordingManifest),
+    Recording(cvbbmso_protocol::RecordingSummary),
 }
 
 pub struct ParticipantRecord {
@@ -231,7 +231,7 @@ pub struct IncidentRecord {
 
 `actor` 由 CLI 提供，缺省为当前操作系统用户名。审计记录包含整数 `audit_id`、`actor`、序列化的操作类型与参数，以及 `occurred_at`；创建考试的审计包含生成的 `exam_id`。`AdminOperation` 的输入先经过域层校验：`start_at < end_at`，`RecordingPolicy` 参数大于零，`oj_user_id` 为正整数，CSV 导入去重。报名只能在 `now < start_at` 时撤销，时间检查与删除在同一事务内完成。错误以 `DomainError` 返回，由 server 或 CLI 映射为对外错误。
 
-`RecordingsShow` 在录像状态为 `complete` 时从 `recording_finalized` 事件读取 `RecordingManifest`。尚未 finalize、finalize 失败或没有摘要事件时返回 `NotFound`。
+`RecordingsShow` 在录像状态为 `complete` 时从 `recording_finalized` 事件读取 `RecordingSummary`。尚未 finalize、finalize 失败或没有摘要事件时返回 `NotFound`。已单独上报的分片明细通过 `EventsList` 查询。
 
 ## 数据所有权
 
@@ -245,7 +245,7 @@ pub struct IncidentRecord {
 | 指令记录 | 客户端实际回报的开始/结束命令终态、唯一 `command_id` 和对应失败码 |
 | 可靠事件 | 客户端上报的 `seq`、事件内容和接收时间 |
 | 异常记录 | 服务端与客户端按发生时间保存的证据 |
-| 录像摘要 | 保存在 `recording_finalized` 可靠事件中的分片元信息和合并文件摘要 |
+| 录像摘要 | 保存在 `recording_finalized` 可靠事件中的分片数和合并文件 SHA-256 |
 | 管理审计 | actor、操作、目标、时间 |
 
 `crates/cvbbmso-domain/migration/` 维护 SQLite 迁移。首次打开空库时，一条初始迁移创建七张业务表，录像摘要存放在可靠事件表中。
@@ -281,7 +281,7 @@ pub struct IncidentRecord {
 
 客户端 `event.seq` 按 `(exam_id, oj_user_id)` 连续递增。`receive` 以联合标识和 `seq` 去重，持久化后推进最大连续确认序号 `ack_event_through`；确认位置在下一次 `sync` 中返回。重复 `seq` 内容相同则忽略，内容不同按协议错误处理。
 
-`Recorder::open` 恢复的分片可能以原 `seq` 重报；服务端按 `seq` 幂等，并可按 `(exam_id, oj_user_id, index)` 做辅助去重。`recording_finalized` 保存非空分片清单和合并摘要，同一摘要可重报，内容不同的摘要会被拒绝。`incident` 保存为异常记录。
+`Recorder::open` 恢复的分片可能以原 `seq` 重报；服务端按 `seq` 幂等，并可按 `(exam_id, oj_user_id, index)` 做辅助去重。`recording_finalized` 保存正数分片数量和合并录像的 SHA-256，两字段均相同的摘要可重报，任一字段不同则拒绝。`incident` 保存为异常记录。
 
 异常记录按发生时间保存，每条记录包含 `occurred_at`：
 

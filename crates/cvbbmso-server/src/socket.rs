@@ -14,13 +14,6 @@ use uuid::Uuid;
 
 use crate::hub::{Connection, Hub, OUTBOUND_CAPACITY, Peer, SocketError, StudentKey};
 
-pub(crate) fn message_limit(exam_duration: ::time::Duration) -> usize {
-    // Budget at least one segment per second, including fractional timestamps,
-    // and leave room for extra segments during capture recovery and finalizing.
-    let seconds = usize::try_from(exam_duration.whole_seconds()).unwrap_or(usize::MAX);
-    (2 * 1024 * 1024).max(seconds.saturating_add(60).saturating_mul(256))
-}
-
 pub(crate) async fn run(
     socket: WebSocket,
     hub: Hub,

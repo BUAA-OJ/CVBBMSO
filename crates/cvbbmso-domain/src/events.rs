@@ -1,4 +1,4 @@
-use cvbbmso_protocol::{ExamEvent, RecordingManifest, SegmentMeta};
+use cvbbmso_protocol::{ExamEvent, RecordingSummary, SegmentMeta};
 use sea_orm::{
     ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Select,
     Set,
@@ -37,14 +37,14 @@ pub(crate) async fn receive(
         };
     }
 
-    if let ExamEvent::RecordingFinalized(ref manifest) = event
+    if let ExamEvent::RecordingFinalized(ref summary) = event
         && recording(tx, key)
             .await
             .map_err(|error| match error {
                 DomainError::Conflict => DomainError::InvalidInput,
                 error => error,
             })?
-            .is_some_and(|(_, existing)| &existing != manifest)
+            .is_some_and(|(_, existing)| &existing != summary)
     {
         return Err(DomainError::InvalidInput);
     }
@@ -101,11 +101,9 @@ pub(crate) async fn has_gap(
 pub(crate) async fn recording(
     tx: &DatabaseTransaction,
     key: &StudentKey,
-) -> Result<Option<(i64, RecordingManifest)>, DomainError> {
+) -> Result<Option<(i64, RecordingSummary)>, DomainError> {
     use stored_event::Column;
-    // Older versions allowed different manifests. Preserve the events and
-    // surface the ambiguity instead of returning one as the exam's recording.
-    let manifests = student_events(key)
+    let recordings = student_events(key)
         .filter(
             Expr::from(
                 Func::cust("json_extract")
@@ -122,10 +120,10 @@ pub(crate) async fn recording(
         .into_tuple::<(i64, String)>()
         .all(tx)
         .await?;
-    match manifests.as_slice() {
+    match recordings.as_slice() {
         [] => Ok(None),
         [(seq, event)] => match db::decode(event)? {
-            ExamEvent::RecordingFinalized(manifest) => Ok(Some((*seq, manifest))),
+            ExamEvent::RecordingFinalized(summary) => Ok(Some((*seq, summary))),
             _ => Err(DomainError::InvalidInput),
         },
         _ => Err(DomainError::Conflict),
@@ -137,16 +135,7 @@ fn validated(event: ExamEvent) -> Result<ExamEvent, DomainError> {
         ExamEvent::SegmentFinalized(segment) => {
             validate_segment(segment).map(ExamEvent::SegmentFinalized)
         }
-        ExamEvent::RecordingFinalized(manifest) => {
-            let segments = manifest
-                .segments
-                .into_iter()
-                .map(validate_segment)
-                .collect::<Result<_, _>>()?;
-            RecordingManifest::new(segments, manifest.merged_sha256)
-                .map(ExamEvent::RecordingFinalized)
-                .map_err(|_| DomainError::InvalidInput)
-        }
+        ExamEvent::RecordingFinalized(_) => Ok(event),
         ExamEvent::Incident(incident) => {
             db::input_time(incident.occurred_at)?;
             Ok(ExamEvent::Incident(incident))

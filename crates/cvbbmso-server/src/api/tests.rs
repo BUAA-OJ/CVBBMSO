@@ -16,7 +16,7 @@ use axum::{
 use cvbbmso_domain::{AdminOperation, AdminOutput, AdminService};
 use cvbbmso_protocol::{
     ClientHello, ClientMessage, ClientState, CommandName, CommandStatus, ExamEvent, ExamPhase,
-    ExecutionState, Platform, RecordingManifest, RecordingPolicy, RecordingState, SegmentMeta,
+    ExecutionState, Platform, RecordingPolicy, RecordingState, RecordingSummary, SegmentMeta,
     ServerMessage, Sha256Digest,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -181,7 +181,9 @@ impl Fixture {
     }
 
     async fn upgrade(&self, path: &str, cookie: &str) -> Result<TestSocket, ClientError> {
-        let (client, server) = duplex(64 * 1024);
+        // Fit an oversized test frame and its header in one write so the
+        // server can reject it without interrupting the test client's send.
+        let (client, server) = duplex(128 * 1024);
         self.clients.send(server).unwrap();
         let mut request = format!("ws://localhost{path}")
             .into_client_request()
@@ -766,29 +768,63 @@ async fn disconnect_storage_failure_is_reconciled() {
 }
 
 #[tokio::test]
-async fn limits_the_total_size_of_a_fragmented_message() {
-    let fixture = Fixture::new().await;
-    let mut socket = fixture.upgrade(&fixture.path(), COOKIE).await.unwrap();
-    for (opcode, final_frame) in [(Data::Text, false), (Data::Continue, true)] {
-        let limit = socket::message_limit(time::Duration::seconds(END - START));
-        let bytes = vec![b' '; limit / 2 + 1];
+async fn enforces_the_same_frame_and_message_limit_for_short_and_long_exams() {
+    const LIMIT: usize = 65_536;
+    let state = hello(ExecutionState::Ready, RecordingState::Idle);
+    let padded = |size| {
+        let mut bytes = serde_json::to_vec(&state).unwrap();
+        bytes.resize(size, b' ');
+        bytes
+    };
+    for end in [END, START + 4 * 3_600] {
+        let fixture = Fixture::with_exam(end, 1).await;
+        let mut socket = fixture.upgrade(&fixture.path(), COOKIE).await.unwrap();
+        socket
+            .send(Message::Text(
+                String::from_utf8(padded(LIMIT)).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            message(&mut socket).await,
+            ServerMessage::Sync { .. }
+        ));
+        close_socket(&fixture, &mut socket).await;
+
+        let mut socket = fixture.upgrade(&fixture.path(), COOKIE).await.unwrap();
+        socket
+            .send(Message::Text(
+                String::from_utf8(padded(LIMIT + 1)).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        socket_error(&mut socket, error_code::PROTOCOL_ERROR).await;
+
+        let mut socket = fixture.upgrade(&fixture.path(), COOKIE).await.unwrap();
+        let mut first = padded(LIMIT + 1);
+        let last = first.split_off(LIMIT / 2);
         socket
             .send(Message::Frame(Frame::message(
-                bytes,
-                OpCode::Data(opcode),
-                final_frame,
+                first,
+                OpCode::Data(Data::Text),
+                false,
             )))
             .await
             .unwrap();
+        socket
+            .send(Message::Frame(Frame::message(
+                last,
+                OpCode::Data(Data::Continue),
+                true,
+            )))
+            .await
+            .unwrap();
+        socket_error(&mut socket, error_code::PROTOCOL_ERROR).await;
     }
-    socket_error(&mut socket, error_code::PROTOCOL_ERROR).await;
-    let state = hello(ExecutionState::Ready, RecordingState::Idle);
-    let mut socket = open_socket(&fixture, &state, 0).await;
-    close_socket(&fixture, &mut socket).await;
 }
 
 #[tokio::test]
-async fn accepts_a_two_hour_manifest_with_one_second_segments() {
+async fn accepts_a_two_hour_recording_summary_with_one_second_segments() {
     let end = START + 7_200;
     let fixture = Fixture::with_exam(end, 1).await;
     fixture.clock.store(end, Ordering::Relaxed);
@@ -796,18 +832,11 @@ async fn accepts_a_two_hour_manifest_with_one_second_segments() {
     let mut socket = open_socket(&fixture, &state, 0).await;
     let id = command(&mut socket, CommandName::EndExam, end).await;
     let digest = Sha256Digest::parse(&"b".repeat(64)).unwrap();
-    let segments = (1..=7_200)
-        .map(|index| {
-            let end = instant(START + i64::from(index));
-            SegmentMeta::new(index, end - time::Duration::SECOND, end, digest.clone()).unwrap()
-        })
-        .collect();
-    let manifest = RecordingManifest::new(segments, digest).unwrap();
+    let summary = RecordingSummary::new(7_200, digest).unwrap();
     let event = ClientMessage::Event {
         seq: 1,
-        event: ExamEvent::RecordingFinalized(manifest.clone()),
+        event: ExamEvent::RecordingFinalized(summary.clone()),
     };
-    assert!(serde_json::to_vec(&event).unwrap().len() > 1024 * 1024);
     send(&mut socket, &event).await;
     confirm(&mut socket, id).await;
     let stored = fixture
@@ -816,7 +845,7 @@ async fn accepts_a_two_hour_manifest_with_one_second_segments() {
             oj_user_id: STUDENT,
         })
         .await;
-    assert!(matches!(stored, AdminOutput::Recording(found) if found == manifest));
+    assert!(matches!(stored, AdminOutput::Recording(found) if found == summary));
 }
 
 async fn confirm(socket: &mut TestSocket, command_id: Uuid) {
@@ -891,7 +920,7 @@ async fn starts_schedules_and_finishes_an_exam_over_websocket() {
         &mut socket,
         &ClientMessage::Event {
             seq: 1,
-            event: ExamEvent::SegmentFinalized(segment.clone()),
+            event: ExamEvent::SegmentFinalized(segment),
         },
     )
     .await;
@@ -900,12 +929,12 @@ async fn starts_schedules_and_finishes_an_exam_over_websocket() {
     fixture.state.hub.trigger_schedule().await;
     let end_command = command(&mut socket, CommandName::EndExam, END).await;
     assert_ne!(start_command, end_command);
-    let manifest = RecordingManifest::new(vec![segment], digest).unwrap();
+    let summary = RecordingSummary::new(1, digest).unwrap();
     send(
         &mut socket,
         &ClientMessage::Event {
             seq: 2,
-            event: ExamEvent::RecordingFinalized(manifest.clone()),
+            event: ExamEvent::RecordingFinalized(summary.clone()),
         },
     )
     .await;
@@ -914,11 +943,11 @@ async fn starts_schedules_and_finishes_an_exam_over_websocket() {
     let _ = socket.next().await;
     fixture.state.hub.barrier().await;
 
-    assert_finished_recording(&fixture, &manifest).await;
+    assert_finished_recording(&fixture, &summary).await;
     assert!(incidents(&fixture).await.is_empty());
 }
 
-async fn assert_finished_recording(fixture: &Fixture, manifest: &RecordingManifest) {
+async fn assert_finished_recording(fixture: &Fixture, summary: &RecordingSummary) {
     let AdminOutput::Student(runtime) = fixture
         .admin(AdminOperation::StudentsShow {
             exam_id: fixture.exam_id,
@@ -943,6 +972,14 @@ async fn assert_finished_recording(fixture: &Fixture, manifest: &RecordingManife
         events.iter().map(|event| event.seq).collect::<Vec<_>>(),
         vec![1, 2]
     );
+    assert!(matches!(
+        &events[0].event,
+        ExamEvent::SegmentFinalized(segment) if segment.index == 1
+    ));
+    assert!(matches!(
+        &events[1].event,
+        ExamEvent::RecordingFinalized(found) if found == summary
+    ));
     let AdminOutput::Recording(recording) = fixture
         .admin(AdminOperation::RecordingsShow {
             exam_id: fixture.exam_id,
@@ -952,7 +989,7 @@ async fn assert_finished_recording(fixture: &Fixture, manifest: &RecordingManife
     else {
         panic!("expected recording");
     };
-    assert_eq!(&recording, manifest);
+    assert_eq!(&recording, summary);
 }
 
 async fn events(fixture: &Fixture) -> Vec<cvbbmso_domain::EventRecord> {
@@ -1244,11 +1281,10 @@ async fn replays_end_handshake_after_ack_loss() {
     let mut socket = open_socket(&fixture, &state, 0).await;
     let previous = command(&mut socket, CommandName::EndExam, END).await;
     let digest = Sha256Digest::parse(&"b".repeat(64)).unwrap();
-    let segment = SegmentMeta::new(1, instant(START), instant(END), digest.clone()).unwrap();
-    let manifest = RecordingManifest::new(vec![segment], digest).unwrap();
+    let summary = RecordingSummary::new(1, digest).unwrap();
     let finalized = ClientMessage::Event {
         seq: 1,
-        event: ExamEvent::RecordingFinalized(manifest),
+        event: ExamEvent::RecordingFinalized(summary),
     };
     send(&mut socket, &finalized).await;
     let result = ClientMessage::CommandResult {
@@ -1280,7 +1316,7 @@ async fn replays_end_handshake_after_ack_loss() {
 }
 
 #[tokio::test]
-async fn successful_end_waits_for_a_contiguous_manifest() {
+async fn successful_end_waits_for_a_contiguous_recording_summary() {
     let fixture = Fixture::new().await;
     fixture.clock.store(END, Ordering::Relaxed);
     let state = hello(ExecutionState::Finalizing, RecordingState::Complete);
@@ -1288,12 +1324,12 @@ async fn successful_end_waits_for_a_contiguous_manifest() {
     let end = command(&mut socket, CommandName::EndExam, END).await;
     let digest = Sha256Digest::parse(&"b".repeat(64)).unwrap();
     let segment = SegmentMeta::new(1, instant(START), instant(END), digest.clone()).unwrap();
-    let manifest = RecordingManifest::new(vec![segment.clone()], digest).unwrap();
+    let summary = RecordingSummary::new(1, digest).unwrap();
     send(
         &mut socket,
         &ClientMessage::Event {
             seq: 2,
-            event: ExamEvent::RecordingFinalized(manifest.clone()),
+            event: ExamEvent::RecordingFinalized(summary.clone()),
         },
     )
     .await;
@@ -1320,7 +1356,7 @@ async fn successful_end_waits_for_a_contiguous_manifest() {
     .await;
     confirm(&mut socket, end).await;
     close_socket(&fixture, &mut socket).await;
-    assert_finished_recording(&fixture, &manifest).await;
+    assert_finished_recording(&fixture, &summary).await;
 }
 
 #[tokio::test]

@@ -24,6 +24,8 @@ use crate::{
     socket,
 };
 
+const MAX_INBOUND_WS_BYTES: usize = 64 * 1024;
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     exam: Arc<ExamService>,
@@ -129,12 +131,11 @@ async fn upgrade(
     let upgrade = upgrade.map_err(|_| HttpError::invalid_request("invalid WebSocket upgrade"))?;
     validate_upgrade_headers(&headers)?;
     let user = state.authenticate(&headers).await?;
-    let duration = state
+    state
         .exam
         .check_enrollment(exam_id, user.id)
         .await
         .map_err(|error| HttpError::domain(&error))?;
-    let message_limit = socket::message_limit(duration);
     let key = StudentKey {
         exam_id,
         oj_user_id: user.id,
@@ -142,8 +143,8 @@ async fn upgrade(
     let request_span = Span::current();
     let failure_span = request_span.clone();
     Ok(upgrade
-        .max_frame_size(message_limit)
-        .max_message_size(message_limit)
+        .max_frame_size(MAX_INBOUND_WS_BYTES)
+        .max_message_size(MAX_INBOUND_WS_BYTES)
         .on_failed_upgrade(move |_| {
             failure_span.in_scope(|| tracing::warn!("WebSocket upgrade failed"));
         })
