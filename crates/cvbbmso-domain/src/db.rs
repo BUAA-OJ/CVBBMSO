@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin, time::Duration};
+use std::{borrow::Cow, error::Error, future::Future, pin::Pin, time::Duration};
 
 use cvbbmso_protocol::{ClientState, ExamPhase, ExamSummary, RecordingPolicy};
 use migration::{Migrator, MigratorTrait};
@@ -100,6 +100,51 @@ pub(crate) fn busy(error: &DomainError) -> bool {
         .code()
         .and_then(|code| code.parse::<u32>().ok())
         .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+}
+
+pub(crate) fn storage_diagnostic(source: &(dyn Error + 'static)) -> Cow<'static, str> {
+    // Driver and conversion messages can quote database paths or stored values.
+    if let Some(error) = source.downcast_ref::<DbErr>() {
+        let (operation, runtime) = match error {
+            DbErr::Conn(runtime) => ("connection", runtime),
+            DbErr::Exec(runtime) => ("execution", runtime),
+            DbErr::Query(runtime) => ("query", runtime),
+            DbErr::ConnectionAcquire(reason) => return reason.to_string().into(),
+            DbErr::Migration(_) => return "database migration failed".into(),
+            DbErr::Type(_) | DbErr::TryIntoErr { .. } => {
+                return "database value type conversion failed".into();
+            }
+            _ => return "database operation failed".into(),
+        };
+        if let RuntimeErr::SqlxError(error) = runtime {
+            return match error.as_ref() {
+                sqlx::Error::Database(error) => {
+                    let code = error.code().and_then(|code| code.parse::<u32>().ok());
+                    match code {
+                        Some(code) => format!("SQLite {operation} failed (code {code})").into(),
+                        None => format!("SQLite {operation} failed").into(),
+                    }
+                }
+                sqlx::Error::Io(error) => {
+                    format!("database {operation} I/O failed ({:?})", error.kind()).into()
+                }
+                sqlx::Error::PoolTimedOut => "database pool timed out".into(),
+                sqlx::Error::PoolClosed => "database pool is closed".into(),
+                _ => format!("database driver {operation} failed").into(),
+            };
+        }
+        return format!("database {operation} failed").into();
+    }
+    if let Some(error) = source.downcast_ref::<serde_json::Error>() {
+        return format!("stored JSON error ({:?})", error.classify()).into();
+    }
+    if source.is::<uuid::Error>() {
+        return "invalid stored UUID".into();
+    }
+    if source.is::<time::error::Parse>() || source.is::<time::error::Format>() {
+        return "invalid stored timestamp".into();
+    }
+    "stored value conversion failed".into()
 }
 
 pub(crate) fn timestamp(value: OffsetDateTime) -> Result<String, time::error::Format> {

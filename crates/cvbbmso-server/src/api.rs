@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use axum::{
     Extension, Json, Router,
@@ -124,9 +124,9 @@ async fn upgrade(
     upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
-    let Path(exam_id) = path.map_err(|_| HttpError::INVALID_REQUEST)?;
+    let Path(exam_id) = path.map_err(|_| HttpError::invalid_request("invalid exam ID"))?;
     Span::current().record("exam_id", tracing::field::display(exam_id));
-    let upgrade = upgrade.map_err(|_| HttpError::INVALID_REQUEST)?;
+    let upgrade = upgrade.map_err(|_| HttpError::invalid_request("invalid WebSocket upgrade"))?;
     validate_upgrade_headers(&headers)?;
     let user = state.authenticate(&headers).await?;
     let duration = state
@@ -164,13 +164,17 @@ fn validate_upgrade_headers(headers: &HeaderMap) -> Result<(), HttpError> {
                 .eq_ignore_ascii_case("upgrade")
         });
     let mut keys = headers.get_all(header::SEC_WEBSOCKET_KEY).iter();
-    let key = keys.next().ok_or(HttpError::INVALID_REQUEST)?;
+    let key = keys
+        .next()
+        .ok_or_else(|| HttpError::invalid_request("missing WebSocket key"))?;
     let mut nonce = [0; 16];
     if !upgrade
         || keys.next().is_some()
         || STANDARD.decode_slice(key, &mut nonce) != Ok(nonce.len())
     {
-        return Err(HttpError::INVALID_REQUEST);
+        return Err(HttpError::invalid_request(
+            "invalid WebSocket handshake headers",
+        ));
     }
     Ok(())
 }
@@ -193,7 +197,7 @@ fn parse_cookies(headers: &HeaderMap) -> Result<AccodingCookies, AccodingError> 
 }
 
 async fn invalid_route() -> HttpError {
-    HttpError::INVALID_REQUEST
+    HttpError::invalid_request("unrecognized route or method")
 }
 
 #[derive(Debug)]
@@ -201,6 +205,7 @@ struct HttpError {
     status: StatusCode,
     code: &'static str,
     message: &'static str,
+    reason: Cow<'static, str>,
 }
 
 impl HttpError {
@@ -208,59 +213,103 @@ impl HttpError {
         status: StatusCode::BAD_REQUEST,
         code: error_code::INVALID_REQUEST,
         message: "Invalid request",
+        reason: Cow::Borrowed("invalid request"),
     };
     const ACCODING_AUTH_EXPIRED: Self = Self {
         status: StatusCode::UNAUTHORIZED,
         code: error_code::ACCODING_AUTH_EXPIRED,
         message: "Accoding login required",
+        reason: Cow::Borrowed("Accoding authentication rejected"),
     };
     const NOT_ENROLLED: Self = Self {
         status: StatusCode::FORBIDDEN,
         code: error_code::NOT_ENROLLED,
         message: "Exam enrollment required",
+        reason: Cow::Borrowed("user is not enrolled"),
     };
     const EXAM_NOT_FOUND: Self = Self {
         status: StatusCode::NOT_FOUND,
         code: error_code::EXAM_NOT_FOUND,
         message: "Exam not found",
+        reason: Cow::Borrowed("exam not found"),
     };
     const ACCODING_UNAVAILABLE: Self = Self {
         status: StatusCode::SERVICE_UNAVAILABLE,
         code: error_code::ACCODING_UNAVAILABLE,
         message: "Accoding identity service unavailable",
+        reason: Cow::Borrowed("Accoding identity request failed"),
     };
     const INTERNAL_ERROR: Self = Self {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         code: error_code::INTERNAL_ERROR,
         message: "Internal server error",
+        reason: Cow::Borrowed("internal failure"),
     };
 
-    fn authentication(error: &AccodingError) -> Self {
-        match error {
-            AccodingError::InvalidHeader(_) => Self::INVALID_REQUEST,
-            AccodingError::MissingSession | AccodingError::Unauthenticated => {
-                Self::ACCODING_AUTH_EXPIRED
-            }
-            AccodingError::Upstream(_) | AccodingError::InvalidResponse(_) => {
-                Self::ACCODING_UNAVAILABLE
-            }
-            _ => Self::INTERNAL_ERROR,
+    fn invalid_request(reason: &'static str) -> Self {
+        Self {
+            reason: Cow::Borrowed(reason),
+            ..Self::INVALID_REQUEST
         }
     }
 
+    fn authentication(error: &AccodingError) -> Self {
+        // Upstream errors can contain URLs or response data.
+        let (response, reason) = match error {
+            AccodingError::InvalidHeader(_) => {
+                return Self::invalid_request("invalid Accoding cookie header");
+            }
+            AccodingError::MissingSession => (
+                Self::ACCODING_AUTH_EXPIRED,
+                "missing Accoding session cookie".into(),
+            ),
+            AccodingError::Unauthenticated => (
+                Self::ACCODING_AUTH_EXPIRED,
+                "Accoding session rejected".into(),
+            ),
+            AccodingError::InvalidResponse(Some(error)) => (
+                Self::ACCODING_UNAVAILABLE,
+                format!("invalid Accoding JSON response ({:?})", error.classify()).into(),
+            ),
+            AccodingError::InvalidResponse(None) => (
+                Self::ACCODING_UNAVAILABLE,
+                "unexpected Accoding identity response".into(),
+            ),
+            AccodingError::Upstream(error) => {
+                let reason = if let Some(status) = error.status() {
+                    format!("Accoding returned HTTP {}", status.as_u16()).into()
+                } else if error.is_timeout() {
+                    "Accoding request timed out".into()
+                } else if error.is_connect() {
+                    "Accoding connection failed".into()
+                } else if error.is_body() {
+                    "failed to read Accoding response body".into()
+                } else {
+                    "Accoding HTTP request failed".into()
+                };
+                (Self::ACCODING_UNAVAILABLE, reason)
+            }
+            _ => (Self::INTERNAL_ERROR, "Accoding verification failed".into()),
+        };
+        Self { reason, ..response }
+    }
+
     fn domain(error: &DomainError) -> Self {
-        match error {
-            DomainError::InvalidInput => Self::INVALID_REQUEST,
-            DomainError::NotEnrolled => Self::NOT_ENROLLED,
-            DomainError::NotFound => Self::EXAM_NOT_FOUND,
-            _ => Self::INTERNAL_ERROR,
+        Self {
+            reason: error.diagnostic(),
+            ..match error {
+                DomainError::InvalidInput => Self::INVALID_REQUEST,
+                DomainError::NotEnrolled => Self::NOT_ENROLLED,
+                DomainError::NotFound => Self::EXAM_NOT_FOUND,
+                _ => Self::INTERNAL_ERROR,
+            }
         }
     }
 }
 
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
-        tracing::warn!(code = self.code, "request rejected");
+        tracing::warn!(code = self.code, reason = %self.reason, "request rejected");
         (
             self.status,
             Json(json!({ "error": { "code": self.code, "message": self.message } })),

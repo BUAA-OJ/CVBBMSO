@@ -17,7 +17,7 @@ pub use admin::{
 };
 pub use exam::{ConnectOutcome, DirectedCommand, DisconnectReason, ExamService};
 
-use std::{error::Error, sync::Arc};
+use std::{borrow::Cow, error::Error, sync::Arc};
 
 use sea_orm::{DatabaseConnection, DbErr};
 use thiserror::Error;
@@ -49,6 +49,19 @@ pub enum DomainError {
 }
 
 impl DomainError {
+    /// Returns a log message with error categories and numeric diagnostics.
+    /// The message omits data carried in the underlying error's text.
+    #[must_use]
+    pub fn diagnostic(&self) -> Cow<'static, str> {
+        match self {
+            Self::NotFound => "resource not found".into(),
+            Self::NotEnrolled => "user is not enrolled".into(),
+            Self::InvalidInput => "invalid input".into(),
+            Self::Conflict => "conflicting state".into(),
+            Self::Storage { source } => db::storage_diagnostic(source.as_ref()),
+        }
+    }
+
     /// Returns whether a temporary SQLite lock prevented the operation.
     #[must_use]
     pub fn is_storage_busy(&self) -> bool {

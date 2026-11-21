@@ -91,7 +91,10 @@ async fn main() -> ExitCode {
 fn log_failure(error: &ServerError) {
     let category = match error {
         ServerError::Config(_) => "config",
-        ServerError::Database(_) => "database",
+        ServerError::Database(source) => {
+            tracing::error!(category = "database", %error, reason = %source.diagnostic(), "server stopped");
+            return;
+        }
         ServerError::Io(_) => "io",
     };
     let mut sources = Vec::new();

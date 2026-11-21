@@ -52,6 +52,8 @@ async fn serve(config: ServerConfig) -> Result<(), ServerError>;
 
 错误码本身由 [cvbbmso-protocol](cvbbmso-protocol.md) 定义；本表维护 HTTP 状态码映射。同一考生从新设备连接时，服务端按“替换旧连接”处理。
 
+HTTP 与 WebSocket 拒绝日志同时记录协议错误码和经过脱敏的失败原因。日志仅记录错误类别和安全诊断字段，例如上游 HTTP 状态与 SQLite 错误号。客户端继续收到协议错误码和通用文案。
+
 ## WebSocket 处理
 
 协议端点为 `wss://<监考服务端>/api/exams/{exam_id}/ws`。服务端在升级前从握手 Cookie 确认考生身份，失败时按上表返回同格式的 HTTP 错误。升级成功后，客户端先发送 `hello`，服务端调用 `ExamService::connect(exam_id, oj_user_id, hello)` 返回 `sync` 和待下发的新命令。后续 `heartbeat`、`status`、`event` 交给 `ExamService::receive`，会话校验 `command_result` 后交给 `ExamService::record_command_result`。入站帧和消息上限按每秒一个录像分片估算，包含 60 秒收尾余量，最低 2 MiB。每条连接最多有一条应用消息在共享队列中等待或处理。所有消息字段见 [cvbbmso-protocol](cvbbmso-protocol.md)。

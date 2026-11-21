@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque, hash_map::Entry},
     sync::Arc,
     time::Duration,
@@ -348,7 +349,7 @@ impl Manager {
             Ok(outcome) => outcome,
             Err(error) => {
                 let error = SocketError::domain(&error);
-                span.in_scope(|| tracing::warn!(code = error.code, "WebSocket admission rejected"));
+                span.in_scope(|| error.log_rejection("WebSocket admission rejected"));
                 let _ = peer.close.send(Some(error));
                 return;
             }
@@ -446,8 +447,8 @@ impl Manager {
         let span = connection.span();
         self.record_lost(lost).await;
         span.in_scope(|| {
-            if let Some(error) = error {
-                tracing::warn!(code = error.code, "WebSocket message rejected");
+            if let Some(error) = &error {
+                error.log_rejection("WebSocket message rejected");
             }
             tracing::info!(?reason, "WebSocket disconnected");
         });
@@ -470,7 +471,7 @@ impl Manager {
                 if !error.is_storage_busy() {
                     lost.connection.span().in_scope(|| {
                         tracing::error!(
-                            ?error,
+                            reason = %error.diagnostic(),
                             "could not record WebSocket disconnect; will retry"
                         );
                     });
@@ -494,7 +495,7 @@ impl Manager {
         let commands = match self.exam.due_commands().await {
             Ok(commands) => commands,
             Err(error) => {
-                tracing::warn!(%error, "command scheduling failed");
+                tracing::warn!(reason = %error.diagnostic(), "command scheduling failed");
                 return;
             }
         };
@@ -520,39 +521,65 @@ impl Connection {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
 pub(crate) struct SocketError {
     code: &'static str,
     message: &'static str,
+    reason: Cow<'static, str>,
 }
 
 impl SocketError {
-    pub(crate) const PROTOCOL_ERROR: Self = Self {
+    const PROTOCOL_ERROR: Self = Self {
         code: error_code::PROTOCOL_ERROR,
         message: "Invalid WebSocket message",
-    };
-    pub(crate) const HELLO_REQUIRED: Self = Self {
-        code: error_code::PROTOCOL_ERROR,
-        message: "hello must be the first message",
+        reason: Cow::Borrowed("invalid protocol message"),
     };
     const INTERNAL_ERROR: Self = Self {
         code: error_code::INTERNAL_ERROR,
         message: "Internal server error",
+        reason: Cow::Borrowed("internal failure"),
     };
 
+    pub(crate) fn protocol(reason: &'static str) -> Self {
+        Self {
+            reason: Cow::Borrowed(reason),
+            ..Self::PROTOCOL_ERROR
+        }
+    }
+
+    pub(crate) fn hello_required(reason: &'static str) -> Self {
+        Self {
+            code: error_code::PROTOCOL_ERROR,
+            message: "hello must be the first message",
+            reason: Cow::Borrowed(reason),
+        }
+    }
+
     fn domain(error: &DomainError) -> Self {
+        let reason = error.diagnostic();
         match error {
-            DomainError::InvalidInput => Self::PROTOCOL_ERROR,
+            DomainError::InvalidInput => Self {
+                reason,
+                ..Self::PROTOCOL_ERROR
+            },
             DomainError::NotEnrolled => Self {
                 code: error_code::NOT_ENROLLED,
                 message: "Exam enrollment required",
+                reason,
             },
             DomainError::Conflict => Self {
                 code: error_code::COMMAND_STATE_CONFLICT,
                 message: "Command result conflicts with command state",
+                reason,
             },
-            _ => Self::INTERNAL_ERROR,
+            _ => Self {
+                reason,
+                ..Self::INTERNAL_ERROR
+            },
         }
+    }
+
+    pub(crate) fn log_rejection(&self, message: &'static str) {
+        tracing::warn!(code = self.code, reason = %self.reason, "{message}");
     }
 
     pub(crate) fn frame(self) -> ServerMessage {

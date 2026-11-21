@@ -1,7 +1,10 @@
 use std::{
     io,
     net::Ipv4Addr,
-    sync::atomic::{AtomicI64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicI64, Ordering},
+    },
 };
 
 use axum::{
@@ -138,6 +141,12 @@ impl Fixture {
                     "connect.sid=other" => OTHER_STUDENT,
                     "connect.sid=expired" => return Err(AccodingError::Unauthenticated),
                     "connect.sid=upstream" => return Err(AccodingError::InvalidResponse(None)),
+                    "connect.sid=upstream-json" => {
+                        let error =
+                            serde_json::from_str::<i64>(r#""private test upstream response""#)
+                                .unwrap_err();
+                        return Err(AccodingError::InvalidResponse(Some(error)));
+                    }
                     _ => panic!("unexpected synthetic cookie"),
                 };
                 Ok(AccodingUser::new(id, format!("student{id}"), "Student".into()).unwrap())
@@ -247,6 +256,93 @@ async fn socket_error(socket: &mut TestSocket, expected: &str) {
 async fn body(response: Response<Body>) -> serde_json::Value {
     let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for CapturedLogs {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn rejection_logs_retain_diagnostics_without_disclosing_source_text() {
+    use sea_orm::{ConnectionTrait, Database};
+
+    let logs = CapturedLogs::default();
+    let writer = logs.clone();
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+
+    let fixture = Fixture::new().await;
+    let response = fixture
+        .request(
+            Request::get("/api/exams")
+                .header(header::COOKIE, "connect.sid=upstream-json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body(response).await,
+        json!({"error": {
+            "code": error_code::ACCODING_UNAVAILABLE,
+            "message": "Accoding identity service unavailable"
+        }})
+    );
+
+    let state = hello(ExecutionState::Ready, RecordingState::Idle);
+    let mut socket = open_socket(&fixture, &state, 0).await;
+    let db = Database::connect(&fixture.database_url).await.unwrap();
+    db.execute_unprepared("CREATE TRIGGER reject_event BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'private test source text'); END")
+        .await.unwrap();
+    send(&mut socket, &navigation(1, "private test event detail")).await;
+    assert_eq!(
+        message(&mut socket).await,
+        ServerMessage::Error {
+            code: error_code::INTERNAL_ERROR.into(),
+            message: "Internal server error".into(),
+        }
+    );
+
+    let bytes = logs.0.lock().unwrap();
+    let output = std::str::from_utf8(&bytes).unwrap();
+    let entries: Vec<_> = output
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect();
+    assert!(
+        entries.iter().any(|entry| {
+            let fields = &entry["fields"];
+            fields["code"] == error_code::ACCODING_UNAVAILABLE
+                && fields["reason"] == "invalid Accoding JSON response (Data)"
+        }),
+        "{output}"
+    );
+    assert!(
+        entries.iter().any(|entry| {
+            let fields = &entry["fields"];
+            fields["code"] == error_code::INTERNAL_ERROR
+                && fields["reason"].as_str().is_some_and(|reason| {
+                    reason.starts_with("SQLite ") && reason.contains("code 1811")
+                })
+        }),
+        "{output}"
+    );
+    assert!(!output.contains("connect.sid=upstream-json"));
+    assert!(!output.contains("private test"));
 }
 
 #[tokio::test]
@@ -1309,27 +1405,12 @@ async fn undeliverable_command_disconnects_and_reconnect_gets_a_new_command() {
 
 #[tokio::test]
 async fn request_logs_include_metadata_and_keep_cookie_values_private() {
-    use std::sync::Mutex;
-
-    struct Capture(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for Capture {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
     let fixture = Fixture::new().await;
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let writer = Arc::clone(&output);
+    let logs = CapturedLogs::default();
+    let writer = logs.clone();
     let subscriber = tracing_subscriber::fmt()
         .json()
-        .with_writer(move || Capture(Arc::clone(&writer)))
+        .with_writer(move || writer.clone())
         .finish();
     // Keep callsite interest stable while other tests use the same Router.
     tracing::subscriber::set_global_default(subscriber).unwrap();
@@ -1343,7 +1424,7 @@ async fn request_logs_include_metadata_and_keep_cookie_values_private() {
         .await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    let output = output.lock().unwrap();
+    let output = logs.0.lock().unwrap();
     let output = std::str::from_utf8(&output).unwrap();
     assert!(!output.contains("connect.sid"));
     assert!(!output.contains("s%3Aexample"));

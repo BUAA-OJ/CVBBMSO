@@ -43,10 +43,7 @@ async fn session(mut socket: WebSocket, hub: Hub, connection: Connection, timeou
         Ok(Some(hello)) => hello,
         Ok(None) => return,
         Err(error) => {
-            tracing::warn!(
-                code = cvbbmso_protocol::error_code::PROTOCOL_ERROR,
-                "WebSocket handshake rejected"
-            );
+            error.log_rejection("WebSocket handshake rejected");
             if send_message(&mut socket, error.frame(), timeout)
                 .await
                 .is_ok()
@@ -96,8 +93,9 @@ async fn first_message(
     match next_message(reader, Instant::now() + timeout).await {
         Ok(Some((ClientMessage::Hello(hello), _))) => Ok(Some(hello)),
         Ok(None) => Ok(None),
-        Err(ReadError::Malformed) => Err(SocketError::PROTOCOL_ERROR),
-        Ok(Some(_)) | Err(ReadError::Timeout) => Err(SocketError::HELLO_REQUIRED),
+        Err(ReadError::Malformed(reason)) => Err(SocketError::protocol(reason)),
+        Ok(Some(_)) => Err(SocketError::hello_required("first message was not hello")),
+        Err(ReadError::Timeout) => Err(SocketError::hello_required("timed out waiting for hello")),
     }
 }
 
@@ -109,8 +107,17 @@ async fn read_frames(
 ) {
     let (reason, error) = loop {
         match next_message(reader, deadline).await {
-            Ok(Some((ClientMessage::Hello(_), _))) | Err(ReadError::Malformed) => {
-                break (DisconnectReason::Closed, Some(SocketError::PROTOCOL_ERROR));
+            Ok(Some((ClientMessage::Hello(_), _))) => {
+                break (
+                    DisconnectReason::Closed,
+                    Some(SocketError::protocol("repeated hello")),
+                );
+            }
+            Err(ReadError::Malformed(reason)) => {
+                break (
+                    DisconnectReason::Closed,
+                    Some(SocketError::protocol(reason)),
+                );
             }
             Ok(Some((message, received_at))) => {
                 let Some(renewed) = hub.receive(connection, message, received_at).await else {
@@ -127,7 +134,7 @@ async fn read_frames(
 
 enum ReadError {
     Timeout,
-    Malformed,
+    Malformed(&'static str),
 }
 
 async fn next_message(
@@ -144,28 +151,34 @@ async fn next_message(
         }
         match frame {
             Some(Ok(Message::Text(text))) => {
-                let message = serde_json::from_str(&text).map_err(|_| ReadError::Malformed)?;
+                let message = serde_json::from_str(&text)
+                    .map_err(|_| ReadError::Malformed("invalid JSON message"))?;
                 return Ok(Some((message, received_at)));
             }
-            Some(Ok(Message::Binary(_))) => return Err(ReadError::Malformed),
+            Some(Ok(Message::Binary(_))) => {
+                return Err(ReadError::Malformed("binary frame received"));
+            }
             Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-            Some(Err(error)) if malformed_frame(&error) => return Err(ReadError::Malformed),
-            Some(Ok(Message::Close(_)) | Err(_)) | None => return Ok(None),
+            Some(Err(error)) => {
+                return match frame_error(&error) {
+                    Some(reason) => Err(ReadError::Malformed(reason)),
+                    None => Ok(None),
+                };
+            }
+            Some(Ok(Message::Close(_))) | None => return Ok(None),
         }
     }
 }
 
-fn malformed_frame(error: &axum::Error) -> bool {
+fn frame_error(error: &axum::Error) -> Option<&'static str> {
     let error = std::error::Error::source(error).and_then(|source| source.downcast_ref());
-    matches!(
-        error,
-        Some(WebSocketError::Utf8(_) | WebSocketError::Protocol(_) | WebSocketError::Capacity(_))
-    ) && !matches!(
-        error,
-        Some(WebSocketError::Protocol(
-            ProtocolError::ResetWithoutClosingHandshake
-        ))
-    )
+    match error {
+        Some(WebSocketError::Utf8(_)) => Some("invalid frame text encoding"),
+        Some(WebSocketError::Capacity(_)) => Some("frame or message exceeded size limit"),
+        Some(WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake)) => None,
+        Some(WebSocketError::Protocol(_)) => Some("invalid WebSocket frame"),
+        _ => None,
+    }
 }
 
 async fn write_frames(
