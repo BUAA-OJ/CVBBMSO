@@ -47,7 +47,7 @@ impl ExamService {
     /// 返回服务端观察连接状态时使用的 UTC 时钟。
     pub fn now(&self) -> time::OffsetDateTime;
 
-    /// 服务端开始监听前，将上次进程遗留的在线记录转为离线。
+    /// 服务端绑定端口后、处理请求前，将上次进程遗留的在线记录转为离线。
     pub async fn recover_online(&self) -> Result<(), DomainError>;
 
     /// 列出指定 Accoding 用户报名的考试。

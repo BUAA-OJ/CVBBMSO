@@ -1,5 +1,6 @@
 use std::{
     io,
+    net::Ipv4Addr,
     sync::atomic::{AtomicI64, Ordering},
 };
 
@@ -18,6 +19,7 @@ use futures_util::{SinkExt, StreamExt};
 use time::OffsetDateTime;
 use tokio::{
     io::{DuplexStream, duplex},
+    net::TcpListener,
     sync::mpsc,
     task::JoinHandle,
 };
@@ -35,7 +37,7 @@ use tokio_tungstenite::{
 use tower::ServiceExt;
 
 use super::*;
-use crate::hub::Manager;
+use crate::{ServerConfig, ServerError, hub::Manager, serve};
 
 mod extremes;
 mod peer;
@@ -793,6 +795,44 @@ async fn close_socket(fixture: &Fixture, socket: &mut TestSocket) {
     socket.send(Message::Close(None)).await.unwrap();
     let _ = socket.next().await;
     fixture.state.hub.barrier().await;
+}
+
+#[tokio::test]
+async fn occupied_port_preserves_the_existing_exam_connection() {
+    let fixture = Fixture::new().await;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    fixture.clock.store(START, Ordering::Relaxed);
+    let state = hello(ExecutionState::Ready, RecordingState::Idle);
+    let mut socket = open_socket(&fixture, &state, 0).await;
+    let start = command(&mut socket, CommandName::StartExam, START).await;
+
+    let startup = serve(ServerConfig {
+        listen_addr: listener.local_addr().unwrap(),
+        database_url: fixture.database_url.clone(),
+        heartbeat_timeout_secs: TIMEOUT.as_secs(),
+    })
+    .await;
+    assert!(
+        matches!(startup, Err(ServerError::Io(error)) if error.kind() == io::ErrorKind::AddrInUse)
+    );
+    assert!(incidents(&fixture).await.is_empty());
+
+    send(&mut socket, &navigation(1, "blocked")).await;
+    confirm(&mut socket, start).await;
+    assert_eq!(
+        events(&fixture)
+            .await
+            .iter()
+            .map(|row| row.seq)
+            .collect::<Vec<_>>(),
+        [1]
+    );
+    assert!(
+        incidents(&fixture)
+            .await
+            .iter()
+            .all(|row| row.kind != "connection_lost")
+    );
 }
 
 #[tokio::test]

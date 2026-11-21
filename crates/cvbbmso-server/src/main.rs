@@ -106,9 +106,9 @@ fn log_failure(error: &ServerError) {
 async fn serve(config: ServerConfig) -> Result<(), ServerError> {
     let timeout = config.heartbeat_timeout()?;
     let verifier = Verifier::new().map_err(|error| ServerError::Config(Box::new(error)))?;
+    let listener = TcpListener::bind(config.listen_addr).await?;
     let exam = Arc::new(ExamService::open(&config.database_url).await?);
     exam.recover_online().await?;
-    let listener = TcpListener::bind(config.listen_addr).await?;
     let (hub, manager) = hub::Manager::new(Arc::clone(&exam), timeout);
     let router = api::router(api::AppState::new(exam, verifier, hub.clone(), timeout));
     tracing::info!(listen_addr = %listener.local_addr()?, "server listening");
