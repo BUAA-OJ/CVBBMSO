@@ -18,7 +18,7 @@
 
 ## 构建和核验 DMG
 
-使用原生 macOS shell、Rust 工具链和 macOS SDK。在对应提交中运行脚本，生成本机架构的锁定 Release 构建，脚本输出 DMG 路径和 SHA-256。
+使用原生 macOS shell 和 macOS SDK。仓库的 `rust-toolchain.toml` 和 DMG 工作流均指定 Rust 1.99.1。在对应提交中运行脚本，生成本机架构的锁定 Release 构建，脚本输出 DMG 路径和 SHA-256。
 
 ```sh
 ./deploy/macos-egress/build-dmg.sh candidate

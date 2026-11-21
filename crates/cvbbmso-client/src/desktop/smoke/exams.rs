@@ -149,7 +149,7 @@ struct Connection {
     outgoing: mpsc::Sender<ServerMessage>,
     results: mpsc::UnboundedReceiver<ClientMessage>,
     denials: mpsc::UnboundedReceiver<String>,
-    recordings: mpsc::UnboundedReceiver<(u64, ExamEvent)>,
+    recordings: mpsc::UnboundedReceiver<(i64, ExamEvent)>,
     closed: oneshot::Receiver<()>,
 }
 

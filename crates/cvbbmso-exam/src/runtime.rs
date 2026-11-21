@@ -341,7 +341,7 @@ struct Runtime<C> {
     /// Retries a failed journal save even if no further events arrive.
     storage_retry_at: Option<Instant>,
     /// Highest event sequence queued to the current session.
-    sent_through: u64,
+    sent_through: i64,
 }
 
 impl<C: Capture> Runtime<C> {
@@ -427,7 +427,7 @@ impl<C: Capture> Runtime<C> {
             connected: self.connected,
             state: self.state,
             last_error_code: if self.storage_retry_at.is_some()
-                || self.journal.has_unnumbered_events()
+                || self.journal.has_unsendable_events()
             {
                 Some(error_code::INTERNAL_ERROR.to_owned())
             } else {
@@ -876,7 +876,7 @@ impl<C: Capture> Runtime<C> {
         if !self.connected
             || self.ack_deadline.is_some()
             || (command.name == CommandName::EndExam
-                && (self.storage_retry_at.is_some() || self.journal.has_unnumbered_events()))
+                && (self.storage_retry_at.is_some() || self.journal.has_unsendable_events()))
         {
             return;
         }

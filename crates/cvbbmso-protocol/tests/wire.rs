@@ -222,3 +222,26 @@ fn documented_server_messages_deserialize() {
     .expect("error parses");
     assert!(matches!(error, ServerMessage::Error { .. }));
 }
+
+#[test]
+fn event_sequences_and_acknowledgments_have_distinct_lower_bounds() {
+    let event = |seq| {
+        format!(
+            r#"{{"type":"event","seq":{seq},"event":{{"kind":"incident","data":{{"code":"recording_failed","occurred_at":"2026-12-20T00:59:55Z"}}}}}}"#
+        )
+    };
+    let sync = |ack| {
+        format!(
+            r#"{{"type":"sync","server_time":"2026-12-20T00:59:55Z","phase":"scheduled","start_at":"2026-12-20T01:00:00Z","end_at":"2026-12-20T04:00:00Z","recording_policy":{{"segment_duration_secs":30,"fps":15}},"ack_event_through":{ack}}}"#
+        )
+    };
+    for invalid in ["-1", "0", "9223372036854775808"] {
+        assert!(serde_json::from_str::<ClientMessage>(&event(invalid)).is_err());
+    }
+    for invalid in ["-1", "9223372036854775808"] {
+        assert!(serde_json::from_str::<ServerMessage>(&sync(invalid)).is_err());
+    }
+    assert!(serde_json::from_str::<ClientMessage>(&event("9223372036854775807")).is_ok());
+    assert!(serde_json::from_str::<ServerMessage>(&sync("9223372036854775807")).is_ok());
+    assert!(serde_json::from_str::<ServerMessage>(&sync("0")).is_ok());
+}

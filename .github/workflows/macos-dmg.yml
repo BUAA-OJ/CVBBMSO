@@ -20,7 +20,9 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
       - uses: Swatinem/rust-cache@v2
       - run: ./deploy/macos-egress/test-authorization.sh
       - run: cargo test --locked -p cvbbmso-network --lib

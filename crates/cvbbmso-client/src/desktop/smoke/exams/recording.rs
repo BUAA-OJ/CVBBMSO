@@ -168,7 +168,7 @@ async fn expect_completed(connection: &mut Connection, command_id: Uuid) -> Resu
     Ok(())
 }
 
-async fn next_recording_event(connection: &mut Connection) -> Result<(u64, ExamEvent), Error> {
+async fn next_recording_event(connection: &mut Connection) -> Result<(i64, ExamEvent), Error> {
     timeout(DEADLINE, connection.recordings.recv())
         .await?
         .ok_or_else(|| {
@@ -178,7 +178,7 @@ async fn next_recording_event(connection: &mut Connection) -> Result<(u64, ExamE
 
 async fn receive_manifest(
     connection: &mut Connection,
-    first_seq: u64,
+    first_seq: i64,
     first: SegmentMeta,
 ) -> Result<RecordingManifest, Error> {
     let mut seq = first_seq;
