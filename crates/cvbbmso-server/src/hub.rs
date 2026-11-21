@@ -12,7 +12,7 @@ use cvbbmso_protocol::{
 use time::OffsetDateTime;
 use tokio::{
     sync::{mpsc, oneshot},
-    time::{Instant, MissedTickBehavior, interval, sleep},
+    time::{Instant, MissedTickBehavior, interval, sleep_until},
 };
 use uuid::Uuid;
 
@@ -20,11 +20,12 @@ const INBOUND_CAPACITY: usize = 256;
 pub(crate) const OUTBOUND_CAPACITY: usize = 32;
 const SCHEDULE_INTERVAL: Duration = Duration::from_secs(1);
 const DISCONNECT_RETRY_BATCH: usize = 16;
+const WRITE_ATTEMPTS: u8 = 4;
 const WRITE_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 enum ReceiveOutcome {
     Continue(Instant),
-    Retry(ClientMessage),
+    Retry(ClientMessage, Instant),
     Stop,
 }
 
@@ -60,6 +61,7 @@ enum Request {
         connection: Connection,
         message: ClientMessage,
         received_at: Instant,
+        attempt: u8,
         processed: oneshot::Sender<ReceiveOutcome>,
     },
     End {
@@ -94,37 +96,35 @@ impl Hub {
         connection: Connection,
         mut message: ClientMessage,
         received_at: Instant,
+        on_retry: impl FnOnce(),
     ) -> Option<Instant> {
-        loop {
-            // Keep retries local to the reader so it cannot reorder or pile up messages.
-            match self.receive_once(connection, message, received_at).await? {
+        let mut on_retry = Some(on_retry);
+        // Wait outside the manager between attempts so other peers can make progress.
+        for attempt in 1..=WRITE_ATTEMPTS {
+            let (processed, completion) = oneshot::channel();
+            self.0
+                .send(Request::Receive {
+                    connection,
+                    message,
+                    received_at,
+                    attempt,
+                    processed,
+                })
+                .await
+                .ok()?;
+            match completion.await.ok()? {
                 ReceiveOutcome::Continue(deadline) => return Some(deadline),
                 ReceiveOutcome::Stop => return None,
-                ReceiveOutcome::Retry(retry) => {
+                ReceiveOutcome::Retry(retry, deadline) => {
+                    if let Some(on_retry) = on_retry.take() {
+                        on_retry();
+                    }
                     message = retry;
-                    sleep(WRITE_RETRY_DELAY).await;
+                    sleep_until((Instant::now() + WRITE_RETRY_DELAY).min(deadline)).await;
                 }
             }
         }
-    }
-
-    async fn receive_once(
-        &self,
-        connection: Connection,
-        message: ClientMessage,
-        received_at: Instant,
-    ) -> Option<ReceiveOutcome> {
-        let (processed, completion) = oneshot::channel();
-        self.0
-            .send(Request::Receive {
-                connection,
-                message,
-                received_at,
-                processed,
-            })
-            .await
-            .ok()?;
-        completion.await.ok()
+        None
     }
 
     pub(crate) async fn end(
@@ -301,10 +301,17 @@ impl Manager {
                     connection,
                     message,
                     received_at,
+                    attempt,
                     processed,
                 } => {
-                    let outcome = self.receive(connection, message, received_at).await;
-                    let _ = processed.send(outcome);
+                    // Let an active transaction settle before admitting a replacement.
+                    // Requests still in the queue can be discarded when the reader ends.
+                    if !processed.is_closed() {
+                        let outcome = self
+                            .receive(connection, message, received_at, attempt)
+                            .await;
+                        let _ = processed.send(outcome);
+                    }
                 }
                 Request::End {
                     connection,
@@ -381,6 +388,7 @@ impl Manager {
         connection: Connection,
         message: ClientMessage,
         received_at: Instant,
+        attempt: u8,
     ) -> ReceiveOutcome {
         let Some(current) = self
             .current
@@ -389,7 +397,7 @@ impl Manager {
         else {
             return ReceiveOutcome::Stop;
         };
-        if received_at >= current.deadline {
+        if received_at >= current.deadline || (attempt > 1 && Instant::now() >= current.deadline) {
             self.end(connection, DisconnectReason::HeartbeatTimeout, None)
                 .await;
             return ReceiveOutcome::Stop;
@@ -403,14 +411,19 @@ impl Manager {
                 return ReceiveOutcome::Continue(current.deadline);
             }
             Ok(false) => self.end(connection, DisconnectReason::Closed, None).await,
-            Err(error) if error.is_storage_busy() => {
-                // The reader cannot process a newer heartbeat until this write finishes.
-                current.deadline = current.deadline.max(Instant::now() + self.timeout);
-                #[cfg(test)]
-                self.write_retries.notify_one();
-                return ReceiveOutcome::Retry(message);
-            }
             Err(error) => {
+                if error.is_storage_busy() {
+                    if Instant::now() >= current.deadline {
+                        self.end(connection, DisconnectReason::HeartbeatTimeout, None)
+                            .await;
+                        return ReceiveOutcome::Stop;
+                    }
+                    if attempt < WRITE_ATTEMPTS {
+                        #[cfg(test)]
+                        self.write_retries.notify_one();
+                        return ReceiveOutcome::Retry(message, current.deadline);
+                    }
+                }
                 self.end(
                     connection,
                     DisconnectReason::Closed,

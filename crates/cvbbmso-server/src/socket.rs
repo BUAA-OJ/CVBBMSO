@@ -5,7 +5,7 @@ use cvbbmso_domain::DisconnectReason;
 use cvbbmso_protocol::{ClientHello, ClientMessage, ServerMessage};
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{Notify, mpsc, oneshot},
     time::{self, Instant},
 };
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, error::ProtocolError};
@@ -105,8 +105,13 @@ async fn read_frames(
     connection: Connection,
     mut deadline: Instant,
 ) {
+    let mut buffered = None;
     let (reason, error) = loop {
-        match next_message(reader, deadline).await {
+        let incoming = match buffered.take() {
+            Some(incoming) => incoming,
+            None => next_message(reader, deadline).await,
+        };
+        let (message, received_at) = match incoming {
             Ok(Some((ClientMessage::Hello(_), _))) => {
                 break (
                     DisconnectReason::Closed,
@@ -119,15 +124,39 @@ async fn read_frames(
                     Some(SocketError::protocol(reason)),
                 );
             }
-            Ok(Some((message, received_at))) => {
-                let Some(renewed) = hub.receive(connection, message, received_at).await else {
-                    return;
-                };
-                deadline = renewed;
-            }
+            Ok(Some(message)) => message,
             Ok(None) => break (DisconnectReason::Closed, None),
             Err(ReadError::Timeout) => break (DisconnectReason::HeartbeatTimeout, None),
-        }
+        };
+
+        let retrying = Notify::new();
+        let write = hub.receive(connection, message, received_at, || retrying.notify_one());
+        tokio::pin!(write);
+        let renewed = tokio::select! {
+            biased;
+            renewed = &mut write => renewed,
+            () = retrying.notified() => {
+                // Check for closure during retry backoff. Keep at most one
+                // later message and submit it only after this write settles.
+                tokio::select! {
+                    biased;
+                    incoming = next_message(reader, deadline) => {
+                        if matches!(incoming, Ok(None)) {
+                            break (DisconnectReason::Closed, None);
+                        }
+                        if !matches!(incoming, Err(ReadError::Timeout)) {
+                            buffered = Some(incoming);
+                        }
+                        write.await
+                    }
+                    renewed = &mut write => renewed,
+                }
+            }
+        };
+        let Some(renewed) = renewed else {
+            return;
+        };
+        deadline = renewed;
     };
     hub.end(connection, reason, error).await;
 }

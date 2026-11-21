@@ -309,14 +309,20 @@ async fn replacement_timeout_and_end_result_interleavings_preserve_current_sessi
                 previous.connection,
                 result(old_end, CommandStatus::Failed),
                 Instant::now(),
+                || {},
             )
             .await
             .is_none()
         );
         assert!(
-            hub.receive(previous.connection, navigation(1, "stale"), Instant::now())
-                .await
-                .is_none()
+            hub.receive(
+                previous.connection,
+                navigation(1, "stale"),
+                Instant::now(),
+                || {}
+            )
+            .await
+            .is_none()
         );
         hub.trigger_schedule().await;
         current.no_output(&fixture).await;
@@ -386,8 +392,13 @@ async fn sqlite_retry_allows_other_student_read_only_ack_then_recovers_writes() 
     let hub = fixture.state.hub.clone();
     let connection = first.connection;
     let write = tokio::spawn(async move {
-        hub.receive(connection, navigation(1, "retried write"), Instant::now())
-            .await
+        hub.receive(
+            connection,
+            navigation(1, "retried write"),
+            Instant::now(),
+            || {},
+        )
+        .await
     });
     tokio::time::timeout(TIMEOUT, fixture.write_retries.notified())
         .await

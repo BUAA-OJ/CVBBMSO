@@ -69,7 +69,7 @@ impl TestPeer {
         fixture
             .state
             .hub
-            .receive(self.connection, message, Instant::now())
+            .receive(self.connection, message, Instant::now(), || {})
             .await
             .is_some()
     }
