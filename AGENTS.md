@@ -2,129 +2,46 @@
 
 Guidance for coding agents working on `cvbbmso`.
 
-## 1. Project Overview
+This file records general engineering conventions. Project-specific contracts
+live under `docs/design/`; read the overview, the protocol document, and the
+document for the crate you are touching before changing behavior. Those
+documents are written in Chinese. Code, comments, doc comments, and commit
+messages are written in English.
 
-`cvbbmso` is a proctored-exam system for Windows and macOS: a Tauri 2 desktop
-client for students and an Axum server operated by staff. Students use a
-controlled WebView to log in to Accoding; the server re-verifies the
-`connect.sid` cookie against Accoding. Exam timing is server-authoritative and
-commands are delivered over one WebSocket per student. During the app lifetime,
-a system-level egress guard restricts outbound network traffic to Accoding, the
-monitoring server, and essential local services.
+Keep this file general. Implementation decisions belong in the crate document
+and in code comments, not here.
 
-The repository is being scaffolded crate by crate. The design contracts live
-under `docs/design/`; follow their layout and contracts exactly.
+## 1. Compatibility Policy
 
-### Source of truth
+Do not add backward-compatibility logic for an old feature unless the user
+explicitly requests it, or the feature is explicitly documented as already
+deployed. Only the user or the project docs can establish that a feature is
+deployed; existing code, tests, or habits are not evidence.
 
-Read these before changing behavior:
+Compatibility logic includes, but is not limited to:
 
-1. `docs/design/overview.md` — system boundary, terminology, crate graph.
-2. `docs/design/crates/cvbbmso-protocol.md` — wire format and error codes.
-3. The crate document for the crate you are touching.
+- deprecated aliases, re-exports, or wrappers kept for old callers;
+- readers or parsers that accept legacy data or wire formats alongside the
+  current one;
+- version fallbacks, migration shims, and feature flags that preserve the old
+  behavior;
+- defensive branches whose only purpose is to keep an obsolete path working.
 
-The documents under `docs/design/` are written in Chinese and define the public
-contracts. Code, comments, doc comments, and commit messages are written in
-English.
+Change the behavior, remove the old path, and update every caller, test, and
+document in the same change. If removing a path would require a data migration
+for users already in production, treat that as a deployment decision and
+confirm it with the user first.
 
-### Crate layout
-
-```text
-crates/
-├── cvbbmso-protocol/   # HTTP / WebSocket DTOs, enums, error codes
-├── cvbbmso-accoding/   # Cookie normalization, Accoding identity verification
-├── cvbbmso-network/    # Client startup preflight and system egress guard
-├── cvbbmso-recorder/   # Screen capture, segmentation, recovery, merge, hashing
-├── cvbbmso-exam/       # Client exam runtime, WebSocket, local event queue
-├── cvbbmso-client/     # Tauri desktop app, startup preflight, controlled browser
-├── cvbbmso-domain/     # Exam rules, scheduling, persistence, incidents
-├── cvbbmso-server/     # Axum HTTP / WebSocket service
-└── cvbbmso-cli/        # Local admin CLI for the server
-```
-
-Dependency direction is one-way and must not form cycles:
-
-```text
-client  -> exam -> recorder / accoding / protocol
-client  -> network / accoding / protocol
-server  -> domain / accoding / protocol
-cli     -> domain / protocol
-domain  -> protocol
-recorder -> protocol
-accoding -> protocol
-```
-
-`cvbbmso-protocol` is a pure data layer: no I/O, no async, no business logic.
-
-## 2. Third-Party Library Preferences
-
-Use the following choices. Do not introduce an alternative without updating
-this file and explaining why.
-
-| Concern | Choice | Notes |
-| --- | --- | --- |
-| Async runtime | `tokio` | The only async runtime in the workspace. |
-| Async traits | Native `async fn` in traits | Use `async-trait` only when a trait must be `dyn`-compatible. |
-| Library errors | `thiserror` | One public error enum per library crate. |
-| Binary errors | `anyhow` | Only in `cvbbmso-server`, `cvbbmso-client`, `cvbbmso-cli` glue code. |
-| Serialization | `serde` + `serde_json` | `cvbbmso-protocol` owns the wire schema. |
-| Time | `time` | Use `OffsetDateTime`; store and transmit UTC RFC 3339. |
-| IDs | `uuid` | Standard textual form on the wire. |
-| Hashing | `sha2` (RustCrypto) | Lowercase 64-char hex digests. |
-| HTTP client | `reqwest` with `rustls-tls` | Do not enable `native-tls` or system OpenSSL. |
-| HTTP server | `axum` | `tower` / `tower-http` only where they replace custom middleware. |
-| WebSocket client | `tokio-tungstenite` | |
-| WebSocket server | `axum` built-in WebSocket extractor | |
-| Database | `SeaORM` over SQLite (`sqlx` backend) | `cvbbmso-domain` owns business queries and keeps its entities private. |
-| Migrations | `sea-orm-migration` | Prefer the default `sea-orm-cli` layout described in §5. |
-| CLI parsing | `clap` (derive) | |
-| Configuration | `clap` flags + environment variables | No configuration files for the server. |
-| Logging | `tracing` + `tracing-subscriber` | JSON logs for the server, human-readable for the client. |
-| Desktop shell | Tauri 2 | Controlled WebView only; no extra browser plugins. |
-| CSV import | `csv` | CLI-side parsing only. |
-| Test helpers | `proptest`, `wiremock`, `insta`, `tempfile` | See §6. |
-
-Additional dependency rules:
-
-- Declare every version once in `[workspace.dependencies]`; crates inherit with
-  `workspace = true`.
-- Prefer `default-features = false` and enable only the features actually used.
-- Do not add dependencies from git, path patches, or forks unless unavoidable.
-- Do not add a crate for something the standard library or an existing
-  dependency already provides.
-- Commit `Cargo.lock`. Keep one major version of each dependency.
-- Run `cargo-deny check` and `cargo audit` before release.
-
-## 3. Error Handling Rules
-
-- Each library crate exposes exactly one public error enum. Variants are
-  categories, not messages; add `#[non_exhaustive]`.
-- Public APIs never return `anyhow::Error`, `Box<dyn Error>`, or `String` as an
-  error. Convert to `anyhow` only at the binary boundary.
-- Use `thiserror` and preserve sources with `#[source]` / `#[from]`. Do not
-  discard the underlying error.
-- Constructors validate their inputs and return `Result`; do not create values
-  that violate documented invariants.
-- Never use `panic!`, `unwrap`, or `expect` in non-test code. If an invariant
-  is truly impossible to violate, encode it in the type instead.
-- Do not convert an error into a log line and then return success. Log once,
-  where the error is finally handled.
-- Map errors to protocol error codes only at the transport boundary
-  (`cvbbmso-server`) or CLI boundary. The mapping tables live in the crate
-  docs; do not invent new codes.
-- `DomainError` and similar enums must not carry HTTP status codes or
-  user-facing copy. That mapping belongs to the caller.
-
-## 4. Development Standards
+## 2. Development Standards
 
 Write idiomatic Rust and keep the design boring.
 
 - **Abstraction must be earned.** Add a trait only when there is a second
   implementation, a real test seam, or a platform boundary. A trait with one
   implementation and no seam is noise.
-- **High cohesion, low coupling.** A crate owns its data and hides its
-  internals. Cross-crate access goes through the documented public API; no
-  reaching into another crate's tables, files, or platform handles.
+- **High cohesion, low coupling.** A module owns its data and hides its
+  internals. Other modules use the documented public API; no reaching into
+  another module's tables, files, or platform handles.
 - **Simplest implementation that satisfies the contract.** Do not add
   configuration knobs, extension points, generic parameters, or layers for
   hypothetical future needs.
@@ -133,8 +50,8 @@ Write idiomatic Rust and keep the design boring.
   singletons.
 - **Prefer enums and newtypes** for closed sets and identifiers. Do not pass
   raw `String`/`i64` where a validated type exists.
-- **Keep public surface small.** Default to private; use `pub(crate)` before
-  `pub`. Re-export only what other crates need.
+- **Keep the public surface small.** Default to private; use `pub(crate)`
+  before `pub`. Re-export only what other modules need.
 - **Modules follow responsibility, not file count.** A module should have one
   reason to change. Split by responsibility, not by line count.
 - **Use the sibling module layout.** A module with child modules lives in
@@ -142,85 +59,50 @@ Write idiomatic Rust and keep the design boring.
   `src/wire/`); never use the old `module/mod.rs` layout.
 - **Comments explain why.** Do not narrate what the code already says. Public
   items get doc comments that state the contract and failure modes.
-- **No dead code, no commented-out code, no debug prints.** Use `tracing`.
+- **No dead code, no commented-out code, no debug prints.** Use the logging
+  facility instead.
 - **No blocking work in async context** without explicit justification; long
   CPU or filesystem work must not stall the runtime.
 - **Never hold a lock across `.await`.** Prefer message passing over shared
   mutable state.
-- **Do not over-abstract the database.** Use SeaORM entities and queries
-  directly in `cvbbmso-domain`; a repository trait per table is not required.
-- **Do not leak platform details.** Windows/macOS APIs stay inside
-  `cvbbmso-recorder`, `cvbbmso-network`, and `cvbbmso-client` adapter modules.
 - **Keep changes scoped.** Do not refactor unrelated code, rename public items,
   or reformat untouched files in the same change.
 
-### Crate responsibilities
+## 3. Error Handling
 
-- `cvbbmso-protocol`: DTOs, enums, validation newtypes, error-code constants.
-  No I/O, no async, no database types.
-- `cvbbmso-accoding`: cookie handling and identity verification only.
-- `cvbbmso-network`: client startup preflight and system egress guard.
-  Proxy inspection stays read-only; never modify system proxy settings.
-- `cvbbmso-recorder`: recording lifecycle, local files, manifests. Platform
-  capture and encoding stay private.
-- `cvbbmso-exam`: runtime orchestration, WebSocket, retry/reconnect, event
-  queue, state publication. No network preflight and no Tauri types.
-- `cvbbmso-client`: startup preflight, Tauri commands and UI wiring only. No
-  exam business rules.
-- `cvbbmso-domain`: rules, transactions, scheduling, persistence, audit.
-  No HTTP or WebSocket types beyond protocol DTOs.
-- `cvbbmso-server`: transport, authentication handoff, error mapping, dispatch.
-  No business rules.
-- `cvbbmso-cli`: argument parsing, CSV reading, output formatting. Delegates to
-  `AdminService`.
+- Public APIs return typed errors, never strings or boxed trait objects.
+  Convert to a dynamic error only at the binary boundary.
+- Preserve the underlying cause when wrapping an error; do not discard it.
+- Constructors validate their inputs and return `Result`; do not create values
+  that violate documented invariants.
+- Never use `panic!`, `unwrap`, or `expect` outside tests. If an invariant is
+  truly impossible to violate, encode it in the type instead.
+- Do not convert an error into a log line and then return success. Log once,
+  where the error is finally handled.
+- Error types describe what failed, not how it is presented. They must not
+  carry transport status codes or user-facing copy; that mapping belongs to
+  the caller.
 
-## 5. Protocol and Data Conventions
-
-- `cvbbmso-protocol` is the only source of wire formats. Do not redefine DTOs
-  in other crates.
-- JSON fields and enum values use `snake_case`; error codes use uppercase
-  `SNAKE_CASE`.
-- Wire enums are closed. Unknown values are a protocol error, not a silent
-  fallback.
-- Validate at construction and on deserialization: UUIDs, SHA-256 digests,
-  positive IDs, non-zero recording policy values, `start_at <= end_at`.
-- Times are UTC `OffsetDateTime`; render RFC 3339. Never store or transmit
-  local time or naive timestamps.
-- Keep the migration crate under `crates/cvbbmso-domain/migration/`, using the
-  standalone layout generated by `sea-orm-cli migrate init`. Keep its
-  `Cargo.toml`, `src/lib.rs` for `Migrator`, and `src/main.rs` for the migration CLI.
-  Use `sea-orm-cli migrate generate` for timestamped migration files and
-  register them in chronological order. `cvbbmso-domain` calls `Migrator`
-  when it opens the database.
-- Add schema changes as new `sea-orm-migration` migrations. Keep each migration
-  reversible and preserve applied migrations.
-- Store timestamps in UTC. Filtering uses absolute instants.
-- Deviations from the documented contracts require a docs change in the same
-  change set.
-
-## 6. Testing
+## 4. Testing
 
 - Unit tests live next to the code in `#[cfg(test)]` modules; integration
-  tests live in `crates/<crate>/tests/`.
+  tests live in a dedicated tests directory of the package.
 - Test behavior and contracts, not private implementation details.
-- Use `proptest` for protocol round-trips and invariant checks.
-- Use `insta` snapshots for serialized JSON so wire changes are visible.
-- Use `wiremock` for Accoding HTTP interactions; do not hit the network.
-- Use `tempfile` for recorder and filesystem tests.
-- Prefer hand-written fakes for narrow traits; use `wiremock` at the HTTP
-  boundary. Avoid `mockall`.
 - Tests must be deterministic: no real sleeps, no wall-clock races, no
   ordering assumptions. Inject clocks and timeouts where behavior depends on
   time.
-- Platform-specific recorder/network tests are gated by `cfg(target_os)` and
-  skipped in CI when the platform is unavailable.
+- Do not hit the real network in tests. Use fakes or a local stub server.
+- Prefer hand-written fakes for narrow traits; avoid general-purpose mocking
+  frameworks.
+- Platform-specific tests are gated by `cfg(target_os)` and skipped where the
+  platform is unavailable.
 - A bug fix includes a regression test that fails before the fix.
 
-## 7. Toolchain, Formatting, and Lints
+## 5. Toolchain, Formatting, and Lints
 
-- Edition 2024, MSRV 1.99.1. Local builds and CI use the same pinned Rust
-  release. Update `Cargo.toml`, `rust-toolchain.toml`, and `.github/workflows/ci.yml`
-  together when raising it.
+- Keep the Rust toolchain pinned in `rust-toolchain.toml`; local builds and CI
+  use the same release. Update `Cargo.toml` and the CI workflow together when
+  raising it.
 - Format with default `rustfmt` settings: `cargo fmt --all`.
 - Enable `clippy::all` and `clippy::pedantic` at workspace level. Treat
   warnings as errors in CI, not during local iteration.
@@ -232,21 +114,17 @@ Write idiomatic Rust and keep the design boring.
 - Public items must be documented, including panics, errors, and blocking
   behavior.
 
-## 8. Git and CI
+## 6. Git
 
 - Use Conventional Commits with English subjects, for example
-  `feat(server): reject expired cookies` or `fix(recorder): keep segment index
-  stable after restart`.
+  `feat(server): reject expired cookies` or
+  `fix(recorder): keep segment index stable after restart`.
 - One logical change per commit. Do not mix refactors with behavior changes.
-- Keep the working tree free of generated artifacts except `Cargo.lock`.
-- When CI exists, it must run:
-  - `cargo fmt --all --check`
-  - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-  - `cargo test --workspace --all-features` on Linux
-  - `cargo check --workspace --all-targets` for Windows and macOS targets
-  - `cargo deny check` and `cargo audit`
+- Keep the working tree free of generated artifacts except the lockfile.
+- CI must enforce formatting, lints, tests, cross-platform compilation checks,
+  and dependency auditing.
 
-## 9. Validation Commands
+## 7. Validation Commands
 
 Run the smallest relevant checks after changes:
 
@@ -256,12 +134,4 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-These commands become available once the Cargo workspace is scaffolded. Until
-then, documentation-only changes need no build.
-
-## 10. Out of Scope for This File
-
-Internal task orchestration, cancellation mechanics, retry algorithms, and the
-recorder capture/encoding pipeline are implementation decisions. Do not infer
-rules for them from this file; decide them in the crate and record the
-reasoning in code comments or the crate document.
+Documentation-only changes need no build.
