@@ -1,8 +1,9 @@
 use std::{
+    cell::RefCell,
     io,
     net::Ipv4Addr,
     sync::{
-        Mutex,
+        Once,
         atomic::{AtomicI64, Ordering},
     },
 };
@@ -258,12 +259,19 @@ async fn body(response: Response<Body>) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-#[derive(Clone, Default)]
-struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+thread_local! {
+    static LOG_OUTPUT: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
 
-impl io::Write for CapturedLogs {
+struct LogWriter;
+
+impl io::Write for LogWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
+        LOG_OUTPUT.with_borrow_mut(|output| {
+            if let Some(output) = output {
+                output.extend_from_slice(bytes);
+            }
+        });
         Ok(bytes.len())
     }
 
@@ -272,20 +280,32 @@ impl io::Write for CapturedLogs {
     }
 }
 
-#[tokio::test]
+fn capture_logs() {
+    static SUBSCRIBER: Once = Once::new();
+    // Share callsite interest across parallel tests and capture only the
+    // logs emitted on the thread of the current-thread Tokio test.
+    SUBSCRIBER.call_once(|| {
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .json()
+                .with_writer(|| LogWriter)
+                .finish(),
+        )
+        .unwrap();
+    });
+    LOG_OUTPUT.set(Some(Vec::new()));
+}
+
+fn captured_logs() -> String {
+    String::from_utf8(LOG_OUTPUT.take().unwrap()).unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn rejection_logs_retain_diagnostics_without_disclosing_source_text() {
     use sea_orm::{ConnectionTrait, Database};
 
-    let logs = CapturedLogs::default();
-    let writer = logs.clone();
-    let _subscriber = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .json()
-            .with_writer(move || writer.clone())
-            .finish(),
-    );
-
     let fixture = Fixture::new().await;
+    capture_logs();
     let response = fixture
         .request(
             Request::get("/api/exams")
@@ -317,8 +337,7 @@ async fn rejection_logs_retain_diagnostics_without_disclosing_source_text() {
         }
     );
 
-    let bytes = logs.0.lock().unwrap();
-    let output = std::str::from_utf8(&bytes).unwrap();
+    let output = captured_logs();
     let entries: Vec<_> = output
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
@@ -1403,17 +1422,10 @@ async fn undeliverable_command_disconnects_and_reconnect_gets_a_new_command() {
     confirm(&mut socket, command_id).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn request_logs_include_metadata_and_keep_cookie_values_private() {
     let fixture = Fixture::new().await;
-    let logs = CapturedLogs::default();
-    let writer = logs.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_writer(move || writer.clone())
-        .finish();
-    // Keep callsite interest stable while other tests use the same Router.
-    tracing::subscriber::set_global_default(subscriber).unwrap();
+    capture_logs();
     let response = fixture
         .request(
             Request::get("/api/exams")
@@ -1424,8 +1436,7 @@ async fn request_logs_include_metadata_and_keep_cookie_values_private() {
         .await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    let output = logs.0.lock().unwrap();
-    let output = std::str::from_utf8(&output).unwrap();
+    let output = captured_logs();
     assert!(!output.contains("connect.sid"));
     assert!(!output.contains("s%3Aexample"));
     assert!(output.lines().any(|line| {
