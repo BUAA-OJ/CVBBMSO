@@ -44,6 +44,7 @@ pub(super) enum ExamCommandError {
     StorageFailed,
     RecordingFailed,
     ShutdownFailed,
+    ReportingPending,
 }
 
 impl From<ExamError> for ExamCommandError {
@@ -148,6 +149,10 @@ pub(super) struct ExamSession {
 }
 
 impl ExamSession {
+    pub(super) fn can_close(&self) -> bool {
+        !reporting_pending(self.snapshot.borrow().as_ref())
+    }
+
     pub(super) fn launch(app: &AppHandle) {
         let (requests, incoming) = mpsc::channel(8);
         let (publish, snapshot) = watch::channel(None);
@@ -192,7 +197,6 @@ pub(super) fn handle_exit(app: &AppHandle, event: &RunEvent) {
         match exit {
             Exit::Running => {
                 api.prevent_exit();
-                app.state::<Admission>().begin_exit(app);
                 sessions
                     .exit
                     .send_replace(Exit::Requested(code.unwrap_or(0)));
@@ -269,6 +273,12 @@ struct Active {
     handle: ExamHandle,
     updates: watch::Receiver<ClientView>,
     inbox: Option<NoticeInbox>,
+}
+
+impl Active {
+    fn reporting_pending(&self) -> bool {
+        reporting_pending(Some(&self.updates.borrow()))
+    }
 }
 
 #[derive(Clone)]
@@ -394,13 +404,19 @@ async fn run(
             _ = exit.changed() => {
                 let requested = *exit.borrow();
                 if let Exit::Requested(code) = requested {
+                    if code == 0 && (opening.is_some() || active.as_ref().is_some_and(Active::reporting_pending)) {
+                        sessions.exit.send_replace(Exit::Running);
+                        let _ = app.emit_to(EventTarget::webview(UI), "confirm-exit", ());
+                        continue;
+                    }
+                    admission.begin_exit(&app);
                     let result = clear(&sessions, &mut opening, &mut active, &snapshot).await;
                     let cleanup = admission.shutdown().await;
                     let failed = result.is_err() || cleanup.is_err() || guard_close_failed;
                     let exit_code = if failed && code == 0 { 1 } else { code };
                     finish_exit(&app, exit_code, cleanup).await;
+                    return;
                 }
-                return;
             }
             _ = admission_updates.changed() => {
                 let status = *admission_updates.borrow_and_update();
@@ -421,6 +437,9 @@ async fn run(
                         task: tokio::spawn(connect(app.clone(), exam_id, instance_id)),
                         reply,
                     });
+                }
+                Some(Request::Close(reply)) if opening.is_some() || active.as_ref().is_some_and(Active::reporting_pending) => {
+                    let _ = reply.send(Err(ExamCommandError::ReportingPending));
                 }
                 Some(Request::Close(reply)) => {
                     let _ = reply.send(clear(&sessions, &mut opening, &mut active, &snapshot).await);
@@ -462,6 +481,10 @@ async fn run(
             () = forward_notice(delivery) => {}
         }
     }
+}
+
+fn reporting_pending(view: Option<&ClientView>) -> bool {
+    view.is_some_and(|view| view.state.execution != ExecutionState::Finished)
 }
 
 async fn joining(opening: &mut Option<Opening>) -> Result<ConnectedExam, ExamCommandError> {

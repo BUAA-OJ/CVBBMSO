@@ -14,6 +14,7 @@
     "allow-open-exam",
     "allow-get-exam-status",
     "allow-close-exam",
+    "allow-confirm-exit",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "core:window:allow-close"

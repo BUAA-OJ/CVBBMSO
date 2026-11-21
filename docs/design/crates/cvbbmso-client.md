@@ -4,7 +4,7 @@
 
 ## 桌面底座
 
-客户端在 Windows 和 macOS 启动本地控制窗。Windows 使用安装后的程序，macOS 正式启动要求 macOS 14 或更新版本。先从 DMG 将已签名的 CVBBMSO.app 拖到「应用程序」，再以当前登录用户在 Finder 中双击打开。准入通过后，可以从控制窗打开独立的 Accoding 窗口。关闭控制窗会退出应用并关闭 Accoding 窗口。`inspect_session` 将 Cookie 是否可用定向通知本地 UI。加载报名列表时由监考服务复验 Accoding 身份。
+客户端在 Windows 和 macOS 启动本地控制窗。Windows 使用安装后的程序，macOS 正式启动要求 macOS 14 或更新版本。先从 DMG 将已签名的 CVBBMSO.app 拖到「应用程序」，再以当前登录用户在 Finder 中双击打开。准入通过后，可以从控制窗打开独立的 Accoding 窗口。关闭控制窗或点击「退出客户端」时先显示退出确认，取消或按 Escape 后继续运行；入场后直至服务端确认本场结束回执，禁止主动关闭客户端或退出当前考试；计算录像 SHA-256、封存合并、可靠事件补报及等待最终 ACK 均在保护范围内。收尾完成后提示「考试结束后，请等待监考老师指示后再关闭客户端。」确定退出后清理网络守卫并关闭 Accoding 窗口。`inspect_session` 将 Cookie 是否可用定向通知本地 UI。加载报名列表时由监考服务复验 Accoding 身份。
 
 部署时可在编译环境中设置 `CVBBMSO_SERVER_ORIGIN`，例如 `https://monitor.example.org`。该值须为 HTTPS Origin，可含端口。显式配置无效地址（含空字符串）会导致启动失败。未设置该变量时，控制窗可照常启动，加载报名列表会提示未配置监考服务地址。远程页面和前端命令均无法设置请求目的地。应用数据根目录通过 Tauri 的 `app_local_data_dir()` 取得。Windows 的 Accoding WebView 用该目录下的 `accoding/` 保存浏览器配置，macOS 使用系统管理的应用 WebKit 数据存储。
 
@@ -31,6 +31,7 @@
 | `list_exams` | 无 | `ExamSummary[]` | 使用当前 Cookie 调用 `GET /api/exams` |
 | `open_exam` | `{ exam_id: uuid }` | `{ "connected": true }` | 调用 `Exam::connect`；等待初始 `sync` 后返回。网络、出站守卫和权限预检已在启动时完成 |
 | `get_exam_status` | 无 | `ClientView` 或 `null` | 读取当前考试状态快照 |
+| `confirm_exit` | 无 | `()` | 本地控制窗确认退出后，触发现有考试与网络守卫收尾流程 |
 | `close_exam` | 无 | `{ "closed": true }` | 停止当前考试运行时，封存当前录像片段并释放考试 |
 | `cvbbmso-status` 事件 | 无 | `ClientView` | 考试运行时主动更新状态 |
 
@@ -60,7 +61,7 @@ impl AppState {
 }
 ```
 
-`AppState` 和浏览器适配器保留为 crate 私有类型；上表 Tauri command 是客户端 UI 的实际契约，`ClientView` 由 `cvbbmso-exam` 定义。`open_exam` 等待初始 `sync` 后返回 `connected`，失败时直接返回错误；`close_exam` 是切换考试或退出前的收尾入口，负责停止并封存当前片段。启动预检和出站守卫错误归入 `AppError::Network`。
+`AppState` 和浏览器适配器保留为 crate 私有类型；上表 Tauri command 是客户端 UI 的实际契约，`ClientView` 由 `cvbbmso-exam` 定义。`open_exam` 等待初始 `sync` 后返回 `connected`，失败时直接返回错误；`close_exam` 是切换考试或退出前的收尾入口，负责停止并封存当前片段。本场尚未收到结束 ACK 时返回 `reporting_pending`，保留运行时和上报队列。启动预检和出站守卫错误归入 `AppError::Network`。
 
 连接期间 `get_exam_status` 返回 `null`，重复入场或同时打开另一场考试返回 `session_busy`。关闭时停止发送当前会话的状态，等待运行时收尾后释放会话。状态事件定向发送到本地控制窗。控制窗收到事件后读取 Rust 中的当前快照，避免延迟到达的旧事件覆盖新状态。
 

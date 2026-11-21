@@ -14,7 +14,7 @@ use tauri::Manager;
 use super::{
     AppHandle, ClientMessage, CommandName, CommandStatus, Connection, DEADLINE, Error, ExamEvent,
     ExamPhase, FIRST, Fixture, OffsetDateTime, RecordingPolicy, ServerMessage, Uuid, WebviewWindow,
-    connection, io, oneshot, open_enrolled_fixture, timeout, wait_for,
+    check_pending_close, connection, io, oneshot, open_enrolled_fixture, timeout, wait_for,
 };
 use crate::desktop::{Desktop, smoke::FIXTURE_USER_ID};
 
@@ -84,6 +84,10 @@ pub(super) async fn exercise(
         "the successful recording waiting for the end acknowledgement",
     )
     .await?;
+    check_pending_close(ui).await?;
+    app.exit(0);
+    wait_for(ui, "document.querySelector('#exit-confirmation').open && document.querySelector('#confirm-exit').disabled", "application exit being rejected before the final ACK").await?;
+    ui.eval("document.querySelector('#exit-confirmation button').click()")?;
     tokio::task::spawn_blocking(move || {
         verify_recording(&recording_dir, &segments, &summary.merged_sha256)
     })
