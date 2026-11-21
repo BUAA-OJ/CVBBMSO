@@ -8,8 +8,9 @@ document for the crate you are touching before changing behavior. Those
 documents are written in Chinese. Code, comments, doc comments, and commit
 messages are written in English.
 
-Keep this file general. Implementation decisions belong in the crate document
-and in code comments, not here.
+Keep this file general apart from the pinned library choices below.
+Implementation decisions belong in the crate document and in code comments,
+not here.
 
 ## Compatibility Policy
 
@@ -31,6 +32,45 @@ Change the behavior, remove the old path, and update every caller, test, and
 document in the same change. If removing a path would require a data migration
 for users already in production, treat that as a deployment decision and
 confirm it with the user first.
+
+## Third-Party Library Preferences
+
+Use the following choices. Do not introduce an alternative without updating
+this file and explaining why.
+
+| Concern | Choice | Notes |
+| --- | --- | --- |
+| Async runtime | `tokio` | The only async runtime in the workspace. |
+| Async traits | Native `async fn` in traits | Use `async-trait` only when a trait must be `dyn`-compatible. |
+| Library errors | `thiserror` | One public error enum per library crate. |
+| Binary errors | `anyhow` | Only in `cvbbmso-server`, `cvbbmso-client`, `cvbbmso-cli` glue code. |
+| Serialization | `serde` + `serde_json` | `cvbbmso-protocol` owns the wire schema. |
+| Time | `time` | Use `OffsetDateTime`; store and transmit UTC RFC 3339. |
+| IDs | `uuid` | Standard textual form on the wire. |
+| Hashing | `sha2` (RustCrypto) | Lowercase 64-char hex digests. |
+| HTTP client | `reqwest` with `rustls-tls` | Do not enable `native-tls` or system OpenSSL. |
+| HTTP server | `axum` | `tower` / `tower-http` only where they replace custom middleware. |
+| WebSocket client | `tokio-tungstenite` | |
+| WebSocket server | `axum` built-in WebSocket extractor | |
+| Database | `SeaORM` over SQLite (`sqlx` backend) | `cvbbmso-domain` owns business queries and keeps its entities private. |
+| Migrations | `sea-orm-migration` | Prefer the default `sea-orm-cli` layout described in the domain crate document. |
+| CLI parsing | `clap` (derive) | |
+| Configuration | `clap` flags + environment variables | No configuration files for the server. |
+| Logging | `tracing` + `tracing-subscriber` | JSON logs for the server, human-readable for the client. |
+| Desktop shell | Tauri 2 | Controlled WebView only; no extra browser plugins. |
+| CSV import | `csv` | CLI-side parsing only. |
+| Test helpers | `proptest`, `wiremock`, `insta`, `tempfile` | See Testing. |
+
+Additional dependency rules:
+
+- Declare every version once in `[workspace.dependencies]`; crates inherit with
+  `workspace = true`.
+- Prefer `default-features = false` and enable only the features actually used.
+- Do not add dependencies from git, path patches, or forks unless unavoidable.
+- Do not add a crate for something the standard library or an existing
+  dependency already provides.
+- Commit `Cargo.lock`. Keep one major version of each dependency.
+- Run `cargo-deny check` and `cargo audit` before release.
 
 ## Development Standards
 
