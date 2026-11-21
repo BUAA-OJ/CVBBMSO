@@ -698,7 +698,7 @@ fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
 async fn confirm_close(ui: &WebviewWindow) -> Result<(), Error> {
     wait_for(
         ui,
-        "document.querySelector('#exit-confirmation').open",
+        "document.querySelector('#exit-confirmation').open && !document.querySelector('#confirm-exit').disabled",
         "exit confirmation",
     )
     .await?;

@@ -183,8 +183,12 @@ fn builder() -> tauri::Builder<Wry> {
     clippy::needless_pass_by_value,
     reason = "Tauri injects the application handle by value"
 )]
-fn confirm_exit(app: AppHandle) {
+fn confirm_exit(app: AppHandle) -> Result<(), exam::ExamCommandError> {
+    if !app.state::<exam::ExamSession>().can_close() {
+        return Err(exam::ExamCommandError::ReportingPending);
+    }
     app.exit(0);
+    Ok(())
 }
 
 fn build_ui(app: &AppHandle) -> tauri::Result<WebviewWindow> {

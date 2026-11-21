@@ -410,7 +410,7 @@ pub(super) async fn exercise(
         ui,
         &format!("window.__TAURI__.core.invoke('open_exam', {{exam_id:'{SECOND}'}})"),
     )?;
-    let second = connection(&mut fixture.incoming, SECOND).await?;
+    let mut second = connection(&mut fixture.incoming, SECOND).await?;
     assert_eq!(second.hello.device_id, first.hello.device_id);
     assert_eq!(second.hello.instance_id, first.hello.instance_id);
     second.outgoing.send(sync()).await?;
@@ -426,6 +426,9 @@ pub(super) async fn exercise(
     .await?;
     app.emit_to(EventTarget::webview(UI), "cvbbmso-status", previous)?;
     wait_for(ui, "window.examEvents.at(-1)?.last_error_code === 'INTERNAL_ERROR' && document.querySelector('#current-exam-title').textContent === 'Second fixture exam'", "the new exam ignoring a queued status event").await?;
+    if case != super::Case::GuardLoss {
+        check_status_updates(ui, &mut second).await?;
+    }
     println!(
         "Exam fixture verified initial sync, enrollment failure, concurrent opens, commands, directed status, close, and reopening."
     );
@@ -561,9 +564,23 @@ async fn check_pending_open(
     ui.eval("document.querySelector('.open-exam').click()")?;
     let cancelled = connection(incoming, FIRST).await?;
     probe(ui, "window.__TAURI__.core.invoke('close_exam')")?;
-    wait_for(ui, "window.examProbe.pending === true && document.querySelector('#exam-session-feedback').textContent === '考试会话已关闭，请重新选择。' && document.querySelector('#current-exam').hidden", "close waiting for an in-flight open").await?;
-    cancelled.outgoing.send(sync()).await?;
-    assert_eq!(probe_value(ui).await?, json!({"value": {"closed": true}}));
+    assert_eq!(
+        probe_value(ui).await?,
+        json!({"error": "reporting_pending"})
+    );
+    cancelled
+        .outgoing
+        .send(ServerMessage::Error {
+            code: error_code::NOT_ENROLLED.into(),
+            message: "Fixture admission rejected".into(),
+        })
+        .await?;
+    wait_for(
+        ui,
+        "!document.querySelector('.open-exam').disabled",
+        "in-flight open retaining ownership until admission completes",
+    )
+    .await?;
     timeout(DEADLINE, cancelled.closed).await??;
     assert_eq!(evaluate(ui, "window.examEvents.length").await?, 0);
     Ok(first_attempt.hello)
@@ -601,5 +618,35 @@ async fn check_status_updates(ui: &WebviewWindow, first: &mut Connection) -> Res
         })
     );
     wait_for(ui, "window.examEvents.at(-1)?.state.recording === 'failed' && document.querySelector('#current-exam-status').textContent.includes('正在收尾')", "server end command in the desktop UI").await?;
+    check_pending_close(ui).await?;
+    first
+        .outgoing
+        .send(ServerMessage::CommandAck { command_id })
+        .await?;
+    wait_for(ui, "document.querySelector('#current-exam-status').textContent.includes('请等待监考老师指示') && !document.querySelector('#close-exam').disabled", "final ACK releasing the close restriction").await?;
     Ok(previous)
+}
+
+async fn check_pending_close(ui: &WebviewWindow) -> Result<(), Error> {
+    probe(
+        ui,
+        "Promise.allSettled([window.__TAURI__.core.invoke('close_exam'), window.__TAURI__.core.invoke('confirm_exit')])",
+    )?;
+    assert_eq!(
+        probe_value(ui).await?,
+        json!({"value": [
+            {"status": "rejected", "reason": "reporting_pending"},
+            {"status": "rejected", "reason": "reporting_pending"}
+        ]})
+    );
+    ui.close()?;
+    wait_for(ui, "document.querySelector('#exit-confirmation').open && document.querySelector('#confirm-exit').disabled && !document.querySelector('#exit-error').hidden", "unacknowledged reporting blocking window closure").await?;
+    ui.eval("document.querySelector('#exit-confirmation button').click()")?;
+    wait_for(
+        ui,
+        "!document.querySelector('#exit-confirmation').open",
+        "dismissed reporting warning",
+    )
+    .await?;
+    Ok(())
 }

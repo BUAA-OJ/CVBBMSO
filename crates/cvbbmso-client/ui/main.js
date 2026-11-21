@@ -2,22 +2,44 @@ const { core, event, window: tauriWindow } = window.__TAURI__;
 const exitConfirmation = document.querySelector("#exit-confirmation");
 const confirmExit = document.querySelector("#confirm-exit");
 const exitError = document.querySelector("#exit-error");
-await event.listen("confirm-exit", () => {
+function renderExitConfirmation(view) {
+  const pending = view !== null && view.state.execution !== "finished";
+  confirmExit.disabled = pending;
+  document.querySelector("#exit-description").textContent = ["finalizing", "finished"].includes(view?.state.execution)
+    ? "考试结束后，请等待监考老师指示后再关闭客户端。"
+    : "考试期间考生请勿擅自退出监考程序，如有问题请联系监考老师。";
+  exitError.textContent = "本场考试尚未完成收尾确认，请保持客户端运行，等待数据计算与上报完成。如有问题请联系监考老师。";
+  exitError.hidden = !pending;
+}
+
+async function refreshExitConfirmation() {
+  confirmExit.disabled = true;
+  try {
+    renderExitConfirmation(await core.invoke("get_exam_status"));
+  } catch {
+    exitError.textContent = "无法确认数据上报状态，请稍后重试。";
+    exitError.hidden = false;
+  }
+}
+
+await event.listen("confirm-exit", async () => {
   if (!exitConfirmation.open) {
-    exitError.hidden = true;
     exitConfirmation.showModal();
   }
+  await refreshExitConfirmation();
 });
 confirmExit.addEventListener("click", async () => {
   confirmExit.disabled = true;
   try {
     await core.invoke("confirm_exit");
     exitConfirmation.close();
-  } catch {
-    exitError.textContent = "无法退出客户端，请重试。";
+  } catch (error) {
+    exitError.textContent = error === "reporting_pending"
+      ? "数据尚未完成上报，请等待收尾确认。"
+      : "无法退出客户端，请重试。";
     exitError.hidden = false;
   } finally {
-    confirmExit.disabled = false;
+    await refreshExitConfirmation();
   }
 });
 const preflight = document.querySelector("#vm-preflight");
@@ -187,6 +209,7 @@ const examSessionErrors = new Map([
   ["storage_failed", "无法读取或保存本地考试数据。"],
   ["recording_failed", "无法初始化本场考试的录像数据。"],
   ["shutdown_failed", "考试会话已结束，但本地收尾失败，请联系考试管理员。"],
+  ["reporting_pending", "本场考试尚未完成收尾确认，暂时不能退出。请联系监考老师。"],
 ]);
 const executionStates = new Map([
   ["ready", "等待开始"],
@@ -245,7 +268,8 @@ function renderExamSession() {
   for (const button of examList.querySelectorAll(".open-exam")) {
     button.disabled = !examEventsReady || examBusy || examView !== null;
   }
-  closeExam.disabled = examBusy;
+  closeExam.disabled = examBusy || (examView !== null && examView.state.execution !== "finished");
+  if (exitConfirmation.open) renderExitConfirmation(examView);
   currentExam.hidden = examView === null;
   const needsSignIn = examView?.state.execution !== "finished"
     && examView?.last_error_code === "ACCODING_AUTH_EXPIRED";
@@ -263,6 +287,7 @@ function renderExamSession() {
     executionStates.get(state.execution),
     `录像${recordingStates.get(state.recording)}`,
   ];
+  if (["finalizing", "finished"].includes(state.execution)) status.push("考试结束后，请等待监考老师指示后再关闭客户端。");
   if (needsSignIn) status.push("请用本场考试账号重新登录 Accoding。");
   else if (last_error_code) {
     status.push(`错误 ${last_error_code}`);
