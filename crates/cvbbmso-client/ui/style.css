@@ -122,3 +122,59 @@ button:disabled {
   margin-block-start: 0.75rem;
   overflow-wrap: anywhere;
 }
+
+#exit-confirmation {
+  box-sizing: border-box;
+  width: min(24rem, calc(100vw - 2rem));
+  padding: 1.75rem;
+  border: 1px solid light-dark(#d8e1e8, #385064);
+  border-radius: 0.875rem;
+  background: light-dark(#f8fafc, #1b303f);
+  color: inherit;
+  box-shadow: 0 1rem 3rem #081a2b33;
+}
+
+#exit-confirmation::backdrop {
+  background: #081a2b66;
+  backdrop-filter: blur(3px);
+}
+
+#exit-confirmation h2 {
+  font-size: 1.25rem;
+  line-height: 1.4;
+  font-weight: 600;
+}
+
+#exit-description {
+  margin: 0.75rem 0 1.75rem;
+  color: light-dark(#526879, #b5c7d5);
+}
+
+#exit-confirmation .actions {
+  justify-content: flex-end;
+  gap: 0.625rem;
+}
+
+#exit-confirmation button {
+  min-width: 5.5rem;
+  padding: 0.55rem 1rem;
+  border-color: light-dark(#c4d0da, #526879);
+  background: transparent;
+  color: inherit;
+}
+
+#exit-confirmation #confirm-exit {
+  border-color: transparent;
+  background: light-dark(#183f5b, #b5dbf3);
+  color: light-dark(#fff, #102735);
+}
+
+#exit-confirmation button:focus-visible {
+  outline: 2px solid light-dark(#355a79, #b5dbf3);
+  outline-offset: 3px;
+}
+
+#exit-error {
+  min-height: 0;
+  margin-bottom: 0;
+}
