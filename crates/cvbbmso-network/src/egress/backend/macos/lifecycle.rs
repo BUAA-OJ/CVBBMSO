@@ -612,7 +612,7 @@ mod tests {
                 assert_eq!(releases, [vec!["-X", "42"]]);
                 assert!(!has_enable_record(&recorder).unwrap());
             } else {
-                assert!(releases.is_empty());
+                assert_eq!(releases, Vec::<Vec<String>>::new());
                 assert!(has_enable_record(&recorder).unwrap());
             }
         }

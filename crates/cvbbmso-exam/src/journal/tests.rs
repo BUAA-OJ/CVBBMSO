@@ -115,7 +115,7 @@ async fn sync_skips_confirmed_events_on_replay_and_keeps_them_until_end_ack() {
     assert_eq!(journal.messages_after(4).count(), 0);
     assert_eq!(seqs(&journal), [1, 2, 3, 4]);
     journal.clear_events();
-    assert!(seqs(&journal).is_empty());
+    assert_eq!(seqs(&journal), Vec::<i64>::new());
 }
 
 #[tokio::test]
@@ -197,7 +197,7 @@ async fn clearing_events_keeps_numbering_and_segment_identity() {
     journal.clear_events();
 
     journal.anchor(0);
-    assert!(seqs(&journal).is_empty());
+    assert_eq!(seqs(&journal), Vec::<i64>::new());
     assert!(journal.append(segment(1)).is_none());
     assert_eq!(journal.append(incident(60)), Some(3));
 }
