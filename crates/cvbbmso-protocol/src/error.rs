@@ -23,7 +23,7 @@ pub enum ProtocolError {
     /// A segment index is zero; indices start at one.
     #[error("segment index must start at 1")]
     InvalidSegmentIndex,
-    /// A manifest is empty or its segment indices are not contiguous from one.
-    #[error("segments must be non-empty with contiguous indices starting at 1")]
-    InvalidSegmentOrder,
+    /// The number of segments is outside the supported positive `u32` range.
+    #[error("segment count must be between 1 and 4294967295")]
+    InvalidSegmentCount,
 }

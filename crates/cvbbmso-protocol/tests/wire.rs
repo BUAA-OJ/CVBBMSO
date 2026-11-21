@@ -4,7 +4,7 @@
 use cvbbmso_protocol::{
     AccodingUser, ClientHello, ClientIncident, ClientMessage, ClientState, CommandName,
     CommandStatus, ExamEvent, ExamListResponse, ExamPhase, ExamSummary, ExecutionState,
-    IncidentCode, Platform, RecordingManifest, RecordingPolicy, RecordingState, SegmentMeta,
+    IncidentCode, Platform, RecordingPolicy, RecordingState, RecordingSummary, SegmentMeta,
     ServerMessage, Sha256Digest,
 };
 use time::OffsetDateTime;
@@ -28,17 +28,6 @@ fn state() -> ClientState {
         execution: ExecutionState::Recording,
         recording: RecordingState::Capturing,
     }
-}
-
-fn manifest() -> RecordingManifest {
-    RecordingManifest::new(
-        vec![
-            segment(1, "2026-12-20T01:00:00Z", "2026-12-20T01:00:30Z", 'a'),
-            segment(2, "2026-12-20T01:00:30Z", "2026-12-20T01:01:00Z", 'b'),
-        ],
-        digest('c'),
-    )
-    .expect("valid manifest")
 }
 
 fn command_result(status: CommandStatus, error_code: Option<&str>) -> ClientMessage {
@@ -119,12 +108,42 @@ fn client_messages_match_the_wire_format() {
             },
             ClientMessage::Event {
                 seq: 6,
-                event: ExamEvent::RecordingFinalized(manifest()),
+                event: ExamEvent::RecordingFinalized(
+                    RecordingSummary::new(2, digest('c')).expect("valid summary"),
+                ),
             },
             command_result(CommandStatus::Completed, None),
             command_result(CommandStatus::Failed, Some("RECORDING_START_FAILED")),
         ]
     );
+}
+
+#[test]
+fn recording_finalized_has_a_bounded_and_strict_payload() {
+    let message = ClientMessage::Event {
+        seq: i64::MAX,
+        event: ExamEvent::RecordingFinalized(RecordingSummary::new(u32::MAX, digest('c')).unwrap()),
+    };
+    let encoded = serde_json::to_string(&message).unwrap();
+    assert_eq!(encoded.len(), 200);
+    assert_eq!(
+        serde_json::from_str::<ClientMessage>(&encoded).unwrap(),
+        message
+    );
+    assert!(RecordingSummary::new(0, digest('c')).is_err());
+
+    let json = serde_json::to_value(&message).unwrap();
+    for (field, value) in [
+        ("segment_count", serde_json::json!(0)),
+        ("segment_count", serde_json::json!(-1)),
+        ("segment_count", serde_json::json!(u64::from(u32::MAX) + 1)),
+        ("merged_sha256", serde_json::json!("not-a-digest")),
+        ("segments", serde_json::json!([])),
+    ] {
+        let mut invalid = json.clone();
+        invalid["event"]["data"][field] = value;
+        assert!(serde_json::from_value::<ClientMessage>(invalid).is_err());
+    }
 }
 
 #[test]
