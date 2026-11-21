@@ -713,8 +713,28 @@ async fn check_close_confirmation(
     ui.close()?;
     wait_for(
         ui,
-        "document.querySelector('#exit-confirmation').open",
+        "document.querySelector('#exit-confirmation').open && !document.querySelector('#confirm-exit').disabled",
         "exit confirmation",
+    )
+    .await?;
+    assert_eq!(admission.shutdowns(), 0);
+    ui.eval(
+        r"
+        const exitInvoke = window.__TAURI_INTERNALS__.invoke;
+        window.__TAURI_INTERNALS__.invoke = (command, ...args) => {
+            if (command === 'confirm_exit') {
+                window.__TAURI_INTERNALS__.invoke = exitInvoke;
+                return Promise.reject('smoke_exit_failure');
+            }
+            return exitInvoke(command, ...args);
+        };
+        document.querySelector('#confirm-exit').click();
+    ",
+    )?;
+    wait_for(
+        ui,
+        "!document.querySelector('#exit-error').hidden && document.querySelector('#exit-error').textContent === '无法退出客户端，请重试。' && !document.querySelector('#confirm-exit').disabled",
+        "exit failure remaining visible after refreshing status",
     )
     .await?;
     assert_eq!(admission.shutdowns(), 0);

@@ -143,6 +143,7 @@ button:disabled {
   font-size: 1.25rem;
   line-height: 1.4;
   font-weight: 600;
+  outline: none;
 }
 
 #exit-description {
@@ -169,6 +170,26 @@ button:disabled {
   color: light-dark(#fff, #102735);
 }
 
+#exit-confirmation button:enabled:hover {
+  background: light-dark(#e5edf3, #2a4355);
+}
+
+#exit-confirmation #confirm-exit:enabled:hover {
+  background: light-dark(#255570, #c9e6f8);
+}
+
+#exit-confirmation button:enabled:active {
+  background: light-dark(#d5e1ea, #385064);
+}
+
+#exit-confirmation #confirm-exit:enabled:active {
+  background: light-dark(#123249, #9dc7e1);
+}
+
+#exit-confirmation button:focus:not(:focus-visible) {
+  outline: none;
+}
+
 #exit-confirmation button:focus-visible {
   outline: 2px solid light-dark(#355a79, #b5dbf3);
   outline-offset: 3px;
@@ -176,5 +197,7 @@ button:disabled {
 
 #exit-error {
   min-height: 0;
-  margin-bottom: 0;
+  margin: 0 0 0.75rem;
+  font-size: 0.85rem;
+  color: light-dark(#526879, #b5c7d5);
 }

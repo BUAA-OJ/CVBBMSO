@@ -8,7 +8,7 @@ function renderExitConfirmation(view) {
   document.querySelector("#exit-description").textContent = ["finalizing", "finished"].includes(view?.state.execution)
     ? "考试结束后，请等待监考老师指示后再关闭客户端。"
     : "考试期间考生请勿擅自退出监考程序，如有问题请联系监考老师。";
-  exitError.textContent = "本场考试尚未完成收尾确认，请保持客户端运行，等待数据计算与上报完成。如有问题请联系监考老师。";
+  exitError.textContent = "数据上传中...";
   exitError.hidden = !pending;
 }
 
@@ -34,12 +34,11 @@ confirmExit.addEventListener("click", async () => {
     await core.invoke("confirm_exit");
     exitConfirmation.close();
   } catch (error) {
+    await refreshExitConfirmation();
     exitError.textContent = error === "reporting_pending"
-      ? "数据尚未完成上报，请等待收尾确认。"
+      ? "数据上传中..."
       : "无法退出客户端，请重试。";
     exitError.hidden = false;
-  } finally {
-    await refreshExitConfirmation();
   }
 });
 const preflight = document.querySelector("#vm-preflight");
