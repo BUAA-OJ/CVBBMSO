@@ -13,7 +13,7 @@ use std::{
     },
 };
 
-use cvbbmso_protocol::{RecordingManifest, RecordingPolicy};
+use cvbbmso_protocol::{RecordingPolicy, RecordingSummary};
 use tokio::sync::{
     mpsc::{self, Receiver},
     oneshot,
@@ -52,9 +52,9 @@ enum State {
     /// A worker exited without returning the latest sealed-segment state.
     Interrupted,
     /// The recorder owns the merge even if its caller stops awaiting it.
-    Finalizing(JoinHandle<Result<RecordingManifest, RecordingError>>),
-    /// Finishing succeeded; the manifest is cached so repeated calls agree.
-    Complete(RecordingManifest),
+    Finalizing(JoinHandle<Result<RecordingSummary, RecordingError>>),
+    /// The merge result stays cached while event delivery completes.
+    Complete(RecordingSummary),
 }
 
 struct CaptureTask {
@@ -175,7 +175,7 @@ impl Recorder {
 
     /// Stops capture and seals the segment being recorded.
     ///
-    /// Merging and the manifest belong to [`Recorder::finish`]. Stopping an idle
+    /// Merging and the summary belong to [`Recorder::finish`]. Stopping an idle
     /// or already stopped recorder does nothing; stopping a failed capture drops
     /// the unsealed segment and keeps the sealed ones.
     ///
@@ -195,44 +195,47 @@ impl Recorder {
     }
 
     /// Stops capture, seals the pending segment, merges the recording, and
-    /// returns its manifest.
+    /// returns its summary.
     ///
     /// The merge runs on a blocking task because it reads, hashes, and writes
     /// whole segments; awaiting it does not block a Tokio worker.
-    /// Cancelling this future only stops waiting: the recorder retains the
-    /// task and its result, and the next call awaits the same merge. Keep this
-    /// recorder alive until finishing completes; dropping it cannot stop an
-    /// already running filesystem operation.
+    /// With an open event receiver, all segment notifications are available to
+    /// receive or have already been consumed before success is returned. Drain
+    /// the receiver concurrently while waiting when the bounded channel can fill.
+    /// Closing or dropping the receiver still allows local finalization.
+    ///
+    /// Cancelling this future preserves the merge task or its completed result.
+    /// The next call resumes waiting. Keep the recorder alive until finishing
+    /// completes, as dropping it cannot stop an active filesystem operation.
     ///
     /// # Errors
     ///
     /// Returns [`RecordingError::NoSegments`] when nothing was recorded and
     /// [`RecordingError::Merge`] when the segments cannot be merged. A failed
     /// attempt leaves the recorder retryable; repeating the call after a
-    /// successful finish returns the same manifest.
-    pub async fn finish(&mut self) -> Result<RecordingManifest, RecordingError> {
+    /// successful finish returns the same summary.
+    pub async fn finish(&mut self) -> Result<RecordingSummary, RecordingError> {
         loop {
             match &mut self.state {
-                State::Complete(manifest) => return Ok(manifest.clone()),
+                State::Complete(summary) => {
+                    self.events.wait_for_delivery().await;
+                    return Ok(summary.clone());
+                }
                 State::Finalizing(task) => {
                     // Await by reference so cancelling the caller cannot detach
                     // the task or allow another writer of the merge temporary
                     // file.
-                    let merged = task.await;
-                    return match merged {
-                        Ok(Ok(manifest)) => {
-                            self.state = State::Complete(manifest.clone());
-                            Ok(manifest)
-                        }
+                    match task.await {
+                        Ok(Ok(summary)) => self.state = State::Complete(summary),
                         Ok(Err(error)) => {
                             self.state = State::Failed;
-                            Err(error)
+                            return Err(error);
                         }
                         Err(error) => {
                             self.state = State::Failed;
-                            Err(RecordingError::Merge(Some(io::Error::other(error))))
+                            return Err(RecordingError::Merge(Some(io::Error::other(error))));
                         }
-                    };
+                    }
                 }
                 State::Capturing(capture) => {
                     capture.stop.store(true, Ordering::Release);
@@ -247,7 +250,7 @@ impl Recorder {
                     let store = self.store.clone();
                     self.state = State::Finalizing(tokio::task::spawn_blocking(move || {
                         let digest = store.merge()?;
-                        store.manifest(digest)
+                        store.summary(digest)
                     }));
                 }
             }
@@ -292,6 +295,15 @@ impl Recorder {
             self.store = tokio::task::spawn_blocking(move || store.refresh())
                 .await
                 .map_err(io::Error::other)??;
+            let last_segment = self.events.last_segment();
+            for meta in self
+                .store
+                .segments()
+                .into_iter()
+                .filter(|meta| meta.index > last_segment)
+            {
+                self.events.send(RecorderEvent::SegmentFinalized(meta));
+            }
             self.state = State::Failed;
         }
         Ok(())

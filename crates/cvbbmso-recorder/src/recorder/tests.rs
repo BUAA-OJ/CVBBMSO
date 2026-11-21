@@ -1,6 +1,6 @@
 use std::{fmt::Write as _, fs, path::Path, path::PathBuf};
 
-use cvbbmso_protocol::{RecordingManifest, RecordingPolicy, SegmentMeta, Sha256Digest};
+use cvbbmso_protocol::{RecordingPolicy, RecordingSummary, Sha256Digest};
 use sha2::Digest as _;
 use tempfile::TempDir;
 use time::OffsetDateTime;
@@ -44,9 +44,8 @@ fn digest() -> Sha256Digest {
     Sha256Digest::parse(&"a".repeat(64)).expect("digest")
 }
 
-fn manifest() -> RecordingManifest {
-    let segment = SegmentMeta::new(1, timestamp(0), timestamp(30), digest()).expect("segment");
-    RecordingManifest::new(vec![segment], digest()).expect("manifest")
+fn summary() -> RecordingSummary {
+    RecordingSummary::new(1, digest()).expect("summary")
 }
 
 fn seal_segments(candidate: &Path, count: u32) {
@@ -181,28 +180,36 @@ async fn finish_without_segments_reports_no_segments() {
 }
 
 #[tokio::test]
-async fn finish_returns_the_same_manifest_after_completion() {
+async fn finish_returns_the_same_summary_after_completion() {
     let (mut recorder, _events, _directory) = open_empty().await;
-    let cached = manifest();
+    let cached = summary();
     recorder.state = State::Complete(cached.clone());
 
-    assert_eq!(recorder.finish().await.expect("manifest"), cached);
+    assert_eq!(recorder.finish().await.expect("summary"), cached);
 }
 
 #[tokio::test]
-async fn finish_merges_the_sealed_segments_and_caches_the_manifest() {
+async fn finish_merges_the_sealed_segments_and_caches_the_summary() {
     let (mut recorder, _events, directory) = open_with_video_segments(2).await;
 
-    let manifest = recorder.finish().await.expect("manifest");
+    let summary = recorder.finish().await.expect("summary");
     let final_path = candidate_dir(&directory, OJ_USER_ID)
         .join("recording")
         .join("final.mp4");
 
-    assert_eq!(manifest.segments.len(), 2);
-    assert_eq!(manifest.segments[0].index, 1);
-    assert_eq!(manifest.segments[1].index, 2);
+    assert_eq!(summary.segment_count.get(), 2);
     assert!(final_path.is_file());
-    assert_eq!(recorder.finish().await.expect("cached"), manifest);
+    assert_eq!(recorder.finish().await.expect("cached"), summary);
+}
+
+#[tokio::test]
+async fn finish_can_merge_when_the_event_receiver_is_dropped() {
+    let (mut recorder, events, _directory) = open_with_video_segments(2).await;
+    drop(events);
+
+    let summary = recorder.finish().await.expect("local summary");
+    assert_eq!(summary.segment_count.get(), 2);
+    assert!(recorder.store.final_path().is_file());
 }
 
 #[tokio::test]
