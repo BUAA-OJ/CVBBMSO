@@ -12,7 +12,7 @@ use cvbbmso_protocol::{
 use time::OffsetDateTime;
 use tokio::{
     sync::{mpsc, oneshot},
-    time::{Instant, MissedTickBehavior, interval, sleep},
+    time::{Instant, MissedTickBehavior, interval, sleep_until},
 };
 use uuid::Uuid;
 
@@ -20,11 +20,12 @@ const INBOUND_CAPACITY: usize = 256;
 pub(crate) const OUTBOUND_CAPACITY: usize = 32;
 const SCHEDULE_INTERVAL: Duration = Duration::from_secs(1);
 const DISCONNECT_RETRY_BATCH: usize = 16;
+const WRITE_ATTEMPTS: u8 = 4;
 const WRITE_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 enum ReceiveOutcome {
     Continue(Instant),
-    Retry(ClientMessage),
+    Retry(ClientMessage, Instant),
     Stop,
 }
 
@@ -60,6 +61,7 @@ enum Request {
         connection: Connection,
         message: ClientMessage,
         received_at: Instant,
+        attempt: u8,
         processed: oneshot::Sender<ReceiveOutcome>,
     },
     End {
@@ -94,37 +96,35 @@ impl Hub {
         connection: Connection,
         mut message: ClientMessage,
         received_at: Instant,
+        on_retry: impl FnOnce(),
     ) -> Option<Instant> {
-        loop {
-            // Keep retries local to the reader so it cannot reorder or pile up messages.
-            match self.receive_once(connection, message, received_at).await? {
+        let mut on_retry = Some(on_retry);
+        // Wait outside the manager between attempts so other peers can make progress.
+        for attempt in 1..=WRITE_ATTEMPTS {
+            let (processed, completion) = oneshot::channel();
+            self.0
+                .send(Request::Receive {
+                    connection,
+                    message,
+                    received_at,
+                    attempt,
+                    processed,
+                })
+                .await
+                .ok()?;
+            match completion.await.ok()? {
                 ReceiveOutcome::Continue(deadline) => return Some(deadline),
                 ReceiveOutcome::Stop => return None,
-                ReceiveOutcome::Retry(retry) => {
+                ReceiveOutcome::Retry(retry, deadline) => {
+                    if let Some(on_retry) = on_retry.take() {
+                        on_retry();
+                    }
                     message = retry;
-                    sleep(WRITE_RETRY_DELAY).await;
+                    sleep_until((Instant::now() + WRITE_RETRY_DELAY).min(deadline)).await;
                 }
             }
         }
-    }
-
-    async fn receive_once(
-        &self,
-        connection: Connection,
-        message: ClientMessage,
-        received_at: Instant,
-    ) -> Option<ReceiveOutcome> {
-        let (processed, completion) = oneshot::channel();
-        self.0
-            .send(Request::Receive {
-                connection,
-                message,
-                received_at,
-                processed,
-            })
-            .await
-            .ok()?;
-        completion.await.ok()
+        None
     }
 
     pub(crate) async fn end(
@@ -301,10 +301,17 @@ impl Manager {
                     connection,
                     message,
                     received_at,
+                    attempt,
                     processed,
                 } => {
-                    let outcome = self.receive(connection, message, received_at).await;
-                    let _ = processed.send(outcome);
+                    // Let an active transaction settle before admitting a replacement.
+                    // Requests still in the queue can be discarded when the reader ends.
+                    if !processed.is_closed() {
+                        let outcome = self
+                            .receive(connection, message, received_at, attempt)
+                            .await;
+                        let _ = processed.send(outcome);
+                    }
                 }
                 Request::End {
                     connection,
@@ -381,6 +388,7 @@ impl Manager {
         connection: Connection,
         message: ClientMessage,
         received_at: Instant,
+        attempt: u8,
     ) -> ReceiveOutcome {
         let Some(current) = self
             .current
@@ -389,7 +397,7 @@ impl Manager {
         else {
             return ReceiveOutcome::Stop;
         };
-        if received_at >= current.deadline {
+        if received_at >= current.deadline || (attempt > 1 && Instant::now() >= current.deadline) {
             self.end(connection, DisconnectReason::HeartbeatTimeout, None)
                 .await;
             return ReceiveOutcome::Stop;
@@ -403,14 +411,19 @@ impl Manager {
                 return ReceiveOutcome::Continue(current.deadline);
             }
             Ok(false) => self.end(connection, DisconnectReason::Closed, None).await,
-            Err(error) if error.is_storage_busy() => {
-                // The reader cannot process a newer heartbeat until this write finishes.
-                current.deadline = current.deadline.max(Instant::now() + self.timeout);
-                #[cfg(test)]
-                self.write_retries.notify_one();
-                return ReceiveOutcome::Retry(message);
-            }
             Err(error) => {
+                if error.is_storage_busy() {
+                    if Instant::now() >= current.deadline {
+                        self.end(connection, DisconnectReason::HeartbeatTimeout, None)
+                            .await;
+                        return ReceiveOutcome::Stop;
+                    }
+                    if attempt < WRITE_ATTEMPTS {
+                        #[cfg(test)]
+                        self.write_retries.notify_one();
+                        return ReceiveOutcome::Retry(message, current.deadline);
+                    }
+                }
                 self.end(
                     connection,
                     DisconnectReason::Closed,
@@ -587,5 +600,112 @@ impl SocketError {
             code: self.code.into(),
             message: self.message.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::extract::ws::Message;
+    use cvbbmso_protocol::{ClientIncident, ExamEvent, IncidentCode};
+    use futures_util::{StreamExt, stream};
+    use tokio::time;
+
+    use super::*;
+    use crate::socket::read_frames;
+
+    #[tokio::test(start_paused = true)]
+    async fn prefetched_event_survives_a_heartbeat_write_crossing_the_old_deadline() {
+        let (requests, mut pending) = mpsc::channel(1);
+        let hub = Hub(requests);
+        let connection = Connection {
+            student: StudentKey {
+                exam_id: Uuid::new_v4(),
+                oj_user_id: 1,
+            },
+            id: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+        };
+        let heartbeat_at = Instant::now();
+        let old_deadline = heartbeat_at + Duration::from_secs(1);
+        let renewed_deadline = heartbeat_at + Duration::from_secs(25);
+        let event = ClientMessage::Event {
+            seq: 1,
+            event: ExamEvent::Incident(ClientIncident {
+                code: IncidentCode::NavigationDenied,
+                occurred_at: OffsetDateTime::UNIX_EPOCH,
+                detail: None,
+            }),
+        };
+        let heartbeat = serde_json::to_string(&ClientMessage::Heartbeat).unwrap();
+        let event_text = serde_json::to_string(&event).unwrap();
+        let (read_event, event_read) = oneshot::channel();
+        let reader = stream::iter([Ok(Message::Text(heartbeat.into()))])
+            .chain(stream::once(async move {
+                sleep_until(old_deadline).await;
+                read_event.send(()).unwrap();
+                Ok(Message::Text(event_text.into()))
+            }))
+            .chain(stream::pending());
+        tokio::pin!(reader);
+
+        let simulate_writes = async {
+            // Simulate SQLite returning busy once, then settling only after the
+            // next frame is ready at the old heartbeat deadline.
+            for expected_attempt in [1, 2] {
+                let Some(Request::Receive {
+                    message: ClientMessage::Heartbeat,
+                    attempt,
+                    received_at,
+                    processed,
+                    ..
+                }) = pending.recv().await
+                else {
+                    panic!("expected a heartbeat write");
+                };
+                assert_eq!(attempt, expected_attempt);
+                assert_eq!(received_at, heartbeat_at);
+                assert!(Instant::now() < old_deadline);
+                if attempt == 1 {
+                    assert!(
+                        processed
+                            .send(ReceiveOutcome::Retry(
+                                ClientMessage::Heartbeat,
+                                old_deadline
+                            ))
+                            .is_ok()
+                    );
+                } else {
+                    event_read.await.unwrap();
+                    assert!(
+                        processed
+                            .send(ReceiveOutcome::Continue(renewed_deadline))
+                            .is_ok()
+                    );
+                    break;
+                }
+            }
+            let Some(Request::Receive {
+                message,
+                received_at,
+                processed,
+                ..
+            }) = pending.recv().await
+            else {
+                panic!("expected the prefetched event after the heartbeat");
+            };
+            assert_eq!(message, event);
+            assert!(received_at >= old_deadline);
+            assert!(received_at < renewed_deadline);
+            assert!(processed.send(ReceiveOutcome::Stop).is_ok());
+        };
+
+        time::timeout(Duration::from_secs(30), async {
+            tokio::join!(
+                read_frames(&mut reader, &hub, connection, old_deadline),
+                simulate_writes
+            );
+        })
+        .await
+        .unwrap();
     }
 }

@@ -630,6 +630,113 @@ async fn sqlite_contention_keeps_a_second_socket_open() {
 }
 
 #[tokio::test]
+async fn closing_during_sqlite_contention_discards_the_blocked_event() {
+    use sea_orm::{ConnectionTrait, Database, TransactionTrait};
+    use tokio::time::{self, timeout};
+
+    let fixture = Fixture::new().await;
+    let state = hello(ExecutionState::Ready, RecordingState::Idle);
+    let mut first = open_socket(&fixture, &state, 0).await;
+    let writer = Database::connect(&fixture.database_url).await.unwrap();
+    let lock = writer.begin().await.unwrap();
+    lock.execute_unprepared("UPDATE exams SET title = title")
+        .await
+        .unwrap();
+    time::pause();
+    // Freeze retry backoff while the real SQLite worker and socket finish.
+    // The watchdog allows virtual timers to advance if the close stalls.
+    let watchdog = std::time::Instant::now() + TIMEOUT;
+    let keep_clock_paused = tokio::spawn(async move {
+        while std::time::Instant::now() < watchdog {
+            tokio::task::yield_now().await;
+        }
+    });
+    send(&mut first, &navigation(1, "abandoned event")).await;
+    timeout(TIMEOUT, fixture.write_retries.notified())
+        .await
+        .unwrap();
+
+    // Observe the close with the write lock still held, before another retry.
+    timeout(TIMEOUT, async {
+        tokio::select! {
+            biased;
+            () = fixture.write_retries.notified() => panic!("write retried after close"),
+            () = close_socket(&fixture, &mut first) => {}
+        }
+    })
+    .await
+    .unwrap();
+    keep_clock_paused.abort();
+    time::resume();
+    assert!(incidents(&fixture).await.is_empty());
+    lock.rollback().await.unwrap();
+
+    fixture.clock.store(START, Ordering::Relaxed);
+    let mut replacement = open_socket(&fixture, &state, 0).await;
+    let start = command(&mut replacement, CommandName::StartExam, START).await;
+    let event = navigation(1, "replacement event");
+    send(&mut replacement, &event).await;
+    confirm(&mut replacement, start).await;
+    fixture.state.hub.trigger_schedule().await;
+    fixture.state.hub.barrier().await;
+    let ClientMessage::Event { event, .. } = event else {
+        unreachable!();
+    };
+    assert_eq!(
+        events(&fixture)
+            .await
+            .into_iter()
+            .map(|row| row.event)
+            .collect::<Vec<_>>(),
+        [event]
+    );
+    let lost: Vec<_> = incidents(&fixture)
+        .await
+        .into_iter()
+        .filter(|item| item.kind == "connection_lost")
+        .collect();
+    assert_eq!(lost.len(), 1);
+    assert_eq!(lost[0].detail.as_deref(), Some("closed"));
+    assert_eq!(lost[0].occurred_at, instant(START - 1));
+    let runtime = fixture
+        .admin(AdminOperation::StudentsShow {
+            exam_id: fixture.exam_id,
+            oj_user_id: STUDENT,
+        })
+        .await;
+    assert!(matches!(runtime, AdminOutput::Student(runtime) if runtime.connected));
+}
+
+#[tokio::test]
+async fn persistent_sqlite_contention_exhausts_the_retry_budget() {
+    use sea_orm::{ConnectionTrait, Database, TransactionTrait};
+
+    let fixture = Fixture::new().await;
+    let state = hello(ExecutionState::Ready, RecordingState::Idle);
+    let mut socket = open_socket(&fixture, &state, 0).await;
+    let writer = Database::connect(&fixture.database_url).await.unwrap();
+    let lock = writer.begin().await.unwrap();
+    lock.execute_unprepared("UPDATE exams SET title = title")
+        .await
+        .unwrap();
+    send(&mut socket, &navigation(1, "blocked event")).await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        socket_error(&mut socket, error_code::INTERNAL_ERROR),
+    )
+    .await
+    .unwrap();
+
+    lock.rollback().await.unwrap();
+    fixture.state.hub.trigger_schedule().await;
+    fixture.state.hub.barrier().await;
+    assert!(events(&fixture).await.is_empty());
+    let lost = incidents(&fixture).await;
+    assert_eq!(lost.len(), 1);
+    assert_eq!(lost[0].kind, "connection_lost");
+}
+
+#[tokio::test]
 async fn disconnect_storage_failure_is_reconciled() {
     use sea_orm::{ConnectionTrait, Database};
 
@@ -1252,7 +1359,12 @@ async fn replacement_ignores_old_close_timeout_and_event_notices() {
         fixture
             .state
             .hub
-            .receive(previous.connection, navigation(1, "stale"), Instant::now())
+            .receive(
+                previous.connection,
+                navigation(1, "stale"),
+                Instant::now(),
+                || {}
+            )
             .await
             .is_none()
     );
@@ -1280,6 +1392,7 @@ async fn replacement_ignores_old_close_timeout_and_event_notices() {
 #[tokio::test]
 async fn heartbeat_renews_the_exact_deadline_and_timeout_is_recorded_once() {
     use cvbbmso_domain::DisconnectReason;
+    use sea_orm::{ConnectionTrait, Database, TransactionTrait};
     use tokio::sync::oneshot;
     use tokio::time::{self, Instant};
 
@@ -1308,7 +1421,12 @@ async fn heartbeat_renews_the_exact_deadline_and_timeout_is_recorded_once() {
         fixture
             .state
             .hub
-            .receive(peer.connection, ClientMessage::Heartbeat, received_at)
+            .receive(
+                peer.connection,
+                ClientMessage::Heartbeat,
+                received_at,
+                || {}
+            )
             .await
             .is_some()
     );
@@ -1326,13 +1444,31 @@ async fn heartbeat_renews_the_exact_deadline_and_timeout_is_recorded_once() {
     ));
     assert!(incidents(&fixture).await.is_empty());
 
+    let writer = Database::connect(&fixture.database_url).await.unwrap();
+    let lock = writer.begin().await.unwrap();
+    lock.execute_unprepared("UPDATE exams SET title = title")
+        .await
+        .unwrap();
+    let hub = fixture.state.hub.clone();
+    let connection = peer.connection;
+    let pending = tokio::spawn(async move {
+        hub.receive(
+            connection,
+            navigation(1, "locked at deadline"),
+            Instant::now(),
+            || {},
+        )
+        .await
+    });
+    fixture.write_retries.notified().await;
     time::advance(received_at + TIMEOUT - Instant::now()).await;
-    fixture
-        .state
-        .hub
-        .end(peer.connection, DisconnectReason::HeartbeatTimeout, None)
-        .await;
-    assert!(peer.closing.await.unwrap().is_none());
+    tokio::select! {
+        closed = &mut peer.closing => assert!(closed.unwrap().is_none()),
+        () = fixture.write_retries.notified() => panic!("retried past the heartbeat deadline"),
+    }
+    assert!(pending.await.unwrap().is_none());
+    lock.rollback().await.unwrap();
+    fixture.state.hub.trigger_schedule().await;
     fixture
         .state
         .hub
