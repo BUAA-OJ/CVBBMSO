@@ -73,7 +73,7 @@ impl ExamHandle {
     pub async fn notify(&self, notice: UiNotice) -> Result<(), ExamError>;
 
     /// 停止采集并封存当前片段，关闭 WebSocket，保留已封存分片。
-    /// 合并与最终 manifest 由后续 Recorder::finish 完成。
+    /// 合并与最终录像摘要由后续 Recorder::finish 完成。
     pub async fn shutdown(self) -> Result<(), ExamError>;
 }
 ```
@@ -106,7 +106,7 @@ impl ExamHandle {
 ### 命令语义
 
 - `start_exam` 表示“确保采集正在运行”：已在采集时幂等成功；有已封存分片但采集已停止时恢复采集；启动失败时持续重试（见[时限与重试](#时限与重试)）。
-- `end_exam` 表示“停止采集、finalize 并收尾”：已在 finalize 或已完成时返回同一 manifest；没有可收尾分片时按失败处理。
+- `end_exam` 停止采集并收尾。重复收到命令时，沿用原录像摘要和收尾结论。没有可收尾分片时按失败处理。
 - 每个 `command_id` 唯一；重连时由服务端根据 `hello.state` 和 `phase` 生成新命令。
 - `status` 仅用于状态对齐；命令确认由 `CommandAck` 负责，结束由 `command_result` 驱动。
 
@@ -133,9 +133,9 @@ stateDiagram-v2
 
 ## 生命周期、离线与认证
 
-- **正常完成**：收到 `end_exam` 后停止采集并执行 `finish`。成功时按录像摘要中的分片索引补记尚未入队的分片事件，再入队录像摘要。运行时按序保存并发出当前连接尚未发送的可靠事件，再发送 `command_result(completed)`。收尾结论确定后停止接收新的导航异常，确保结束结果是本次握手的最后一条业务消息。收到对应的 `CommandAck` 后才清理本场事件，进入 `finished` 并关闭 WebSocket。
-- **finalize 失败**：`finish` 进行有限重试。仍失败时将 `recording_failed` 入队，先补齐可靠事件，再发送 `command_result(failed, RECORDING_FINISH_FAILED)`。收到对应的 `CommandAck` 后以 `finished/failed` 关闭。没有可收尾分片（`NoSegments`）同样走失败路径。
-- **主动关闭**：`ExamHandle::shutdown` 调用 `Recorder::stop` 停止采集并封存当前片段，关闭 WebSocket；合并与 manifest 由后续 `finish` 完成。已封存分片保留，下次 `Recorder::open` 恢复。服务端按普通断开记录 `connection_lost`。
+- **正常完成**：收到 `end_exam` 后停止采集并执行 `finish`，等待期间继续接收分片事件。成功返回后排空已送达的事件，确认日志已包含索引从 1 连续到 `segment_count` 的独立分片事件，再入队仅含 `segment_count` 和 `merged_sha256` 的录像摘要。运行时按序保存并发送尚未发出的可靠事件，再发送 `command_result(completed)`。收尾结论确定后停止接收新的导航异常。收到当前结束命令的 `CommandAck` 后才清理本场事件，进入 `finished` 并关闭 WebSocket。
+- **finalize 失败**：`finish` 进行有限重试。仍失败时将 `recording_failed` 入队，先补齐可靠事件，再发送 `command_result(failed, RECORDING_FINISH_FAILED)`。收到对应的 `CommandAck` 后以 `finished/failed` 关闭。没有可收尾分片（`NoSegments`）或分片事件与摘要计数不一致时也按失败处理。
+- **主动关闭**：`ExamHandle::shutdown` 调用 `Recorder::stop` 停止采集并封存当前片段，然后关闭 WebSocket。已封存分片保留，下次 `Recorder::open` 恢复。合并和摘要由后续 `finish` 完成。服务端按普通断开记录 `connection_lost`。
 - **断网跨过结束时间**：客户端使用 `sync.server_time` 计算服务端时钟偏移；到达 `end_at + 60s` 后调用 `Recorder::stop` 封存当前片段，进入 `finalizing/finalizing`，等待 `end_exam`。重连后按服务端下发的 `end_exam` 执行 `finish` 并完成收尾。
 - **Cookie 过期**：运行时继续录屏，保持本地事件队列；通过 `ClientView` 通知 UI 重新登录，并按退避策略重试连接。认证失效期间录像继续。
 - **更新 Cookie**：收到 `CookiesUpdated` 时，通过 `GET /api/exams` 验证新 Cookie 的报名状态，并核对 `user.id` 与当前运行时绑定的考生一致。验证通过后采用新 Cookie，离线时立即重试连接。验证失败时保留原 Cookie，账号不符时通过 `ACCODING_AUTH_EXPIRED` 提示重新登录。
@@ -169,6 +169,8 @@ stateDiagram-v2
 本 crate 在 `<app-data>/exams/<exam-id>/<oj-user-id>/runtime/` 保存考试执行阶段、可靠事件队列和已入队的分片 `index`。队列保留至当前结束命令的 ACK，`sync.ack_event_through` 只决定补发起点。录像文件和分片元信息属于 [cvbbmso-recorder](cvbbmso-recorder.md)，位于同一考生目录下的 `recording/`。命令 ID 只在所属 WebSocket 会话有效。
 
 `Recorder::open` 会重新发出全部已恢复分片；已入队的分片保留其原 `seq` 继续等待确认，已确认的分片不再上报，未入队的分片分配下一个事件序号。服务端按 `seq` 去重，因此重复上报安全。分片事件仍以 `SegmentMeta.index` 作为稳定身份，服务端可按 `(exam_id, oj_user_id, index)` 做辅助去重。
+
+读取升级前的本地日志时，运行时从旧 `recording_finalized.data.segments` 计算分片数，保留原摘要事件序号、合并哈希、独立分片事件和已保存的运行状态。日志重写和补报使用新版摘要。此转换只用于本地日志，客户端与服务端按同版线上协议通信。
 
 首次 `sync` 之前产生的事件先入队，收到 `ack_event_through` 后从其下一号开始编号。后续 `sync` 只能推进下一个可用序号。本地数据丢失或损坏时，新日志也以服务端已持久化的位置为起点。线上事件序号上限为 `i64::MAX`。旧日志中仍在范围内的事件沿用原序号，已经超出范围的事件和耗尽后新增的事件留在本地。仍有无法编号或上报的事件时，运行时显示 `INTERNAL_ERROR`，暂缓发送结束结果。可靠事件在原子写入磁盘成功后才进入 WebSocket 发送队列。进程在写盘恢复前退出时，仅存于内存的事件随之丢失。
 

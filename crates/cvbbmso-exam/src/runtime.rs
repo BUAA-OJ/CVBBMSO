@@ -12,13 +12,13 @@
 mod capture;
 mod session;
 
-use std::{collections::HashMap, future::Future, path::PathBuf, time::Duration};
+use std::{collections::HashMap, future::Future, io, path::PathBuf, time::Duration};
 
 use cvbbmso_accoding::AccodingCookies;
 use cvbbmso_protocol::{
     ClientHello, ClientIncident, ClientMessage, ClientState, CommandName, CommandStatus, ExamEvent,
     ExamPhase, ExecutionState, IncidentCode, Platform, RecordingPolicy, RecordingState,
-    ServerMessage, error_code,
+    RecordingSummary, ServerMessage, error_code,
 };
 use cvbbmso_recorder::{RecorderEvent, RecordingError};
 use time::OffsetDateTime;
@@ -767,14 +767,14 @@ impl<C: Capture> Runtime<C> {
         }
     }
 
-    /// Finishes the recording with bounded retries and reports the manifest.
+    /// Finishes the recording with bounded retries and reports the summary.
     async fn finish(&mut self) -> CommandStatus {
         self.retry_at = None;
         self.set_state(ExecutionState::Finalizing, RecordingState::Finalizing)
             .await;
         let mut attempt = 1;
         let result = loop {
-            match self.capture.finish().await {
+            match self.finish_capture().await {
                 Err(error)
                     if attempt < self.timing.finish_attempts
                         && !matches!(error, RecordingError::NoSegments) =>
@@ -786,20 +786,22 @@ impl<C: Capture> Runtime<C> {
                 result => break result,
             }
         };
-        // Finishing may seal a segment while the runtime is awaiting the
-        // recorder. Queue its notification before the manifest and result.
-        self.drain_recorder_events().await;
+        let result = result.and_then(|summary| {
+            if self.journal.has_recording_segments(summary.segment_count) {
+                Ok(summary)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "recorder segment events do not match the recording summary",
+                )
+                .into())
+            }
+        });
         match result {
-            Ok(manifest) => {
-                // A segment notification can arrive after the drain. Save any
-                // missing segments together with the manifest and final state.
-                for segment in &manifest.segments {
-                    self.journal
-                        .append(ExamEvent::SegmentFinalized(segment.clone()));
-                }
+            Ok(summary) => {
                 let changed =
                     self.update_state(ExecutionState::Finalizing, RecordingState::Complete);
-                self.record(ExamEvent::RecordingFinalized(manifest)).await;
+                self.record(ExamEvent::RecordingFinalized(summary)).await;
                 if let Some(state) = changed {
                     self.announce(state).await;
                 }
@@ -815,6 +817,27 @@ impl<C: Capture> Runtime<C> {
                 CommandStatus::Failed
             }
         }
+    }
+
+    async fn finish_capture(&mut self) -> Result<RecordingSummary, RecordingError> {
+        let mut received = Vec::new();
+        let result = {
+            // The recorder must deliver its tail segment before finish returns.
+            // Keep reading while it waits for the bounded channel to have room.
+            let finish = self.capture.finish();
+            tokio::pin!(finish);
+            loop {
+                tokio::select! {
+                    result = &mut finish => break result,
+                    Some(event) = self.recorder.recv() => received.push(event),
+                }
+            }
+        };
+        for event in received {
+            self.recorder_event(event).await;
+        }
+        self.drain_recorder_events().await;
+        result
     }
 
     async fn drain_recorder_events(&mut self) {

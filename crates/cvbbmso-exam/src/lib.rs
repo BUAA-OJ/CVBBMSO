@@ -145,7 +145,7 @@ impl ExamHandle {
     }
 
     /// Stops capture and seals the current segment, closes the WebSocket, and
-    /// keeps the sealed segments; merging and the final manifest belong to a
+    /// keeps the sealed segments; merging and the final summary belong to a
     /// later `Recorder::finish`.
     ///
     /// # Errors

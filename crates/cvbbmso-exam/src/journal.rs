@@ -3,7 +3,7 @@
 //! The journal owns the reliable event queue: every event is written here
 //! before it is sent, and stays until the exam closes with its final
 //! `CommandAck`. The server's `sync.ack_event_through` controls replay.
-//! It also records which recorder segments and manifest were already queued
+//! It also records which recorder segments and summary were already queued
 //! and the client state reached, so a restarted process resumes where it
 //! stopped.
 //!
@@ -16,11 +16,15 @@ use std::{
     collections::{BTreeSet, VecDeque},
     fs,
     io::{self, Write},
+    num::NonZeroU32,
     path::{Path, PathBuf},
 };
 
-use cvbbmso_protocol::{ClientMessage, ClientState, ExamEvent, ExecutionState, RecordingState};
-use serde::{Deserialize, Serialize};
+use cvbbmso_protocol::{
+    ClientMessage, ClientState, ExamEvent, ExecutionState, RecordingState, RecordingSummary,
+    SegmentMeta, Sha256Digest,
+};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::ExamError;
 
@@ -51,7 +55,7 @@ struct Data {
     queue: VecDeque<Entry>,
     /// Segment indexes already queued, so recovered segments are not repeated.
     segments: BTreeSet<u32>,
-    /// Whether the recording manifest was already queued.
+    /// Whether the recording summary was already queued.
     finalized: bool,
     /// Client state reached before the last save.
     state: ClientState,
@@ -61,7 +65,51 @@ struct Data {
 struct Entry {
     /// Keep the old unsigned representation to preserve existing snapshots.
     seq: Option<u64>,
+    #[serde(deserialize_with = "deserialize_stored_event")]
     event: ExamEvent,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredEvent {
+    Current(ExamEvent),
+    Legacy(LegacyEvent),
+}
+
+#[derive(Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "data",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum LegacyEvent {
+    RecordingFinalized {
+        segments: Vec<SegmentMeta>,
+        merged_sha256: Sha256Digest,
+    },
+}
+
+// Old manifests duplicated the individually journaled segments. Convert only
+// the stored summary payload, leaving its event number and the segment entries intact.
+fn deserialize_stored_event<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ExamEvent, D::Error> {
+    match StoredEvent::deserialize(deserializer)? {
+        StoredEvent::Current(event) => Ok(event),
+        StoredEvent::Legacy(LegacyEvent::RecordingFinalized {
+            segments,
+            merged_sha256,
+        }) => {
+            let count = u32::try_from(segments.len()).map_err(D::Error::custom)?;
+            if !segments.iter().map(|segment| segment.index).eq(1..=count) {
+                return Err(D::Error::custom("noncontiguous legacy recording segments"));
+            }
+            RecordingSummary::new(count, merged_sha256)
+                .map(ExamEvent::RecordingFinalized)
+                .map_err(D::Error::custom)
+        }
+    }
 }
 
 impl Default for Data {
@@ -169,7 +217,7 @@ impl Journal {
     /// Queues an event and returns its sequence number, if already anchored.
     ///
     /// Returns `None` for a segment whose index was already queued, for a
-    /// second recording manifest, and for any event recorded before numbering
+    /// second recording summary, and for any event recorded before numbering
     /// is anchored or after the sequence space is exhausted.
     pub(crate) fn append(&mut self, event: ExamEvent) -> Option<i64> {
         let repeated = match &event {
@@ -210,6 +258,11 @@ impl Journal {
             .queue
             .back()
             .is_some_and(|entry| entry.seq.is_none_or(|seq| seq > MAX_WIRE_SEQ))
+    }
+
+    /// Whether all segments from the recorder's summary have been journaled.
+    pub(crate) fn has_recording_segments(&self, count: NonZeroU32) -> bool {
+        self.data.segments.iter().copied().eq(1..=count.get())
     }
 
     /// Returns numbered messages beyond the current session's send position.

@@ -12,7 +12,7 @@ use std::{
 use cvbbmso_accoding::AccodingCookies;
 use cvbbmso_protocol::{
     ClientMessage, ClientState, CommandName, CommandStatus, ExamEvent, ExamPhase, ExecutionState,
-    IncidentCode, RecordingManifest, RecordingPolicy, RecordingState, SegmentMeta, ServerMessage,
+    IncidentCode, RecordingPolicy, RecordingState, RecordingSummary, SegmentMeta, ServerMessage,
     Sha256Digest, error_code,
 };
 use cvbbmso_recorder::{RecorderEvent, RecordingError};
@@ -113,7 +113,7 @@ struct Script(Arc<Mutex<ScriptState>>);
 struct ScriptState {
     calls: Vec<&'static str>,
     start_failures: u32,
-    no_segments: bool,
+    omit_segment_events: bool,
 }
 
 impl Script {
@@ -129,6 +129,7 @@ impl Script {
 struct FakeCapture {
     script: Script,
     segment_count: u32,
+    recorder: mpsc::Sender<RecorderEvent>,
 }
 
 impl Capture for FakeCapture {
@@ -149,22 +150,27 @@ impl Capture for FakeCapture {
         async { Ok(()) }
     }
 
-    fn finish(&mut self) -> impl Future<Output = Result<RecordingManifest, RecordingError>> + Send {
-        let no_segments = {
+    fn finish(&mut self) -> impl Future<Output = Result<RecordingSummary, RecordingError>> + Send {
+        let omit_segment_events = {
             let mut script = self.script.0.lock().unwrap();
             script.calls.push("finish");
-            script.no_segments
+            script.omit_segment_events
         };
         let segment_count = self.segment_count;
+        let recorder = self.recorder.clone();
         async move {
-            if no_segments {
-                return Err(RecordingError::NoSegments);
+            if !omit_segment_events {
+                for index in 1..=segment_count {
+                    recorder
+                        .send(RecorderEvent::SegmentFinalized(segment(index)))
+                        .await
+                        .unwrap();
+                }
             }
-            Ok(RecordingManifest::new(
-                (1..=segment_count).map(segment).collect(),
-                Sha256Digest::parse(&"b".repeat(64)).unwrap(),
+            Ok(
+                RecordingSummary::new(segment_count, Sha256Digest::parse(&"b".repeat(64)).unwrap())
+                    .unwrap(),
             )
-            .unwrap())
         }
     }
 }
@@ -188,9 +194,13 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
+        Self::with_event_capacity(16).await
+    }
+
+    async fn with_event_capacity(capacity: usize) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
-        let (recorder, events) = mpsc::channel(16);
+        let (recorder, events) = mpsc::channel(capacity);
         Self {
             listener,
             base,
@@ -231,6 +241,7 @@ impl Harness {
         let capture = FakeCapture {
             script: self.script.clone(),
             segment_count: self.segment_count,
+            recorder: self.recorder.clone(),
         };
         let events = self.events.take().expect("launched once per harness");
         let open_gate = self.open_gate.take();
@@ -821,6 +832,7 @@ async fn a_full_send_queue_cannot_hold_recording_past_the_offline_deadline() {
         capture: FakeCapture {
             script: harness.script.clone(),
             segment_count: 1,
+            recorder: harness.recorder.clone(),
         },
         recorder,
         inbound_tx,
@@ -940,8 +952,10 @@ async fn a_failed_journal_write_keeps_the_exam_running() {
 }
 
 #[tokio::test]
-async fn end_result_waits_for_the_tail_segment_and_manifest_to_be_saved_and_sent() {
-    let mut harness = Harness::new().await;
+async fn end_result_waits_for_the_tail_segment_and_summary_to_be_saved_and_sent() {
+    // The fake fills the single slot with a duplicate, then waits to deliver
+    // the tail before returning. The runtime must consume events during finish.
+    let mut harness = Harness::with_event_capacity(1).await;
     harness.segment_count = 2;
     let (mut conn, handle) = harness.connected(ExamPhase::Running).await;
     let mut view = handle.subscribe();
@@ -981,36 +995,33 @@ async fn end_result_waits_for_the_tail_segment_and_manifest_to_be_saved_and_sent
     .await
     .unwrap()
     .unwrap();
-    // The recorder publishes this notification after finish returned its manifest.
-    harness
-        .recorder
-        .send(RecorderEvent::SegmentFinalized(segment(2)))
-        .await
-        .unwrap();
     std::fs::remove_dir(&blocker).unwrap();
 
     let (seq, event) = expect_event(conn.recv().await);
     assert_eq!(seq, 2);
     let ExamEvent::SegmentFinalized(tail) = event else {
-        panic!("expected the tail segment before the manifest, got {event:?}");
+        panic!("expected the tail segment before the summary, got {event:?}");
     };
-    assert_eq!(tail.index, 2);
+    assert_eq!(tail, segment(2));
     let (seq, event) = expect_event(conn.recv().await);
     assert_eq!(seq, 3);
-    let ExamEvent::RecordingFinalized(manifest) = event else {
-        panic!("expected the manifest after the tail segment, got {event:?}");
+    let ExamEvent::RecordingFinalized(summary) = event else {
+        panic!("expected the summary after the tail segment, got {event:?}");
     };
-    assert_eq!(manifest.segments.len(), 2);
-    assert_eq!(manifest.segments[1], tail);
+    assert_eq!(summary.segment_count.get(), tail.index);
+    assert_eq!(
+        summary.merged_sha256,
+        Sha256Digest::parse(&"b".repeat(64)).unwrap()
+    );
     expect_result(&conn.recv().await, 2, CommandStatus::Completed);
     conn.send(ack(2)).await;
     conn.closed().await;
 }
 
 #[tokio::test]
-async fn failed_end_replays_unconfirmed_evidence_and_clears_it_after_ack() {
+async fn end_with_missing_segments_replays_failure_and_clears_it_after_ack() {
     let mut harness = Harness::new().await;
-    harness.script.0.lock().unwrap().no_segments = true;
+    harness.script.0.lock().unwrap().omit_segment_events = true;
     let (mut conn, handle) = harness.connected(ExamPhase::Running).await;
     let mut view = handle.subscribe();
     start_recording(&mut conn).await;
@@ -1099,7 +1110,7 @@ async fn capture_is_retried_after_start_exam_reports_failure() {
 }
 
 #[tokio::test]
-async fn restart_replies_to_a_fresh_end_command_after_the_original_ack_is_lost() {
+async fn restart_replays_a_legacy_journal_before_replying_to_a_fresh_end_command() {
     let mut harness = Harness::new().await;
     let (mut conn, handle) = harness.connected(ExamPhase::Running).await;
     start_recording(&mut conn).await;
@@ -1108,12 +1119,12 @@ async fn restart_replies_to_a_fresh_end_command_after_the_original_ack_is_lost()
         &conn.recv().await,
         state(ExecutionState::Finalizing, RecordingState::Finalizing),
     );
-    let (seq, segment) = expect_event(conn.recv().await);
+    let (seq, segment_event) = expect_event(conn.recv().await);
     assert_eq!(seq, 1);
-    assert!(matches!(&segment, ExamEvent::SegmentFinalized(meta) if meta.index == 1));
-    let (seq, manifest) = expect_event(conn.recv().await);
+    assert!(matches!(&segment_event, ExamEvent::SegmentFinalized(meta) if meta.index == 1));
+    let (seq, summary) = expect_event(conn.recv().await);
     assert_eq!(seq, 2);
-    assert!(matches!(manifest, ExamEvent::RecordingFinalized(_)));
+    assert!(matches!(summary, ExamEvent::RecordingFinalized(_)));
     expect_status(
         &conn.recv().await,
         state(ExecutionState::Finalizing, RecordingState::Complete),
@@ -1131,6 +1142,17 @@ async fn restart_replies_to_a_fresh_end_command_after_the_original_ack_is_lost()
     handle.shutdown().await.unwrap();
     conn.closed().await;
 
+    let path = harness.candidate_dir().join("runtime/journal.json");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let event = &mut stored["queue"][1]["event"];
+    assert_eq!(event["kind"], "recording_finalized");
+    event["data"] = serde_json::json!({
+        "segments": [segment(1)],
+        "merged_sha256": "b".repeat(64),
+    });
+    std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+
     let mut restarted = Harness::new().await;
     std::mem::swap(&mut restarted.data, &mut harness.data);
     let pending = restarted.launch();
@@ -1142,11 +1164,14 @@ async fn restart_replies_to_a_fresh_end_command_after_the_original_ack_is_lost()
         hello.state,
         state(ExecutionState::Finalizing, RecordingState::Complete)
     );
-    // The server committed the original end result, but its ACK never arrived.
-    conn.send(sync(ExamPhase::Ended, 2)).await;
+    // The old connection closed before receiving an end ACK. A new server
+    // without the old database needs both events under their original numbers.
+    conn.send(sync(ExamPhase::Ended, 0)).await;
     let handle = pending.await.unwrap().unwrap();
     conn.send(ack(2)).await;
     conn.send(command(3, CommandName::EndExam)).await;
+    assert_eq!(expect_event(conn.recv().await), (1, segment_event.clone()));
+    assert_eq!(expect_event(conn.recv().await), (2, summary.clone()));
     expect_result(&conn.recv().await, 3, CommandStatus::Completed);
     assert_eq!(restarted.script.calls(), Vec::<&str>::new());
     let journal = Journal::open(&restarted.candidate_dir()).await.unwrap();
@@ -1155,11 +1180,17 @@ async fn restart_replies_to_a_fresh_end_command_after_the_original_ack_is_lost()
             .messages_after(0)
             .map(|(_, message)| expect_event(message))
             .collect::<Vec<_>>(),
-        [(1, segment), (2, manifest)]
+        [(1, segment_event), (2, summary)]
     );
     conn.send(ack(3)).await;
     conn.closed().await;
     handle.shutdown().await.unwrap();
+    let journal = Journal::open(&restarted.candidate_dir()).await.unwrap();
+    assert_eq!(
+        journal.state(),
+        state(ExecutionState::Finished, RecordingState::Complete)
+    );
+    assert_eq!(journal.messages_after(0).count(), 0);
 }
 
 #[tokio::test]
@@ -1168,11 +1199,7 @@ async fn reopening_a_finished_exam_closes_the_connection() {
     let mut journal = Journal::open(&harness.candidate_dir()).await.unwrap();
     journal.anchor(0);
     journal.append(ExamEvent::RecordingFinalized(
-        RecordingManifest::new(
-            vec![segment(1)],
-            Sha256Digest::parse(&"b".repeat(64)).unwrap(),
-        )
-        .unwrap(),
+        RecordingSummary::new(1, Sha256Digest::parse(&"b".repeat(64)).unwrap()).unwrap(),
     ));
     journal.clear_events();
     journal.set_state(state(ExecutionState::Finished, RecordingState::Complete));
