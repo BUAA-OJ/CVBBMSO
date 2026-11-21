@@ -15,7 +15,7 @@ use std::{
     },
 };
 
-use cvbbmso_protocol::{ProtocolError, RecordingManifest, SegmentMeta, Sha256Digest};
+use cvbbmso_protocol::{ProtocolError, RecordingSummary, SegmentMeta, Sha256Digest};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
@@ -242,12 +242,14 @@ impl SegmentStore {
         }
     }
 
-    /// Builds the manifest of the sealed segments.
-    pub(crate) fn manifest(
+    /// Summarizes the number of sealed segments and the merged file digest.
+    pub(crate) fn summary(
         &self,
         merged_sha256: Sha256Digest,
-    ) -> Result<RecordingManifest, RecordingError> {
-        RecordingManifest::new(self.segments(), merged_sha256).map_err(rejected_segment)
+    ) -> Result<RecordingSummary, RecordingError> {
+        let segment_count = u32::try_from(self.segments.len())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        RecordingSummary::new(segment_count, merged_sha256).map_err(rejected_segment)
     }
 
     fn segments_dir(&self) -> PathBuf {

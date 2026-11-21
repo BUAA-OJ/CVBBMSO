@@ -1,6 +1,6 @@
 use cvbbmso_protocol::{
-    ClientIncident, ClientState, ExamEvent, ExecutionState, IncidentCode, RecordingManifest,
-    RecordingState, SegmentMeta, Sha256Digest,
+    ClientIncident, ClientState, ExamEvent, ExecutionState, IncidentCode, RecordingState,
+    RecordingSummary, SegmentMeta, Sha256Digest,
 };
 use time::OffsetDateTime;
 
@@ -38,12 +38,9 @@ fn capturing() -> ClientState {
     }
 }
 
-fn manifest() -> ExamEvent {
-    let ExamEvent::SegmentFinalized(meta) = segment(1) else {
-        unreachable!()
-    };
+fn recording_summary() -> ExamEvent {
     ExamEvent::RecordingFinalized(
-        RecordingManifest::new(vec![meta], Sha256Digest::parse(&"b".repeat(64)).unwrap()).unwrap(),
+        RecordingSummary::new(1, Sha256Digest::parse(&"b".repeat(64)).unwrap()).unwrap(),
     )
 }
 
@@ -232,7 +229,7 @@ async fn a_snapshot_with_noncontiguous_sequences_is_set_aside() {
 }
 
 #[tokio::test]
-async fn a_completed_snapshot_requires_a_recorded_manifest() {
+async fn a_completed_snapshot_requires_a_recorded_summary() {
     let dir = tempfile::tempdir().unwrap();
     let mut journal = open(&dir).await;
     journal.set_state(ClientState {
@@ -302,11 +299,11 @@ async fn saving_does_not_follow_a_preexisting_temporary_path() {
 }
 
 #[tokio::test]
-async fn the_recording_manifest_is_queued_once() {
+async fn the_recording_summary_is_queued_once() {
     let dir = tempfile::tempdir().unwrap();
     let mut journal = open(&dir).await;
     journal.anchor(0);
 
-    assert_eq!(journal.append(manifest()), Some(1));
-    assert!(journal.append(manifest()).is_none());
+    assert_eq!(journal.append(recording_summary()), Some(1));
+    assert!(journal.append(recording_summary()).is_none());
 }

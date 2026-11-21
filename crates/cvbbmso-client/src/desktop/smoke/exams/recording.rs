@@ -7,7 +7,7 @@ use std::{
     path::Path,
 };
 
-use cvbbmso_protocol::{RecordingManifest, SegmentMeta, Sha256Digest};
+use cvbbmso_protocol::{RecordingSummary, SegmentMeta, Sha256Digest};
 use sha2::{Digest, Sha256};
 use tauri::Manager;
 
@@ -71,11 +71,12 @@ pub(super) async fn exercise(
 
     let end = Uuid::from_u128(0x42);
     send_command(&connection, end, CommandName::EndExam, now).await?;
-    let manifest = timeout(
-        DEADLINE,
-        receive_manifest(&mut connection, first_seq, first),
-    )
-    .await??;
+    let (segments, summary) =
+        timeout(DEADLINE, receive_summary(&mut connection, first_seq, first)).await??;
+    require(
+        capture_display || segments.len() == 2,
+        "Expected both restored recording segments",
+    )?;
     expect_completed(&mut connection, end).await?;
     wait_for(
         ui,
@@ -83,7 +84,10 @@ pub(super) async fn exercise(
         "the successful recording waiting for the end acknowledgement",
     )
     .await?;
-    tokio::task::spawn_blocking(move || verify_recording(&recording_dir, &manifest)).await??;
+    tokio::task::spawn_blocking(move || {
+        verify_recording(&recording_dir, &segments, &summary.merged_sha256)
+    })
+    .await??;
 
     connection
         .outgoing
@@ -176,11 +180,11 @@ async fn next_recording_event(connection: &mut Connection) -> Result<(i64, ExamE
         })
 }
 
-async fn receive_manifest(
+async fn receive_summary(
     connection: &mut Connection,
     first_seq: i64,
     first: SegmentMeta,
-) -> Result<RecordingManifest, Error> {
+) -> Result<(Vec<SegmentMeta>, RecordingSummary), Error> {
     let mut seq = first_seq;
     let mut segments = vec![first];
     loop {
@@ -188,13 +192,19 @@ async fn receive_manifest(
         require(next_seq > seq, "Recording events were out of sequence")?;
         seq = next_seq;
         match event {
-            ExamEvent::SegmentFinalized(segment) => segments.push(segment),
-            ExamEvent::RecordingFinalized(manifest) => {
+            ExamEvent::SegmentFinalized(segment) => {
                 require(
-                    manifest.segments == segments,
-                    "The manifest did not match the sealed segment events",
+                    u32::try_from(segments.len() + 1)? == segment.index,
+                    "Recording segment indices were not consecutive",
                 )?;
-                return Ok(manifest);
+                segments.push(segment);
+            }
+            ExamEvent::RecordingFinalized(summary) => {
+                require(
+                    u32::try_from(segments.len())? == summary.segment_count.get(),
+                    "The summary count did not match the sealed segment events",
+                )?;
+                return Ok((segments, summary));
             }
             _ => return Err(io::Error::other("Unexpected recording event").into()),
         }
@@ -228,19 +238,23 @@ fn seed_recording(directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn verify_recording(directory: &Path, manifest: &RecordingManifest) -> io::Result<()> {
-    let segments = directory.join("segments");
-    for segment in &manifest.segments {
+fn verify_recording(
+    directory: &Path,
+    segments: &[SegmentMeta],
+    merged_sha256: &Sha256Digest,
+) -> io::Result<()> {
+    let segment_dir = directory.join("segments");
+    for segment in segments {
         let name = format!("{:06}", segment.index);
         let saved: SegmentMeta =
-            serde_json::from_slice(&fs::read(segments.join(format!("{name}.json")))?)?;
+            serde_json::from_slice(&fs::read(segment_dir.join(format!("{name}.json")))?)?;
         require(
             saved == *segment,
             "Segment metadata differs from the monitor event",
         )?;
-        verify_digest(&segments.join(format!("{name}.mkv")), &segment.sha256)?;
+        verify_digest(&segment_dir.join(format!("{name}.mkv")), &segment.sha256)?;
     }
-    verify_digest(&directory.join("final.mp4"), &manifest.merged_sha256)
+    verify_digest(&directory.join("final.mp4"), merged_sha256)
 }
 
 fn verify_digest(file: &Path, expected: &Sha256Digest) -> io::Result<()> {

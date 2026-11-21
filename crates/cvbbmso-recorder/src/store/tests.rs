@@ -226,7 +226,7 @@ fn refuses_to_seal_over_existing_metadata() {
 }
 
 #[test]
-fn manifest_lists_segments_in_ascending_order() {
+fn summary_reports_segment_count_and_merged_digest() {
     let directory = TempDir::new().expect("temp dir");
     let mut store = store(&directory);
     for index in 1..=2_u32 {
@@ -237,12 +237,10 @@ fn manifest_lists_segments_in_ascending_order() {
     }
 
     let merged = Sha256Digest::parse(EMPTY_DIGEST).expect("digest");
-    let manifest = store.manifest(merged).expect("manifest");
+    let summary = store.summary(merged).expect("summary");
 
-    assert_eq!(manifest.segments.len(), 2);
-    assert_eq!(manifest.segments[0].index, 1);
-    assert_eq!(manifest.segments[1].index, 2);
-    assert_eq!(manifest.merged_sha256.as_str(), EMPTY_DIGEST);
+    assert_eq!(summary.segment_count.get(), 2);
+    assert_eq!(summary.merged_sha256.as_str(), EMPTY_DIGEST);
 }
 
 #[test]

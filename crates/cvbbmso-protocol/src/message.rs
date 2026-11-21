@@ -114,7 +114,7 @@ pub enum ServerMessage {
 pub enum CommandName {
     /// Start recording and enter the recording state.
     StartExam,
-    /// Stop recording and finalize the manifest.
+    /// Stop recording and produce the recording summary.
     EndExam,
 }
 

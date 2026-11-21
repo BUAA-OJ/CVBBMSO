@@ -10,20 +10,22 @@ use cvbbmso_protocol::{RecordingPolicy, SegmentMeta};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
-use super::{OJ_USER_ID, PICTURE, SEQUENCE, candidate_dir, exam_id};
+use super::{
+    OJ_USER_ID, PICTURE, SEQUENCE, candidate_dir, exam_id, open_with_video_segments,
+    wait_for_merge_completion,
+};
 use crate::{
     Recorder, RecorderEvent, RecordingError,
     capture::{Frame, SampledFrame},
     container::{AvcConfig, MkvFile, Sample},
     encode::Nv12Frame,
-    recorder::worker::VideoEncoder,
+    recorder::{State, worker::VideoEncoder},
 };
 
 enum Input {
     Frame(SampledFrame),
     Fence(oneshot::Sender<()>),
     Fault,
-    Panic(oneshot::Sender<()>),
 }
 
 fn drive<E: VideoEncoder>(recorder: &mut Recorder) -> mpsc::Sender<Input> {
@@ -44,10 +46,6 @@ fn drive<E: VideoEncoder>(recorder: &mut Recorder) -> mpsc::Sender<Input> {
                     }
                     Input::Fence(ready) => ready.send(()).expect("fence receiver"),
                     Input::Fault => return Err(platform_fault()),
-                    Input::Panic(ready) => {
-                        ready.send(()).expect("announce interruption");
-                        panic!("injected capture worker panic");
-                    }
                 }
             }
             Ok(())
@@ -160,7 +158,7 @@ async fn start_waits_for_the_backend_and_can_retry_a_setup_failure() {
 }
 
 #[tokio::test]
-async fn rotates_stops_recovers_and_finishes_with_full_event_channels() {
+async fn finishing_waits_for_all_segment_events_under_backpressure() {
     let directory = TempDir::new().expect("directory");
     let (mut recorder, mut events) = open(&directory).await;
     let source = drive::<DelayedEncoder>(&mut recorder);
@@ -205,25 +203,48 @@ async fn rotates_stops_recovers_and_finishes_with_full_event_channels() {
     }
     fence(&source).await;
     assert_eq!(events.len(), events.max_capacity());
-    let manifest = {
-        let mut finishing = std::pin::pin!(recorder.finish());
-        assert!(
-            finishing
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
-        drop(source);
-        finishing.await.expect("finish under backpressure")
+    assert_pending(recorder.finish());
+    drop(source);
+    let State::Capturing(capture) = &recorder.state else {
+        panic!("finish should retain the capture worker");
     };
-    assert_eq!(manifest.segments.len(), 57);
-    assert_eq!(manifest.segments[..19], expected);
-    for index in 20..=57 {
-        assert_eq!(
-            segment_event(&mut events, index).await,
-            manifest.segments[(index - 1) as usize]
-        );
+    while !capture.task.is_finished() {
+        tokio::task::yield_now().await;
     }
+    assert_pending(recorder.finish());
+    if matches!(recorder.state, State::Finalizing(_)) {
+        wait_for_merge_completion(&recorder).await;
+    }
+    // Even a successful merge cannot complete finish while the tail is still
+    // waiting for capacity. Cancelling this wait must retain that merge.
+    assert_pending(recorder.finish());
+    assert!(matches!(recorder.state, State::Complete(_)));
+
+    let mut received = Vec::new();
+    let summary = {
+        let mut finishing = std::pin::pin!(recorder.finish());
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut finishing => break result.expect("finish under backpressure"),
+                event = events.recv() => {
+                    let Some(RecorderEvent::SegmentFinalized(meta)) = event else {
+                        panic!("expected segment while finishing");
+                    };
+                    received.push(meta);
+                }
+            }
+        }
+    };
+    while let Ok(event) = events.try_recv() {
+        let RecorderEvent::SegmentFinalized(meta) = event else {
+            panic!("expected segment after finishing");
+        };
+        received.push(meta);
+    }
+    assert_eq!(summary.segment_count.get(), 57);
+    expected.extend(received);
+    assert_eq!(expected, recorder.store.segments());
     for index in 1..=57 {
         let bytes = fs::read(recorder.store.video_path(index)).expect("published MKV");
         let file = MkvFile::parse(&bytes).expect("readable MKV");
@@ -232,7 +253,18 @@ async fn rotates_stops_recovers_and_finishes_with_full_event_channels() {
         assert!(file.samples[0].is_idr().expect("IDR"));
         assert_eq!(file.samples[1].timestamp_ms, 500);
     }
-    assert_eq!(recorder.finish().await.expect("cached manifest"), manifest);
+    assert_eq!(recorder.finish().await.expect("cached summary"), summary);
+    assert!(events.try_recv().is_err());
+}
+
+fn assert_pending(future: impl Future) {
+    let mut future = std::pin::pin!(future);
+    assert!(
+        future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
 }
 
 #[tokio::test]
@@ -256,34 +288,48 @@ async fn permits_recovery_after_an_async_fault_without_publishing_its_open_segme
     push_frame(&source, 16, 16, 0);
     fence(&source).await;
     drop(source);
-    recorder.stop().await.expect("stop");
-    segment_event(&mut events, 2).await;
-    let manifest = recorder.finish().await.expect("finish");
-    assert_eq!(manifest.segments.len(), 2);
+    let summary = recorder.finish().await.expect("finish");
+    assert_eq!(summary.segment_count.get(), 2);
+    let RecorderEvent::SegmentFinalized(tail) = events.try_recv().expect("tail already delivered")
+    else {
+        panic!("unexpected tail event");
+    };
+    assert_eq!(tail.index, 2);
 }
 
 #[tokio::test]
-async fn revisits_disk_before_finishing_after_a_worker_panics() {
-    let directory = TempDir::new().expect("directory");
-    let (mut recorder, mut events) = open(&directory).await;
-    let source = drive::<DelayedEncoder>(&mut recorder);
+async fn finish_delivers_a_segment_sealed_before_an_interrupted_send() {
+    let (mut recorder, mut events, _directory) = open_with_video_segments(1).await;
+    recorder.driver = Some(Box::new(|mut job, _, ready| {
+        ready.send(()).expect("ready");
+        let bytes = fs::read(job.store.video_path(1)).expect("fixture MKV");
+        let at = time::OffsetDateTime::UNIX_EPOCH;
+        job.store
+            .write_segment(&bytes, at, at)
+            .expect("seal before interruption");
+        panic!("worker lost before publishing the tail event");
+    }));
     recorder.start().await.expect("start");
-    push_frame(&source, 16, 16, 0);
-    push_frame(&source, 16, 16, 1000);
-    let sealed = segment_event(&mut events, 1).await;
-    let (ready, interrupted) = oneshot::channel();
-    source.send(Input::Panic(ready)).expect("interrupt worker");
-    interrupted.await.expect("worker interruption");
     assert!(matches!(
         recorder.finish().await,
         Err(RecordingError::Io(_))
     ));
 
-    let manifest = recorder
+    let summary = recorder
         .finish()
         .await
         .expect("finish from recovered evidence");
-    assert_eq!(manifest.segments, vec![sealed]);
+    assert_eq!(summary.segment_count.get(), 2);
+    for index in [1, 2] {
+        let RecorderEvent::SegmentFinalized(meta) =
+            events.try_recv().expect("recovered segments ready")
+        else {
+            panic!("unexpected recovery event");
+        };
+        assert_eq!(meta.index, index);
+    }
+    assert_eq!(recorder.finish().await.expect("cached summary"), summary);
+    assert!(events.try_recv().is_err());
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -302,8 +348,8 @@ async fn records_synthetic_frames_across_rotation_with_the_native_encoder() {
     fence(&source).await;
     drop(source);
     recorder.stop().await.expect("stop");
-    let manifest = recorder.finish().await.expect("merge");
-    assert_eq!(manifest.segments.len(), 2);
+    let summary = recorder.finish().await.expect("merge");
+    assert_eq!(summary.segment_count.get(), 2);
     for index in 1..=2 {
         segment_event(&mut events, index).await;
         let bytes = fs::read(recorder.store.video_path(index)).expect("published MKV");

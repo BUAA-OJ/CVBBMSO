@@ -68,7 +68,7 @@ pub enum ProtocolError {
     InvalidRecordingPolicy,
     InvalidTimeRange,
     InvalidSegmentIndex,
-    InvalidSegmentOrder,
+    InvalidSegmentCount,
 }
 
 pub struct SegmentMeta {
@@ -79,8 +79,8 @@ pub struct SegmentMeta {
     pub sha256: Sha256Digest,
 }
 
-pub struct RecordingManifest {
-    pub segments: Vec<SegmentMeta>,
+pub struct RecordingSummary {
+    pub segment_count: NonZeroU32,
     pub merged_sha256: Sha256Digest,
 }
 
@@ -100,14 +100,14 @@ pub enum IncidentCode {
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum ExamEvent {
     SegmentFinalized(SegmentMeta),
-    RecordingFinalized(RecordingManifest),
+    RecordingFinalized(RecordingSummary),
     Incident(ClientIncident),
 }
 ```
 
-`AccodingUser.id` 为正整数。`ExamPhase` 由服务端时钟和固定考试时间推导。`RecordingPolicy` 两个参数均大于零。`SegmentMeta.index` 从 1 开始，按录制顺序连续递增；`start_at <= end_at`；`sha256` 对应封存视频片段的完整文件字节。`RecordingManifest.segments` 非空、按 `index` 升序且从 1 连续递增；`merged_sha256` 对合并后的整个视频文件计算。`recording_finalized` 使用非空分片清单。
+`AccodingUser.id` 为正整数。`ExamPhase` 由服务端时钟和固定考试时间推导。`RecordingPolicy` 两个参数均大于零。`SegmentMeta.index` 从 1 开始，按录制顺序连续递增；`start_at <= end_at`；`sha256` 对应封存视频片段的完整文件字节。`recording_finalized` 的载荷仅包含 `segment_count` 与 `merged_sha256`。前者为正 `u32`，后者对合并后的整个视频文件计算。
 
-`AccodingUser`、`ExamSummary`、`RecordingPolicy`、`SegmentMeta`、`RecordingManifest` 均提供校验构造器（`new`），违反上述约束时返回 `ProtocolError`；反序列化执行同一套校验，非法消息直接失败。时间字段在构造和反序列化时归一化为 UTC，并按 RFC 3339 序列化。`Sha256Digest` 在构造和反序列化时校验格式，摘要统一为 64 位小写十六进制。`ClientIncident.detail` 为可选的简短字符串，异常分类以稳定的 `code` 为准。
+`AccodingUser`、`ExamSummary`、`RecordingPolicy`、`SegmentMeta`、`RecordingSummary` 均提供校验构造器（`new`），违反上述约束时返回 `ProtocolError`；反序列化执行同一套校验，非法消息直接失败。`RecordingSummary` 拒绝额外字段。时间字段在构造和反序列化时归一化为 UTC，并按 RFC 3339 序列化。`Sha256Digest` 在构造和反序列化时校验格式，摘要统一为 64 位小写十六进制。`ClientIncident.detail` 为可选的简短字符串，异常分类以稳定的 `code` 为准。
 
 ### `ClientState` 合法组合
 
@@ -218,7 +218,7 @@ pub enum ServerMessage {
 
 `ClientMessage` 与 `ServerMessage` 是 Serde 封闭枚举，协议字段由对应变体直接决定。`Hello(ClientHello)` 序列化时将 `ClientHello` 字段直接展开在顶层 JSON。`Hello.device_id` 是持久设备标识，`instance_id` 是每次客户端进程启动生成的新 UUID。`Status` 发送运行快照；`Heartbeat` 是无载荷消息，默认每 5 秒发送一次。
 
-`CommandResult` 使用当前 WebSocket 会话收到的 `command_id`，报告终态 `completed` / `failed`。`completed` 省略 `error_code`；`failed` 必须提供错误码。两种命令均允许 `INTERNAL_ERROR` 和 `COMMAND_STATE_CONFLICT`；录像相关失败码分别为 `start_exam` 的 `RECORDING_START_FAILED` 和 `end_exam` 的 `RECORDING_FINISH_FAILED`。每个命令由服务端生成新的唯一 `command_id`；重连或进程重启后，服务端根据 `hello.state` 与考试阶段决定是否生成新的 `start_exam` / `end_exam`。客户端对命令语义幂等：已在采集时再次 `start_exam` 保持当前采集，已完成 finalize 时再次 `end_exam` 返回同一 manifest。
+`CommandResult` 使用当前 WebSocket 会话收到的 `command_id`，报告终态 `completed` / `failed`。`completed` 省略 `error_code`；`failed` 必须提供错误码。两种命令均允许 `INTERNAL_ERROR` 和 `COMMAND_STATE_CONFLICT`；录像相关失败码分别为 `start_exam` 的 `RECORDING_START_FAILED` 和 `end_exam` 的 `RECORDING_FINISH_FAILED`。每个命令由服务端生成新的唯一 `command_id`；重连或进程重启后，服务端根据 `hello.state` 与考试阶段决定是否生成新的 `start_exam` / `end_exam`。客户端对命令语义幂等：已在采集时再次 `start_exam` 保持当前采集，已完成 finalize 时再次 `end_exam` 返回同一录像摘要。
 
 `CommandAck` 表示服务端已提交对应的命令终态。客户端收到 ACK 后可以清理对应的本地命令结果。`Command.effective_at` 是服务端时间线上的生效时刻；客户端使用 `sync.server_time` 计算时钟偏移，当前时间早于生效时刻则等待，达到生效时刻后立即执行。
 
@@ -265,7 +265,7 @@ pub enum ServerMessage {
 ```
 
 ```json
-{"type":"event","seq":6,"event":{"kind":"recording_finalized","data":{"segments":[{"index":1,"start_at":"2026-12-20T01:00:00Z","end_at":"2026-12-20T01:00:30Z","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"merged_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}
+{"type":"event","seq":6,"event":{"kind":"recording_finalized","data":{"segment_count":1,"merged_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}
 ```
 
 ```json
@@ -289,6 +289,6 @@ pub enum ServerMessage {
 - `Recorder::open` 恢复的已封存分片会全部重新发出 `SegmentFinalized`；运行时为每个分片复用已持久化的原 `seq`，没有原 `seq` 的才分配新序号。服务端按 `seq` 幂等去重。同一 `seq` 重复且内容相同则忽略；内容不同按 `PROTOCOL_ERROR` 处理。
 - `command_id` 标识一次具体命令下发；每个命令 ID 唯一。服务端按 `hello.state` 与 `phase` 生成新命令；客户端记录处理结果并回复终态。
 - 考试开始与结束均以 `command` 为触发源；`sync.phase` 用于状态对齐及决定应生成什么命令。`status` 用于状态对齐；结束由 `command_result` 与 `CommandAck` 完成。
-- `end_exam` 得出成功或失败结果后，客户端先按序发送本场尚未送达的可靠事件，再在同一连接发送 `command_result`。成功时发送 `recording_finalized`，服务端确认摘要及截至该事件的序号均已连续落库。同一摘要可重报，不同摘要按 `PROTOCOL_ERROR` 处理。
+- `end_exam` 得出成功或失败结果后，客户端先按序发送本场尚未送达的可靠事件，再在同一连接发送 `command_result`。成功时发送 `recording_finalized`，服务端确认摘要及截至该事件的序号均已连续落库。分片数和合并哈希均相同的摘要可重报，任一字段不同按 `PROTOCOL_ERROR` 处理。
 - 服务端在同一事务归档收到的终态并将执行状态置为 `finished`，提交后才回复 `CommandAck`。客户端等待 ACK 后关闭连接。连接在 `finished` 之前关闭、心跳超时或被替换时按连接丢失处理。
 - 客户端与服务端同版本部署，协议在两端同步升级。

@@ -6,7 +6,7 @@
 
 use std::future::Future;
 
-use cvbbmso_protocol::RecordingManifest;
+use cvbbmso_protocol::RecordingSummary;
 use cvbbmso_recorder::{Recorder, RecordingError};
 
 /// Lifecycle operations of one candidate recording.
@@ -17,8 +17,8 @@ pub(crate) trait Capture: Send + 'static {
     /// Stops capture and seals the current segment.
     fn stop(&mut self) -> impl Future<Output = Result<(), RecordingError>> + Send;
 
-    /// Stops capture, merges the sealed segments, and returns the manifest.
-    fn finish(&mut self) -> impl Future<Output = Result<RecordingManifest, RecordingError>> + Send;
+    /// Stops capture, merges the sealed segments, and returns the summary.
+    fn finish(&mut self) -> impl Future<Output = Result<RecordingSummary, RecordingError>> + Send;
 }
 
 impl Capture for Recorder {
@@ -30,7 +30,7 @@ impl Capture for Recorder {
         Recorder::stop(self)
     }
 
-    fn finish(&mut self) -> impl Future<Output = Result<RecordingManifest, RecordingError>> + Send {
+    fn finish(&mut self) -> impl Future<Output = Result<RecordingSummary, RecordingError>> + Send {
         Recorder::finish(self)
     }
 }
