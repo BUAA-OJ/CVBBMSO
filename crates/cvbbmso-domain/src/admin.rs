@@ -21,50 +21,97 @@ use crate::{
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 #[non_exhaustive]
-#[allow(missing_docs)]
 pub enum AdminOperation {
     /// Creates an exam with fixed times and recording settings.
     ExamsCreate {
+        /// The exam title shown to students.
         title: String,
+        /// The scheduled start time.
         #[serde(serialize_with = "serialize_audit_time")]
         start_at: OffsetDateTime,
+        /// The scheduled end time.
         #[serde(serialize_with = "serialize_audit_time")]
         end_at: OffsetDateTime,
+        /// The recording settings for the exam.
         policy: RecordingPolicy,
     },
     /// Lists all exams by start time and ID.
     ExamsList,
     /// Looks up a single exam and its policy.
-    ExamsShow { exam_id: Uuid },
+    ExamsShow {
+        /// The ID of the exam.
+        exam_id: Uuid,
+    },
     /// Enrolls an individual participant.
-    ParticipantsAdd { exam_id: Uuid, oj_user_id: i64 },
+    ParticipantsAdd {
+        /// The ID of the exam.
+        exam_id: Uuid,
+        /// The participant's Accoding user ID.
+        oj_user_id: i64,
+    },
     /// Removes an enrollment before the exam starts while retaining evidence.
-    ParticipantsRemove { exam_id: Uuid, oj_user_id: i64 },
+    ParticipantsRemove {
+        /// The ID of the exam.
+        exam_id: Uuid,
+        /// The participant's Accoding user ID.
+        oj_user_id: i64,
+    },
     /// Enrolls a batch, deduplicating IDs and skipping existing enrollments.
     ParticipantsImport {
+        /// The ID of the exam.
         exam_id: Uuid,
+        /// The Accoding user IDs to enroll.
         oj_user_ids: Vec<i64>,
     },
     /// Lists current enrollments for an exam.
-    ParticipantsList { exam_id: Uuid },
+    ParticipantsList {
+        /// The ID of the exam.
+        exam_id: Uuid,
+    },
     /// Lists runtime records, including those from removed enrollments.
-    StudentsStatus { exam_id: Uuid },
+    StudentsStatus {
+        /// The ID of the exam.
+        exam_id: Uuid,
+    },
     /// Looks up a student's runtime record.
-    StudentsShow { exam_id: Uuid, oj_user_id: i64 },
+    StudentsShow {
+        /// The ID of the exam.
+        exam_id: Uuid,
+        /// The participant's Accoding user ID.
+        oj_user_id: i64,
+    },
     /// Lists a student's reliable events in ascending sequence order.
-    EventsList { exam_id: Uuid, oj_user_id: i64 },
+    EventsList {
+        /// The ID of the exam.
+        exam_id: Uuid,
+        /// The participant's Accoding user ID.
+        oj_user_id: i64,
+    },
     /// Lists incidents using optional student, kind and inclusive time filters.
     IncidentsList {
+        /// The ID of the exam.
         exam_id: Uuid,
+        /// Restricts the results to an Accoding user when present.
         oj_user_id: Option<i64>,
+        /// Restricts the results to an incident kind when present.
         kind: Option<String>,
+        /// The optional inclusive lower bound on occurrence time.
         since: Option<OffsetDateTime>,
+        /// The optional inclusive upper bound on occurrence time.
         until: Option<OffsetDateTime>,
     },
     /// Looks up an incident by ID.
-    IncidentsShow { incident_id: Uuid },
+    IncidentsShow {
+        /// The ID of the incident.
+        incident_id: Uuid,
+    },
     /// Looks up the reported recording summary.
-    RecordingsShow { exam_id: Uuid, oj_user_id: i64 },
+    RecordingsShow {
+        /// The ID of the exam.
+        exam_id: Uuid,
+        /// The participant's Accoding user ID.
+        oj_user_id: i64,
+    },
 }
 
 /// The committed result of a management operation.
