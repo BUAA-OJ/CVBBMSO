@@ -1,5 +1,7 @@
 [advisories]
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "SeaORM 2.0.4 migrations enable chrono through SeaORM's default features. Remove this exception once the migration crate can disable that dependency." },
+]
 
 [licenses]
 allow = [

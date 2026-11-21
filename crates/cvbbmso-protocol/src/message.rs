@@ -1,6 +1,6 @@
 //! WebSocket messages exchanged over the exam connection.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -35,8 +35,12 @@ pub enum ClientMessage {
     },
     /// Reliable, ordered business event.
     Event {
-        /// Per-exam sequence number, starting at one.
-        seq: u64,
+        /// Per-exam sequence number in `1..=i64::MAX`.
+        #[serde(
+            deserialize_with = "deserialize_sequence::<_, 1>",
+            serialize_with = "serialize_sequence::<_, 1>"
+        )]
+        seq: i64,
         /// Event payload.
         event: ExamEvent,
     },
@@ -72,8 +76,12 @@ pub enum ServerMessage {
         end_at: OffsetDateTime,
         /// Recording parameters for this exam.
         recording_policy: RecordingPolicy,
-        /// Highest contiguous event sequence the server has persisted.
-        ack_event_through: u64,
+        /// Highest contiguous event sequence persisted, or zero if none.
+        #[serde(
+            deserialize_with = "deserialize_sequence::<_, 0>",
+            serialize_with = "serialize_sequence::<_, 0>"
+        )]
+        ack_event_through: i64,
     },
     /// Start or end command.
     Command {
@@ -106,7 +114,7 @@ pub enum ServerMessage {
 pub enum CommandName {
     /// Start recording and enter the recording state.
     StartExam,
-    /// Stop recording and finalize the manifest.
+    /// Stop recording and produce the recording summary.
     EndExam,
 }
 
@@ -119,4 +127,29 @@ pub enum CommandStatus {
     Completed,
     /// The command failed.
     Failed,
+}
+
+fn deserialize_sequence<'de, D: Deserializer<'de>, const MIN: i64>(
+    deserializer: D,
+) -> Result<i64, D::Error> {
+    let value = i64::deserialize(deserializer)?;
+    if value < MIN {
+        return Err(serde::de::Error::custom(
+            "event sequence is below its minimum",
+        ));
+    }
+    Ok(value)
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // Serde's serialization hook borrows the field.
+fn serialize_sequence<S: Serializer, const MIN: i64>(
+    value: &i64,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    if *value < MIN {
+        return Err(serde::ser::Error::custom(
+            "event sequence is below its minimum",
+        ));
+    }
+    serializer.serialize_i64(*value)
 }

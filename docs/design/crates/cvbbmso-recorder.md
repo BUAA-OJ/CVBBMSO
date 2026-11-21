@@ -37,15 +37,15 @@ impl Recorder {
     /// 开始或恢复主显示器录制；已处于采集状态时幂等。
     pub async fn start(&mut self) -> Result<(), RecordingError>;
 
-    /// 停止采集并封存当前片段；合并与 manifest 由 finish 负责。
+    /// 停止采集并封存当前片段；合并与摘要由 finish 负责。
     /// 已停止或未在采集时幂等；在 Failed 状态调用只丢弃当前未封存片段，已封存分片保留。
     pub async fn stop(&mut self) -> Result<(), RecordingError>;
 
-    /// 停止采集、封存剩余片段、合并视频并返回完整摘要。
-    /// 已完成后重复调用返回同一 manifest；分片清单为空时返回 NoSegments。
+    /// 停止采集、封存剩余片段、合并视频并返回录像摘要。
+    /// 已完成后重复调用返回同一摘要；没有可合并分片时返回 NoSegments。
     pub async fn finish(
         &mut self,
-    ) -> Result<cvbbmso_protocol::RecordingManifest, RecordingError>;
+    ) -> Result<cvbbmso_protocol::RecordingSummary, RecordingError>;
 }
 ```
 
@@ -76,21 +76,16 @@ impl Recorder {
 }
 ```
 
-`start_at` / `end_at` 是该片段实际录制的起止 UTC 时间；`sha256` 是 `NNNNNN.mkv` 封存后整个文件的 SHA-256。`RecordingManifest` 按 `index` 升序列出所有片段，索引从 1 连续递增且清单非空，并携带合并后 `final.mp4` 整个文件的 `merged_sha256`。
+`start_at` / `end_at` 是该片段实际录制的起止 UTC 时间；`sha256` 是 `NNNNNN.mkv` 封存后整个文件的 SHA-256。`finish` 按 `index` 升序合并已封存分片，返回参与合并的分片数及完整 `final.mp4` 的 SHA-256。
 
 ```json
 {
-  "segments": [{
-    "index": 1,
-    "start_at": "2026-12-20T01:00:00Z",
-    "end_at": "2026-12-20T01:00:30Z",
-    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-  }],
+  "segment_count": 1,
   "merged_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 }
 ```
 
-`final.mp4` 在 `finish` 过程中生成，失败时可能留下半成品。重新 `finish` 或下次 `open` 会清理或重建该文件，以完整文件作为合法 manifest 的产物。
+`final.mp4` 在 `finish` 过程中生成，失败时可能留下半成品。重新 `finish` 或下次 `open` 会清理或重建该文件。摘要使用完整文件计算。
 
 ## 录像生命周期
 
@@ -102,7 +97,7 @@ stateDiagram-v2
     Capturing --> Opened: stop / 封存当前片段
     Capturing --> Finalizing: finish
     Opened --> Finalizing: finish / 恢复后收尾
-    Finalizing --> Complete: 生成 RecordingManifest
+    Finalizing --> Complete: 生成 RecordingSummary
     Capturing --> Failed: Fault
     Finalizing --> Failed: Fault / finish 失败
     Failed --> Capturing: start / 重试
@@ -112,9 +107,9 @@ stateDiagram-v2
 ```
 
 - `Failed` 可通过 `start` 重试或通过 `finish` 收尾。采集故障后运行时先上报 `recording_failed`，再调用 `start` 重试；成功后进入 `Capturing` 并上报 `recording_recovered`。重试由运行时控制，recorder 负责单次尝试。
-- `finish` 是单次尝试。失败后状态为 `Failed`，允许再次 `finish`；运行时按有界退避重试。已 `Complete` 后重复 `finish` 返回同一 manifest。
-- `finish` 可从 `Opened` 或 `Failed` 调用，用于考试结束或恢复后的收尾；分片清单为空时返回 `NoSegments`。
-- `stop` 封存当前片段；合并与 manifest 由 `finish` 负责。主动关闭或 `end_at + 60s` 本地截止使用它；之后仍可通过 `finish` 生成摘要。
+- `finish` 是单次尝试。失败后状态为 `Failed`，允许再次 `finish`；运行时按有界退避重试。已 `Complete` 后重复 `finish` 返回同一摘要。
+- `finish` 可从 `Opened` 或 `Failed` 调用，用于考试结束或恢复后的收尾；没有可合并分片时返回 `NoSegments`。
+- `stop` 封存当前片段；合并与摘要由 `finish` 负责。主动关闭或 `end_at + 60s` 本地截止使用它；之后仍可通过 `finish` 生成摘要。
 - 客户端异常退出后，`open` 检索既有分片并恢复可用录制状态；考试仍在进行时由运行时在收到新的 `start_exam` 后调用 `start` 继续录制。
-- 考试已结束时，服务端下发 `end_exam`，由 `finish` 收尾现有录像；`recording_finalized` 事件仅在分片清单非空时生成。
+- 考试已结束时，服务端下发 `end_exam`，由 `finish` 收尾并返回录像摘要，供考试运行时上报 `recording_finalized`。
 - 录像形成的分片和最终摘要通过 `cvbbmso-exam` 转为 [协议](cvbbmso-protocol.md) 中的可靠 `event` 消息。

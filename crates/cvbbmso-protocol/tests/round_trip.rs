@@ -3,7 +3,7 @@
 use cvbbmso_protocol::{
     AccodingUser, ClientHello, ClientIncident, ClientMessage, ClientState, CommandName,
     CommandStatus, ExamEvent, ExamListResponse, ExamPhase, ExamSummary, ExecutionState,
-    IncidentCode, Platform, RecordingManifest, RecordingPolicy, RecordingState, SegmentMeta,
+    IncidentCode, Platform, RecordingPolicy, RecordingState, RecordingSummary, SegmentMeta,
     ServerMessage, Sha256Digest,
 };
 use proptest::prelude::*;
@@ -95,22 +95,10 @@ fn arb_segment() -> impl Strategy<Value = SegmentMeta> {
     )
 }
 
-fn arb_manifest() -> impl Strategy<Value = RecordingManifest> {
-    (
-        prop::collection::vec((arb_ordered_times(), arb_digest()), 1..4),
-        arb_digest(),
-    )
-        .prop_map(|(parts, merged_sha256)| {
-            let segments = parts
-                .into_iter()
-                .enumerate()
-                .map(|(offset, ((start_at, end_at), sha256))| {
-                    let index = u32::try_from(offset).expect("offset fits in u32") + 1;
-                    SegmentMeta::new(index, start_at, end_at, sha256).expect("valid segment")
-                })
-                .collect();
-            RecordingManifest::new(segments, merged_sha256).expect("indices are ascending")
-        })
+fn arb_recording_summary() -> impl Strategy<Value = RecordingSummary> {
+    (1..=u32::MAX, arb_digest()).prop_map(|(segment_count, merged_sha256)| {
+        RecordingSummary::new(segment_count, merged_sha256).expect("valid summary")
+    })
 }
 
 fn arb_incident_code() -> impl Strategy<Value = IncidentCode> {
@@ -137,7 +125,7 @@ fn arb_incident() -> impl Strategy<Value = ClientIncident> {
 fn arb_event() -> impl Strategy<Value = ExamEvent> {
     prop_oneof![
         arb_segment().prop_map(ExamEvent::SegmentFinalized),
-        arb_manifest().prop_map(ExamEvent::RecordingFinalized),
+        arb_recording_summary().prop_map(ExamEvent::RecordingFinalized),
         arb_incident().prop_map(ExamEvent::Incident),
     ]
 }
@@ -164,7 +152,7 @@ fn arb_client_message() -> impl Strategy<Value = ClientMessage> {
         ),
         Just(ClientMessage::Heartbeat),
         arb_client_state().prop_map(|state| ClientMessage::Status { state }),
-        (any::<u64>(), arb_event()).prop_map(|(seq, event)| ClientMessage::Event { seq, event }),
+        (1..=i64::MAX, arb_event()).prop_map(|(seq, event)| ClientMessage::Event { seq, event }),
         (
             arb_uuid(),
             arb_command_status(),
@@ -187,7 +175,7 @@ fn arb_server_message() -> impl Strategy<Value = ServerMessage> {
             arb_phase(),
             arb_ordered_times(),
             arb_policy(),
-            any::<u64>()
+            0..=i64::MAX
         )
             .prop_map(
                 |(server_time, phase, (start_at, end_at), recording_policy, ack)| {

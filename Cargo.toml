@@ -1,25 +1,41 @@
 [workspace]
 resolver = "3"
-members = ["crates/cvbbmso-accoding", "crates/cvbbmso-network", "crates/cvbbmso-protocol"]
+members = [
+    "crates/cvbbmso-accoding",
+    "crates/cvbbmso-domain",
+    "crates/cvbbmso-domain/migration",
+    "crates/cvbbmso-network",
+    "crates/cvbbmso-protocol",
+    "crates/cvbbmso-server",
+]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.99.1"
 publish = false
 
 [workspace.dependencies]
+axum = { version = "0.8.9", default-features = false }
+base64 = "0.23.1"
+clap = { version = "4.6.8", default-features = false }
 core-foundation = "0.10"
+cvbbmso-accoding = { version = "0.1.0", path = "crates/cvbbmso-accoding" }
+cvbbmso-domain = { version = "0.1.0", path = "crates/cvbbmso-domain" }
 cvbbmso-protocol = { version = "0.1.0", path = "crates/cvbbmso-protocol" }
+futures-util = { version = "0.3.34", default-features = false }
 http = "1.0"
 insta = { version = "1.43", features = ["json"] }
 libc = "0.2"
+migration = { version = "0.1.0", path = "crates/cvbbmso-domain/migration", default-features = false }
 proptest = "1.7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+sea-orm = { version = "2.0.4", default-features = false }
+sea-orm-migration = { version = "2.0.4", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = "1.0"
 system-configuration = "0.8"
-tempfile = "3"
+tempfile = "3.27.0"
 thiserror = "2.0"
 time = { version = "0.3", default-features = false, features = [
     "formatting",
@@ -28,6 +44,10 @@ time = { version = "0.3", default-features = false, features = [
     "serde-well-known",
 ] }
 tokio = { version = "1.0", default-features = false }
+tokio-tungstenite = { version = "0.29.0", default-features = false }
+tower = { version = "0.5.3", default-features = false }
+tracing = { version = "0.1.44", default-features = false }
+tracing-subscriber = { version = "0.3.23", default-features = false }
 url = "2.5"
 uuid = { version = "1.11", default-features = false, features = ["serde"] }
 windows-sys = "0.61"

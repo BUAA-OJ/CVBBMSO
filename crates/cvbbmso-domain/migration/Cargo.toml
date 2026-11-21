@@ -1,0 +1,21 @@
+[package]
+name = "migration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = ["cli"]
+cli = ["sea-orm-migration/cli", "dep:tokio"]
+
+[[bin]]
+name = "migration"
+required-features = ["cli"]
+
+[dependencies]
+sea-orm-migration = { workspace = true, features = ["runtime-tokio", "sqlx-sqlite"] }
+tokio = { workspace = true, optional = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -18,7 +18,7 @@
 | event | 客户端可靠、顺序上报的业务事件，带 `(exam_id, oj_user_id, seq)` 标识 |
 | incident | 异常证据记录，以 `occurred_at` 标识发生时间；每次发生保存一条记录 |
 | segment | 一段已封存的录像分片，带 1-based `index`、起止时间和 SHA-256 |
-| manifest | 一次录像的完整摘要，包含全部分片和合并后文件的 SHA-256 |
+| recording summary | 服务端保存的录像摘要，包含分片数和合并后文件的 SHA-256 |
 | recording | 客户端本地录屏产物；服务端保存摘要 |
 | `ack_event_through` | `sync` 中返回的服务端已持久化最大连续事件序号 |
 | `CommandAck` | 服务端对 `command_result` 的确认 |
