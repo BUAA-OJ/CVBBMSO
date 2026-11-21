@@ -113,13 +113,15 @@ read_pf() {
 }
 
 check_idle() {
-    local name job contents section
+    local name job definition contents section
     if exists "$support"; then
         protected "$support" directory
     fi
     if exists "$state_dir"; then
         protected "$state_dir" directory
-        for name in egress.state pf.rules pf.enable; do
+        for name in egress.state egress-cleanup.pending pf.rules pf.enable \
+            pf.enable.before pf.enable.capture pf.enable.owner pf.enable.releasing \
+            managed-pf.v1 managed-filter.conf; do
             if exists "$state_dir/$name"; then
                 die "Guard state at $state_dir/$name. Complete recovery first."
             fi
@@ -128,15 +130,24 @@ check_idle() {
     if exists "$launch_dir"; then
         protected "$launch_dir" directory
     fi
-    if exists "$launch_dir/$cleanup_label.plist"; then
-        die 'A guard recovery definition is present. Complete recovery first.'
-    fi
+    for definition in "$launch_dir/$cleanup_label.plist" "$launch_dir/$cleanup_label.v2."*.plist; do
+        if exists "$definition"; then
+            die 'A guard recovery definition is present. Complete recovery first.'
+        fi
+    done
     if job=$(launchctl print "system/$cleanup_label" 2>&1); then
         die 'A guard recovery job is loaded. Complete recovery first.'
     fi
     if [[ $job != *"Could not find service \"$cleanup_label\" in domain for system"* ]]; then
         printf '%s\n' "$job" >&2
         die 'Cannot establish that the guard recovery job is absent.'
+    fi
+    if ! job=$(launchctl print system 2>&1); then
+        printf '%s\n' "$job" >&2
+        die 'Cannot establish that versioned guard recovery jobs are absent.'
+    fi
+    if [[ $job == *"$cleanup_label.v2."* ]]; then
+        die 'A versioned guard recovery job is loaded. Complete recovery first.'
     fi
     # Darwin's scoped queries can fail with EINVAL for a nonexistent anchor.
     contents=$(read_pf -s Anchors) || exit 1
@@ -164,12 +175,12 @@ check_hook() {
         }
         END {
             if (expected == "absent") exit (count != 0)
-            exit (count != 1 || first != "anchor \"" anchor "\" out all")
+            exit (count != 1 || first != "anchor \"" anchor "\" all")
         }
     ' <<< "$rules" || if [[ $expected == absent ]]; then
         die 'The reserved PF entry is still loaded. Remove it through the host PF configuration first.'
     else
-        die 'Expected the reserved entry as the first live PF filter rule, without quick or duplicates.'
+        die 'Expected the reserved entry as the first live PF filter rule, in both directions, without quick or duplicates.'
     fi
 }
 

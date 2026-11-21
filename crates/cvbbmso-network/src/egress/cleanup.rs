@@ -1,47 +1,133 @@
 //! The macOS launchd fallback retries recovery after a crash or an expired lease.
 
 use crate::NetworkError;
-use crate::egress::commands::Commands;
+use crate::egress::commands::{Commands, Diagnostic};
+use crate::egress::state::Generation;
 
 const TASK: &str = "com.cvbbmso.egress-cleanup";
-const DOMAIN: &str = "system/com.cvbbmso.egress-cleanup";
-const DEFINITION: &str = "/Library/LaunchDaemons/com.cvbbmso.egress-cleanup.plist";
+const LEASE_PREFIX: &str = "com.cvbbmso.egress-cleanup.v2.";
 const LAUNCHCTL: &str = "/bin/launchctl";
+const PENDING: &str = "/Library/Application Support/com.cvbbmso/egress-cleanup.pending";
 
-pub(crate) fn schedule(commands: &dyn Commands, helper: &str) -> Result<(), NetworkError> {
-    commands.write(DEFINITION, &render_definition(helper))?;
-    commands.run(LAUNCHCTL, &["bootstrap", "system", DEFINITION])?;
-    verify(commands)
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Job {
+    Legacy,
+    Lease(Generation),
 }
 
-pub(crate) fn verify(commands: &dyn Commands) -> Result<(), NetworkError> {
-    commands.run(LAUNCHCTL, &["print", DOMAIN])
-}
-
-pub(crate) fn cancel(commands: &dyn Commands) -> Result<(), NetworkError> {
-    // Delete the definition before bootout, which may stop the recovery helper
-    // that is calling this function.
-    commands.remove(DEFINITION)?;
-    if commands.run(LAUNCHCTL, &["bootout", DOMAIN]).is_err()
-        && commands.run(LAUNCHCTL, &["print", DOMAIN]).is_ok()
-    {
-        return Err(NetworkError::Platform);
+impl Job {
+    pub(crate) fn new(generation: Option<Generation>) -> Self {
+        generation.map_or(Self::Legacy, Self::Lease)
     }
-    Ok(())
-}
 
-fn render_definition(helper: &str) -> String {
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+    fn label(&self) -> String {
+        match self {
+            Self::Legacy => TASK.to_owned(),
+            Self::Lease(generation) => format!("{LEASE_PREFIX}{}", generation.as_str()),
+        }
+    }
+
+    fn definition(&self) -> String {
+        format!("/Library/LaunchDaemons/{}.plist", self.label())
+    }
+
+    fn domain(&self) -> String {
+        format!("system/{}", self.label())
+    }
+
+    pub(crate) fn schedule(
+        &self,
+        commands: &dyn Commands,
+        helper: &str,
+    ) -> Result<(), NetworkError> {
+        let definition = self.definition();
+        let contents = self.render_definition(helper);
+        match self {
+            Self::Legacy => commands.write(&definition, &contents)?,
+            Self::Lease(_) => commands.write_new(&definition, &contents)?,
+        }
+        commands.run(LAUNCHCTL, &["bootstrap", "system", &definition])?;
+        self.verify(commands)
+    }
+
+    pub(crate) fn verify(&self, commands: &dyn Commands) -> Result<(), NetworkError> {
+        commands.run(LAUNCHCTL, &["print", &self.domain()])
+    }
+
+    pub(crate) fn pending(commands: &dyn Commands) -> Result<Option<Self>, NetworkError> {
+        let value = commands.read(PENDING)?;
+        match value.as_deref() {
+            None => Ok(None),
+            Some(TASK) => Ok(Some(Self::Legacy)),
+            Some(label) => label
+                .strip_prefix(LEASE_PREFIX)
+                .ok_or(NetworkError::Io)
+                .and_then(|name| {
+                    Generation::try_from(name.to_owned()).map_err(|_| NetworkError::Io)
+                })
+                .map(|generation| Some(Self::Lease(generation))),
+        }
+    }
+
+    pub(crate) fn record_cleanup(&self, commands: &dyn Commands) -> Result<(), NetworkError> {
+        if Self::pending(commands)?.is_some_and(|pending| pending != *self) {
+            return Err(NetworkError::Io);
+        }
+        commands.write(PENDING, &self.label())
+    }
+
+    pub(crate) fn finish_cleanup(&self, commands: &dyn Commands) -> Result<(), NetworkError> {
+        if Self::pending(commands)?.as_ref() != Some(self) {
+            return Err(NetworkError::Io);
+        }
+        self.unload(commands)?;
+        commands.remove(PENDING)
+    }
+
+    /// Only touches this label and definition. A retired lease may call it
+    /// after a newer lease has acquired the PF anchor.
+    pub(crate) fn unload(&self, commands: &dyn Commands) -> Result<(), NetworkError> {
+        // Remove the definition before bootout, which may also stop the caller.
+        commands.remove(&self.definition())?;
+        let domain = self.domain();
+        if let Err(error) = commands.run(LAUNCHCTL, &["bootout", &domain]) {
+            if error != NetworkError::Platform {
+                return Err(error);
+            }
+            let absent = format!(
+                "Could not find service \"{}\" in domain for system",
+                self.label()
+            );
+            match commands.diagnostic(LAUNCHCTL, &["print", &domain])? {
+                Diagnostic::Rejected(message)
+                    if message.lines().any(|line| line.trim() == absent) => {}
+                _ => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn render_definition(&self, helper: &str) -> String {
+        let arguments = match self {
+            Self::Legacy => "<string>--recover</string>".to_owned(),
+            Self::Lease(generation) => format!(
+                "<string>--recover-lease</string><string>{}</string>",
+                generation.as_str()
+            ),
+        };
+        let label = self.label();
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
 <plist version=\"1.0\">\n\
 <dict>\n\
-  <key>Label</key><string>{TASK}</string>\n\
-  <key>ProgramArguments</key><array><string>{helper}</string><string>--recover</string></array>\n\
+  <key>Label</key><string>{label}</string>\n\
+  <key>ProgramArguments</key><array><string>{helper}</string>{arguments}</array>\n\
   <key>StartInterval</key><integer>60</integer>\n\
 </dict>\n\
 </plist>\n"
-    )
+        )
+    }
 }
 
 #[cfg(test)]
@@ -49,15 +135,70 @@ mod tests {
     use super::*;
     use crate::egress::commands::testing::Recorder;
 
+    const DOMAIN: &str = "system/com.cvbbmso.egress-cleanup";
+    const HELPER: &str = "/Library/PrivilegedHelperTools/com.cvbbmso.egress-watchdog";
+    const ABSENT: &str =
+        "Could not find service \"com.cvbbmso.egress-cleanup\" in domain for system";
+
     #[test]
-    fn launchd_uses_the_fixed_privileged_helper() {
-        const HELPER: &str = "/Library/PrivilegedHelperTools/com.cvbbmso.egress-watchdog";
+    fn launchd_legacy_job_uses_the_existing_helper_contract() {
         let recorder = Recorder::default();
-        schedule(&recorder, HELPER).unwrap();
-        let job = recorder.contents(DEFINITION).unwrap();
-        assert!(job.contains(HELPER));
-        assert!(job.contains("--recover"));
-        cancel(&recorder).unwrap();
-        assert!(recorder.contents(DEFINITION).is_none());
+        let job = Job::Legacy;
+        job.schedule(&recorder, HELPER).unwrap();
+        let definition = job.definition();
+        let contents = recorder.contents(&definition).unwrap();
+        assert!(contents.contains(HELPER));
+        assert!(contents.contains("<string>--recover</string>"));
+        job.record_cleanup(&recorder).unwrap();
+        job.finish_cleanup(&recorder).unwrap();
+        assert!(recorder.contents(&definition).is_none());
+    }
+
+    #[test]
+    fn a_timed_out_launchctl_is_not_evidence_the_job_is_gone() {
+        let recorder = Recorder::default();
+        let job = Job::Legacy;
+        job.record_cleanup(&recorder).unwrap();
+        recorder.reply(&["bootout", DOMAIN], Err(NetworkError::Io));
+        assert_eq!(job.finish_cleanup(&recorder), Err(NetworkError::Io));
+        assert_eq!(Job::pending(&recorder).unwrap(), Some(Job::Legacy));
+
+        recorder.reply(&["bootout", DOMAIN], Err(NetworkError::Platform));
+        recorder.reply(&["print", DOMAIN], Err(NetworkError::Io));
+        assert_eq!(job.finish_cleanup(&recorder), Err(NetworkError::Io));
+        assert_eq!(Job::pending(&recorder).unwrap(), Some(Job::Legacy));
+    }
+
+    #[test]
+    fn a_failed_bootout_clears_pending_only_after_confirmed_absence() {
+        let recorder = Recorder::default();
+        let job = Job::Legacy;
+        job.record_cleanup(&recorder).unwrap();
+        recorder.rejected(&["bootout", DOMAIN], "Boot-out failed");
+        recorder.rejected(&["print", DOMAIN], "Permission denied");
+        assert_eq!(job.finish_cleanup(&recorder), Err(NetworkError::Platform));
+        assert_eq!(Job::pending(&recorder).unwrap(), Some(Job::Legacy));
+
+        recorder.rejected(&["bootout", DOMAIN], "Boot-out failed");
+        recorder.rejected(&["print", DOMAIN], ABSENT);
+        assert_eq!(job.finish_cleanup(&recorder), Ok(()));
+        assert_eq!(Job::pending(&recorder).unwrap(), None);
+    }
+
+    #[test]
+    fn lease_definitions_are_distinct_and_cannot_be_overwritten() {
+        let recorder = Recorder::default();
+        let generation = Generation::allocate(&recorder).unwrap();
+        let lease = Job::Lease(generation.clone());
+        let next = Job::Lease(Generation::allocate(&recorder).unwrap());
+        let helper = crate::egress::managed::RECOVERY_SERVICE;
+        lease.schedule(&recorder, helper).unwrap();
+        let definition = recorder.contents(&lease.definition()).unwrap();
+        assert!(definition.contains(&format!("<string>{helper}</string>")));
+        assert!(definition.contains("<string>--recover-lease</string>"));
+        assert!(definition.contains(generation.as_str()));
+        assert_eq!(lease.schedule(&recorder, helper), Err(NetworkError::Io));
+        assert_ne!(lease.definition(), next.definition());
+        assert_ne!(lease.domain(), next.domain());
     }
 }
