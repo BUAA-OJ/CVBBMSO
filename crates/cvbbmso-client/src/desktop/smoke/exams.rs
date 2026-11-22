@@ -345,7 +345,7 @@ async fn open_enrolled_fixture(
     )?;
     wait_for(
         ui,
-        "document.querySelectorAll('.open-exam:enabled').length === 2",
+        "document.querySelectorAll('.open-exam').length === 3 && document.querySelectorAll('.open-exam:enabled').length === 2 && document.querySelector('#exams li:last-child .open-exam').disabled",
         "enrolled exams",
     )
     .await?;
@@ -405,6 +405,15 @@ pub(super) async fn exercise(
     );
     app.emit_to(EventTarget::webview(UI), "cvbbmso-status", previous.clone())?;
     wait_for(ui, "window.examEvents.at(-1)?.last_error_code === 'INTERNAL_ERROR' && document.querySelector('#current-exam').hidden", "closed exam ignoring a queued status event").await?;
+    assert_eq!(
+        evaluate(
+            ui,
+            "document.querySelector('#exams li:last-child .open-exam').disabled"
+        )
+        .await?,
+        true,
+        "Refreshing session state must not enable an ended exam"
+    );
 
     probe(
         ui,

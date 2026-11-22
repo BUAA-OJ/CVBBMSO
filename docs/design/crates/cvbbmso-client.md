@@ -95,6 +95,8 @@ Windows 基于 WebView2 配置 `AreDevToolsEnabled=false`、`AreBrowserAccelerat
 
 ## Cookie 登录与考试连接
 
+报名列表中 `phase == ended` 的考试保持显示，但禁止进入。初次渲染和考试会话状态刷新均保持其「进入考试」按钮禁用，入场操作也拒绝该阶段，避免新会话停留在无法收到结束指令的等待状态。
+
 学生在 WebView 加载 `https://accoding.buaa.edu.cn/user/login`。浏览器完成 `GET /user/login`、带 `_csrf` 的表单 POST、跳转和 `Set-Cookie` 处理；Rust 原生代码从 WebView Cookie Store 取得 `connect.sid` 和可用的附加 Cookie，创建 `cvbbmso-accoding::AccodingCookies`。
 
 每次加载或刷新报名列表，`list_exams` 都从原生 Cookie Store 读取当前会话，并通过 [`cvbbmso-exam::Monitor`](cvbbmso-exam.md#公开-rust-api) 向构建时配置的 HTTPS Origin 发送 `GET /api/exams`。列表命令只把通过校验的 `items` 返回本地控制窗。HTTP 200 且列表为空表示用户已登录但未报名。HTTP 401 提示重新登录，HTTP 503 提示稍后重试。刷新时清空旧列表，响应超限、格式无效或请求失败时显示相应错误。

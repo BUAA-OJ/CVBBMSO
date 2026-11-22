@@ -256,8 +256,9 @@ function renderExam(exam) {
   const enter = document.createElement("button");
   enter.type = "button";
   enter.className = "open-exam";
+  enter.dataset.phase = exam.phase;
   enter.textContent = "进入考试";
-  enter.disabled = !examEventsReady || examBusy || examView !== null;
+  enter.disabled = exam.phase === "ended" || !examEventsReady || examBusy || examView !== null;
   enter.addEventListener("click", () => changeExamSession(exam));
   item.append(title, phase, times, enter);
   return item;
@@ -265,7 +266,7 @@ function renderExam(exam) {
 
 function renderExamSession() {
   for (const button of examList.querySelectorAll(".open-exam")) {
-    button.disabled = !examEventsReady || examBusy || examView !== null;
+    button.disabled = button.dataset.phase === "ended" || !examEventsReady || examBusy || examView !== null;
   }
   closeExam.disabled = examBusy || (examView !== null && examView.state.execution !== "finished");
   if (exitConfirmation.open) renderExitConfirmation(examView);
@@ -314,7 +315,7 @@ async function refreshExamSession() {
 }
 
 async function changeExamSession(exam) {
-  if (examBusy || (exam && examView) || (!exam && !examView)) return;
+  if (examBusy || exam?.phase === "ended" || (exam && examView) || (!exam && !examView)) return;
   examBusy = true;
   ++statusRevision;
   renderExamSession();

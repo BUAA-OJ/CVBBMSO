@@ -681,6 +681,16 @@ fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
         items.push(summary(exams::FIRST, EXAM_TITLE));
         if include_second_exam {
             items.push(summary(exams::SECOND, "Second fixture exam"));
+            items.push(
+                ExamSummary::new(
+                    Uuid::from_u128(0x30),
+                    "Ended fixture exam".into(),
+                    start_at,
+                    end_at,
+                    ExamPhase::Ended,
+                )
+                .unwrap(),
+            );
         }
     }
     Json(ExamListResponse {
