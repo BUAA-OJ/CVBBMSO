@@ -68,7 +68,7 @@ cvbbmso/
 | `cvbbmso-exam` | 客户端考试运行时、WS 重连、可靠上报、本地状态 | `Exam::connect`、`ExamHandle` | [运行时](crates/cvbbmso-exam.md) |
 | `cvbbmso-client` | 启动预检、WebView、Cookie Store、状态 UI | 可执行程序、Tauri commands | [客户端](crates/cvbbmso-client.md) |
 | `cvbbmso-domain` | 考试规则、调度、报名、状态、异常和录像摘要 | `ExamService`、`AdminService` | [领域](crates/cvbbmso-domain.md) |
-| `cvbbmso-server` | `/api`、Cookie 鉴权、WS 连接和指令推送 | HTTP / WebSocket 端点 | [服务端](crates/cvbbmso-server.md) |
+| `cvbbmso-server` | 考生鉴权、WS 连接和指令推送、可选管理控制面板 | 考生 HTTP / WebSocket、管理 HTTP 端点 | [服务端](crates/cvbbmso-server.md) |
 | `cvbbmso-cli` | 创建考试、配置考生、查询状态/事件/异常/录像 | Clap 命令 | [CLI](crates/cvbbmso-cli.md) |
 
 依赖关系：

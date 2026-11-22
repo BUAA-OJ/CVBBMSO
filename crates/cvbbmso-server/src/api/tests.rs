@@ -1065,11 +1065,14 @@ async fn occupied_port_preserves_the_existing_exam_connection() {
     let mut socket = open_socket(&fixture, &state, 0).await;
     let start = command(&mut socket, CommandName::StartExam, START).await;
 
-    let startup = serve(ServerConfig {
-        listen_addr: listener.local_addr().unwrap(),
-        database_url: fixture.database_url.clone(),
-        heartbeat_timeout_secs: TIMEOUT.as_secs(),
-    })
+    let startup = serve(
+        ServerConfig {
+            listen_addr: listener.local_addr().unwrap(),
+            database_url: fixture.database_url.clone(),
+            heartbeat_timeout_secs: TIMEOUT.as_secs(),
+        },
+        None,
+    )
     .await;
     assert!(
         matches!(startup, Err(ServerError::Io(error)) if error.kind() == io::ErrorKind::AddrInUse)
