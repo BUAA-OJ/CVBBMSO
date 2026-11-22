@@ -133,7 +133,7 @@ stateDiagram-v2
 
 ## 生命周期、离线与认证
 
-- **正常完成**：收到 `end_exam` 后停止采集并执行 `finish`，等待期间继续接收分片事件。成功返回后排空已送达的事件，确认日志已包含索引从 1 连续到 `segment_count` 的独立分片事件，再入队仅含 `segment_count` 和 `merged_sha256` 的录像摘要。运行时按序保存并发送尚未发出的可靠事件，再发送 `command_result(completed)`。收尾结论确定后停止接收新的导航异常。收到当前结束命令的 `CommandAck` 后才清理本场事件，进入 `finished` 并关闭 WebSocket。
+- **正常完成**：收到 `end_exam` 后停止采集并执行 `finish`，等待期间继续接收分片事件。成功返回后排空已送达的事件，确认日志已记录从 1 到 `segment_count` 的连续分片，含收尾时封存的尾段，再将录像摘要作为 `recording_finalized` 入队。摘要仅含 `segment_count` 和 `merged_sha256`。运行时按序保存并发送尚未发出的可靠事件，再发送 `command_result(completed)`。收尾结论确定后停止接收新的导航异常。收到当前结束命令的 `CommandAck` 后才清理本场事件，进入 `finished` 并关闭 WebSocket。
 - **finalize 失败**：`finish` 进行有限重试。仍失败时将 `recording_failed` 入队，先补齐可靠事件，再发送 `command_result(failed, RECORDING_FINISH_FAILED)`。收到对应的 `CommandAck` 后以 `finished/failed` 关闭。没有可收尾分片（`NoSegments`）或分片事件与摘要计数不一致时也按失败处理。
 - **主动关闭**：`ExamHandle::shutdown` 调用 `Recorder::stop` 停止采集并封存当前片段，然后关闭 WebSocket。已封存分片保留，下次 `Recorder::open` 恢复。合并和摘要由后续 `finish` 完成。服务端按普通断开记录 `connection_lost`。
 - **断网跨过结束时间**：客户端使用 `sync.server_time` 计算服务端时钟偏移；到达 `end_at + 60s` 后调用 `Recorder::stop` 封存当前片段，进入 `finalizing/finalizing`，等待 `end_exam`。重连后按服务端下发的 `end_exam` 执行 `finish` 并完成收尾。

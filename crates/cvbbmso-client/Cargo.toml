@@ -50,7 +50,7 @@ base64.workspace = true
 cvbbmso-accoding.workspace = true
 cvbbmso-exam.workspace = true
 cvbbmso-protocol.workspace = true
-futures-util.workspace = true
+futures-util = { workspace = true, features = ["sink"] }
 rcgen.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 rustls.workspace = true
@@ -61,6 +61,6 @@ tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "sync", "test-util", "time"] }
 tokio-rustls.workspace = true
-tokio-tungstenite = { workspace = true, features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { workspace = true, features = ["connect", "rustls-tls-native-roots"] }
 url.workspace = true
 uuid.workspace = true

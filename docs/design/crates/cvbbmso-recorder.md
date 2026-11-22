@@ -41,7 +41,7 @@ impl Recorder {
     /// 已停止或未在采集时幂等；在 Failed 状态调用只丢弃当前未封存片段，已封存分片保留。
     pub async fn stop(&mut self) -> Result<(), RecordingError>;
 
-    /// 停止采集、封存剩余片段、合并视频并返回完整摘要。
+    /// 停止采集、封存剩余片段、合并视频并返回录像摘要。
     /// 已完成后重复调用返回同一摘要。如果没有已封存分片，返回 NoSegments。
     pub async fn finish(
         &mut self,
@@ -115,7 +115,7 @@ stateDiagram-v2
 - `finish` 可从 `Opened` 或 `Failed` 调用，用于考试结束或恢复后的收尾；分片清单为空时返回 `NoSegments`。
 - `stop` 封存当前片段；合并与摘要由 `finish` 负责。主动关闭或 `end_at + 60s` 本地截止使用它；之后仍可通过 `finish` 生成摘要。
 - 客户端异常退出后，`open` 检索既有分片并恢复可用录制状态；考试仍在进行时由运行时在收到新的 `start_exam` 后调用 `start` 继续录制。
-- 考试已结束时，服务端下发 `end_exam`，由 `finish` 收尾现有录像；`recording_finalized` 事件仅在分片清单非空时生成。
+- 考试已结束时，服务端下发 `end_exam`，由 `finish` 收尾并返回录像摘要，供考试运行时上报 `recording_finalized`。
 - 录像形成的分片和最终摘要通过 `cvbbmso-exam` 转为 [协议](cvbbmso-protocol.md) 中的可靠 `event` 消息。
 
 ## M3 私有采样与原始帧验收
