@@ -20,6 +20,7 @@ ignore = [
     { id = "RUSTSEC-2025-0081", reason = "UNIC tables required by Tauri urlpattern" },
     { id = "RUSTSEC-2025-0098", reason = "UNIC tables required by Tauri urlpattern" },
     { id = "RUSTSEC-2025-0100", reason = "UNIC tables required by Tauri urlpattern" },
+    { id = "RUSTSEC-2026-0543", reason = "SeaORM 2.0.4 migrations enable chrono through SeaORM's default features. Remove this exception once the migration crate can disable that dependency." },
 ]
 
 [licenses]

@@ -57,7 +57,8 @@ cvbbmso-cli recordings show --exam <exam-id> --oj-user-id 12345
 - `--segment-duration` 单位为秒，和 `--fps` 一样必须大于零。
 - `participants import` 的 CSV 读取 `oj_user_id` 列；CLI 解析后以 `Vec<i64>` 传给领域层，重复 ID 由领域层去重。
 - 所有查询命令支持 `--format text|json`，默认 `text`。`--format` 是全局参数，可放在子命令前后。
-- `incidents list` 支持 `--exam`、`--oj-user-id`、`--kind`、`--since`、`--until` 组合筛选，结果按 `occurred_at` 升序排列。
+- `participants remove` 只能在考试开始前执行。
+- `incidents list` 支持 `--exam`、`--oj-user-id`、`--kind`、`--since`、`--until` 组合筛选，结果按 `occurred_at`、`incident_id` 升序排列。
 
 ## AdminOperation 映射
 
@@ -87,7 +88,9 @@ cvbbmso-cli recordings show --exam <exam-id> --oj-user-id 12345
 | `events list` | `EventRecord[]` | 客户端上报的 `seq`、`event`、`received_at` |
 | `incidents list` | `IncidentRecord[]` | 服务端及客户端异常的发生时间与上下文 |
 | `incidents show` | `IncidentRecord` | 单个异常的完整信息 |
-| `recordings show` | `RecordingManifest` | 分片元信息及合并录像 SHA-256；没有 manifest 时返回 `NotFound` |
+| `recordings show` | `RecordingSummary` | 分片数 `segment_count` 和合并录像 SHA-256 `merged_sha256`；没有摘要时返回 `NotFound` |
+
+通过 `events list` 查看已上报的 `segment_finalized` 分片明细。
 
 `StudentRuntime` 的核心字段为 `exam_id: uuid`、`oj_user_id: i64`、`connected: bool`、`execution: ExecutionState`、`last_seen_at: datetime?`；`ExecutionState` 为 `ready` / `recording` / `finalizing` / `finished`。`EventRecord` 为 `exam_id`、`oj_user_id`、`seq`、`event`、`received_at`，其中 `event` 遵循 [cvbbmso-protocol](cvbbmso-protocol.md)。`IncidentRecord` 为 `id`、`exam_id`、`oj_user_id`、`source`、`kind`、`occurred_at`、`detail`，字段定义见 [cvbbmso-domain](cvbbmso-domain.md)。`detail` 是可选字符串，用于记录 `heartbeat_timeout`、`replaced`、`capture stream stopped` 等上下文。
 
@@ -111,4 +114,4 @@ cvbbmso-cli incidents list --exam <exam-id> --kind connection_lost --format json
 ]
 ```
 
-`incidents list` 的 `--kind` 支持 `connection_lost`、`connection_restored`、`process_restarted`、`recording_failed`、`recording_recovered`、`navigation_denied`。`connection_lost` 与 `connection_restored` 是两条独立记录，CLI 按 `occurred_at` 排序展示；客户端保持离线时，CLI 仍能查询到服务端记录的 `connection_lost`。
+`incidents list` 的 `--kind` 支持 `connection_lost`、`connection_restored`、`process_restarted`、`recording_failed`、`recording_recovered`、`navigation_denied`。`connection_lost` 与 `connection_restored` 是两条独立记录；客户端保持离线时，CLI 仍能查询到服务端记录的 `connection_lost`。

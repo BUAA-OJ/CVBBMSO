@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    branches: [main, feat/client]
+    branches: [main, feat/client, feat/network]
   push:
     branches: [main]
   workflow_dispatch:
@@ -75,7 +75,7 @@ jobs:
       - name: Check the minimum Rust version
         run: |
           rustc -Vv
-          cargo check --workspace --all-targets --locked
+          cargo check --locked --workspace --all-targets
       - name: Test Windows filter plans without installing WFP rules
         if: matrix.os == 'windows-latest'
         run: cargo test --locked -p cvbbmso-network --lib egress::backend::windows
@@ -189,7 +189,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
-      - run: cargo deny check
+      - run: cargo deny --locked check
 
   audit:
     name: Security advisories
