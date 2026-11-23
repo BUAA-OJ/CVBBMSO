@@ -1,6 +1,6 @@
 # cvbbmso-domain — 考试业务与异常记录
 
-本 crate 统一管理考试规则、报名关系、服务端时钟调度、考生运行状态、指令、可靠事件、异常记录和录像摘要。业务记录以 `(exam_id, oj_user_id)` 唯一定位每名考生的考试过程。HTTP 和 WebSocket 解析由 `cvbbmso-server` 负责，管理员操作由 `cvbbmso-cli` 调用本 crate。
+本 crate 统一管理考试规则、报名关系、服务端时钟调度、考生运行状态、指令、可靠事件、异常记录和录像摘要。业务记录以 `(exam_id, oj_user_id)` 唯一定位每名考生的考试过程。HTTP 和 WebSocket 解析由 `cvbbmso-server` 负责。可选的 HTTP 控制面板和设计中的本机 CLI 均通过 `AdminService` 执行管理操作；面板鉴权及反向代理部署边界归[服务端](cvbbmso-server.md#管理控制面板)。
 
 本文档定义公开 Rust 接口、数据所有权和跨模块行为；Repository、事务、SQL 实体和表结构由实现负责。
 
@@ -117,7 +117,7 @@ impl AdminService {
     /// 为 CLI 打开 SQLite 并运行迁移。
     pub async fn open(database_url: &str) -> Result<Self, DomainError>;
 
-    /// 执行一个 CLI 管理操作并返回结构化结果；actor 写入审计。
+    /// 执行管理操作并返回结构化结果；写操作将 actor 写入审计。
     pub async fn execute(
         &self,
         actor: String,
@@ -215,21 +215,18 @@ pub struct EventRecord {
     pub received_at: OffsetDateTime,
 }
 
-#[serde(rename_all = "snake_case")]
-pub enum IncidentSource { Server, Client }
-
 pub struct IncidentRecord {
     pub id: Uuid,
     pub exam_id: Uuid,
     pub oj_user_id: i64,
-    pub source: IncidentSource,
+    pub source: cvbbmso_protocol::admin::IncidentSource,
     pub kind: String,
     pub occurred_at: OffsetDateTime,
     pub detail: Option<String>,
 }
 ```
 
-`actor` 由 CLI 提供，缺省为当前操作系统用户名。审计记录包含整数 `audit_id`、`actor`、序列化的操作类型与参数，以及 `occurred_at`；创建考试的审计包含生成的 `exam_id`。`AdminOperation` 的输入先经过域层校验：`start_at < end_at`，`RecordingPolicy` 参数大于零，`oj_user_id` 为正整数，CSV 导入去重。报名只能在 `now < start_at` 时撤销，时间检查与删除在同一事务内完成。错误以 `DomainError` 返回，由 server 或 CLI 映射为对外错误。
+`actor` 由调用方提供：控制面板使用 `control_panel`，CLI 设计默认使用当前操作系统用户名。审计记录包含整数 `audit_id`、`actor`、序列化的操作类型与参数，以及 `occurred_at`；创建考试的审计包含生成的 `exam_id`。`AdminOperation` 的输入先经过域层校验：`start_at < end_at`，`RecordingPolicy` 参数大于零，`oj_user_id` 为正整数，批量导入去重。报名只能在 `now < start_at` 时撤销，时间检查与删除在同一事务内完成。错误以 `DomainError` 返回，由 server 或 CLI 映射为对外错误。
 
 `RecordingsShow` 在录像状态为 `complete` 时从 `recording_finalized` 事件读取 `RecordingSummary`。尚未 finalize、finalize 失败或没有摘要事件时返回 `NotFound`。已单独上报的分片明细通过 `EventsList` 查询。
 
