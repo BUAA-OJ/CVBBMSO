@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "get_exam_status",
         "close_exam",
         "confirm_exit",
+        "open_campus_auth",
     ]);
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(manifest))?;
     Ok(())

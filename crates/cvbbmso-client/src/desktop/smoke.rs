@@ -150,6 +150,7 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
             let base = Url::parse(&format!("http://{fixture}/"))?;
             let (blocked, mut decisions) = mpsc::unbounded_channel();
             app.manage(Desktop {
+                campus_auth: base.join("campus-auth")?,
                 login: base.join("user/login")?,
                 identity: base.join("api/users/me")?,
                 data_dir,
@@ -256,6 +257,13 @@ async fn check_admission_retry(ui: &WebviewWindow, admission: &FakeAdmission) ->
     assert_eq!(admission.installs(), 0);
     check_environment_gate(ui).await?;
     ui.eval("document.querySelector('#admission-retry').click()")?;
+    wait_for(ui, "!document.querySelector('#admission-auth').hidden && !document.querySelector('#admission-retry').hidden", "campus authentication offered when the monitor is unreachable").await?;
+    ui.eval("document.querySelector('#admission-auth').click()")?;
+    let portal = campus_window(ui.app_handle()).await?;
+    assert_eq!(admission.installs(), 0);
+    assert!(ui.app_handle().get_webview_window(OJ).is_none());
+    portal.close()?;
+    ui.eval("document.querySelector('#admission-retry').click()")?;
     #[cfg(target_os = "macos")]
     {
         wait_for(ui, "!document.querySelector('#admission-retry').hidden && document.querySelector('#admission-status').textContent.includes('录制屏幕')", "screen permission denial").await?;
@@ -339,7 +347,8 @@ async fn check_environment_gate(ui: &WebviewWindow) -> Result<(), Error> {
             const invoke = window.__TAURI__.core.invoke;
             const results = await Promise.allSettled([
                 invoke('open_accoding'), invoke('inspect_session'), invoke('list_exams'),
-                invoke('open_exam', {exam_id: '00000000-0000-0000-0000-000000000010'})
+                invoke('open_exam', {exam_id: '00000000-0000-0000-0000-000000000010'}),
+                invoke('open_campus_auth')
             ]);
             window.gatedRequests = results.every(result => result.status === 'rejected')
                 && results[2].reason === 'preflight_blocked'
@@ -565,6 +574,7 @@ async fn start_fixture(
                     }
                 }),
             )
+            .route("/campus-auth", get(campus_fixture))
             .route(
                 "/rotate",
                 get(|| async {
@@ -625,6 +635,10 @@ async fn start_fixture(
         axum::serve(fixture, router).await.unwrap();
     });
     Ok((fixture_addr, foreign_addr, hits))
+}
+
+async fn campus_fixture() -> Html<&'static str> {
+    Html("<title>Fixture campus authentication</title>")
 }
 
 fn fixture_relogin(mode: &str) -> Response {
@@ -818,8 +832,9 @@ async fn check_blocked_preflight(
             invoke('inspect_session'),
             invoke('list_exams'),
             invoke('open_exam', { exam_id: '00000000-0000-0000-0000-000000000010' }),
+            invoke('open_campus_auth'),
           ]);
-          const denied = ['设备检查通过后才能继续。', '设备检查通过后才能继续。', 'preflight_blocked', 'preflight_blocked'];
+          const denied = ['设备检查通过后才能继续。', '设备检查通过后才能继续。', 'preflight_blocked', 'preflight_blocked', '设备检查通过后才能继续。'];
           window.blockedCommands = results.every(
             (result, index) => result.status === 'rejected' && result.reason === denied[index]
           ) ? 'rejected' : 'unexpected';
@@ -831,7 +846,10 @@ async fn check_blocked_preflight(
         "Rust admission rejection",
     )
     .await?;
-    if app.get_webview_window(OJ).is_some() || requests.load(Ordering::Relaxed) != 0 {
+    if app.get_webview_window(OJ).is_some()
+        || app.get_webview_window(super::campus::WINDOW).is_some()
+        || requests.load(Ordering::Relaxed) != 0
+    {
         return Err(
             io::Error::other("Blocked client created a remote WebView or made a request").into(),
         );
@@ -902,6 +920,23 @@ async fn exercise(
     check_ipc(ui, &oj).await?;
     refresh_exams(ui, "已登录，暂无报名考试。", None).await?;
     let foreign_url = Url::parse(&format!("http://{foreign}/"))?;
+    ui.eval("document.querySelector('#campus-auth').click()")?;
+    let portal = campus_window(app).await?;
+    platform::assert_locked(&portal)?;
+    check_ipc(ui, &portal).await?;
+    let portal_foreign = foreign_url.join("?source=campus")?;
+    portal.eval(format!("location.assign('{}')", portal_foreign.as_str()))?;
+    expect_denial(decisions, "campus-navigation", &portal_foreign).await?;
+    assert_eq!(
+        evaluate(&portal, "document.title").await?,
+        "Fixture campus authentication"
+    );
+    portal.close()?;
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        0,
+        "Portal requests must be blocked before reaching another origin"
+    );
     oj.eval(format!(
         "window.open('{}', '_blank');",
         foreign_url.as_str()
@@ -923,6 +958,25 @@ async fn exercise(
         return Err(io::Error::other("Cross-origin navigation reached the listener").into());
     }
     Ok(())
+}
+
+async fn campus_window(app: &AppHandle) -> Result<WebviewWindow, Error> {
+    let portal = timeout(DEADLINE, async {
+        loop {
+            if let Some(portal) = app.get_webview_window(super::campus::WINDOW) {
+                break portal;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await?;
+    wait_for(
+        &portal,
+        "document.title === 'Fixture campus authentication'",
+        "campus fixture page",
+    )
+    .await?;
+    Ok(portal)
 }
 
 async fn open_fixture_browser(app: &AppHandle, ui: &WebviewWindow) -> Result<WebviewWindow, Error> {
@@ -1067,6 +1121,7 @@ async fn check_ipc(ui: &WebviewWindow, oj: &WebviewWindow) -> Result<(), Error> 
                 invoke("get_exam_status"),
                 invoke("close_exam"),
                 invoke("confirm_exit"),
+                invoke("open_campus_auth"),
                 invoke("plugin:event|listen", {
                     event: "accoding-session",
                     target: { kind: "Any" },

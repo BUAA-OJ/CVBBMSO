@@ -28,12 +28,15 @@ use std::time::{Duration, Instant};
 
 use self::allow_set::AllowSet;
 use self::backend::GuardBackend;
-use self::policy::{Plan, Service, Target, ValidatedPolicy};
+use self::policy::{Plan, Service, Target, Transport, ValidatedPolicy};
 use self::resolver::{Resolver, SystemResolver};
 use self::services::Services;
 use crate::NetworkError;
 
 pub use self::policy::EgressPolicy;
+
+/// Campus network authentication host, allowed only over HTTPS (TCP port 443).
+pub const CAMPUS_AUTH_HOST: &str = "gw.buaa.edu.cn";
 
 /// How long an address that disappeared from DNS stays allowed.
 const ADDRESS_GRACE: Duration = Duration::from_secs(120);
@@ -118,6 +121,7 @@ impl EgressGuard {
             resolved.certificate,
             now,
         )?;
+        allowed.refresh_authentication(resolved.authentication, now);
         let destinations = config.resolve(&SystemResolver).await;
         let plan = make_plan(&endpoints, &allowed, destinations, now);
         let backend = tokio::task::spawn_blocking(move || install(&plan))
@@ -232,6 +236,7 @@ impl Runtime {
             resolved.certificate,
             now,
         )?;
+        candidate.refresh_authentication(resolved.authentication, now);
         backend.apply(&make_plan(endpoints, &candidate, destinations, now))?;
         self.allowed = candidate;
         self.last_refresh = Some(now);
@@ -251,15 +256,23 @@ struct Resolved {
     accoding: Vec<IpAddr>,
     server: Vec<IpAddr>,
     certificate: Vec<SocketAddr>,
+    authentication: Vec<SocketAddr>,
 }
 
 async fn resolve_endpoints(resolver: &impl Resolver, endpoints: &ValidatedPolicy) -> Resolved {
-    let (accoding, server, certificate) = tokio::join!(
+    let (accoding, server, certificate, authentication) = tokio::join!(
         resolver.resolve(&endpoints.accoding.host, endpoints.accoding.port),
         resolver.resolve(&endpoints.server.host, endpoints.server.port),
         resolve_certificate(resolver),
+        resolver.resolve(CAMPUS_AUTH_HOST, 443),
     );
     Resolved {
+        authentication: authentication
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|address| services::is_unicast(*address))
+            .map(|address| SocketAddr::new(address, 443))
+            .collect(),
         accoding: accoding.unwrap_or_default(),
         server: server.unwrap_or_default(),
         certificate,
@@ -302,9 +315,17 @@ async fn resolve_certificate(resolver: &impl Resolver) -> Vec<SocketAddr> {
 fn make_plan(
     endpoints: &ValidatedPolicy,
     allowed: &AllowSet,
-    services: Vec<Service>,
+    mut services: Vec<Service>,
     now: Instant,
 ) -> Plan {
+    services.extend(
+        allowed
+            .authentication(now)
+            .into_iter()
+            .map(|remote| Service::new(remote.ip(), remote.port(), Transport::Tcp)),
+    );
+    services.sort_unstable();
+    services.dedup();
     let (accoding, server, certificate) = allowed.active(now);
     Plan::new(
         Target::new(accoding, endpoints.accoding.port),
@@ -345,6 +366,49 @@ mod tests {
         assert_eq!(plan.server.addresses, vec![address]);
     }
 
+    #[test]
+    fn campus_authentication_adds_only_resolved_https_tcp_destinations() {
+        let endpoints = policy().validate().unwrap();
+        let now = Instant::now();
+        let mut allowed = AllowSet::new(ADDRESS_GRACE);
+        let remote = "192.0.2.78:443".parse().unwrap();
+        allowed.refresh_authentication(vec![remote], now);
+        let plan = make_plan(&endpoints, &allowed, Vec::new(), now);
+        assert_eq!(
+            plan.services,
+            [super::Service::new(remote.ip(), 443, super::Transport::Tcp)]
+        );
+        assert_eq!(plan.accoding.addresses, [] as [IpAddr; 0]);
+        assert_eq!(plan.server.addresses, [] as [IpAddr; 0]);
+    }
+
+    struct CampusResolver;
+
+    impl super::Resolver for CampusResolver {
+        fn resolve(
+            &self,
+            host: &str,
+            port: u16,
+        ) -> impl std::future::Future<Output = Result<Vec<IpAddr>, crate::NetworkError>> {
+            let result = if host == super::CAMPUS_AUTH_HOST {
+                assert_eq!(port, 443);
+                Ok(vec!["192.0.2.78".parse().unwrap(), "::".parse().unwrap()])
+            } else {
+                Err(crate::NetworkError::Resolution)
+            };
+            std::future::ready(result)
+        }
+    }
+
+    #[tokio::test]
+    async fn campus_authentication_resolution_is_independent_of_monitor_dns() {
+        let resolved =
+            super::resolve_endpoints(&CampusResolver, &policy().validate().unwrap()).await;
+        assert_eq!(resolved.authentication, ["192.0.2.78:443".parse().unwrap()]);
+        assert_eq!(resolved.accoding, [] as [IpAddr; 0]);
+        assert_eq!(resolved.server, [] as [IpAddr; 0]);
+    }
+
     struct RefusingBackend;
 
     impl super::GuardBackend for RefusingBackend {
@@ -382,6 +446,7 @@ mod tests {
                 &RefusingBackend,
                 &endpoints,
                 Resolved {
+                    authentication: Vec::new(),
                     accoding: vec![new],
                     server: vec![new],
                     certificate: Vec::new(),

@@ -83,7 +83,6 @@ impl Target {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Transport {
-    #[cfg(any(windows, target_os = "macos"))]
     Tcp,
     Udp,
 }

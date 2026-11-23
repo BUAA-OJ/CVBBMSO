@@ -1,6 +1,7 @@
 use url::{Origin, Url};
 
 pub const LOGIN_URL: &str = "https://accoding.buaa.edu.cn/user/login";
+pub const CAMPUS_AUTH_URL: &str = "https://gw.buaa.edu.cn/srun_portal_success?ac_id=78&theme=buaa";
 pub const IDENTITY_URL: &str = "https://accoding.buaa.edu.cn/api/users/me";
 
 pub fn server_origin(value: &str) -> Option<Origin> {

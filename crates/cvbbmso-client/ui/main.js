@@ -49,6 +49,7 @@ const studentControls = document.querySelector("#student-controls");
 const admissionPanel = document.querySelector("#admission-panel");
 const admissionStatus = document.querySelector("#admission-status");
 const admissionRetry = document.querySelector("#admission-retry");
+const admissionAuth = document.querySelector("#admission-auth");
 const admissionSettings = document.querySelector("#admission-settings");
 const admissionExit = document.querySelector("#admission-exit");
 const admittedControls = document.querySelector("#admitted-controls");
@@ -84,6 +85,7 @@ async function refreshAdmission(retry = false) {
     const result = await core.invoke("admission_status", { retry });
     if (revision !== admissionRevision) return;
     const ready = result.status === "ready";
+    admissionAuth.hidden = result.status !== "blocked" || result.reason !== "monitor_unreachable";
     admittedControls.hidden = !ready;
     admissionPanel.hidden = ready;
     admissionRetry.hidden = result.status !== "blocked" || restartRequired.has(result.reason);
@@ -105,6 +107,7 @@ async function refreshAdmission(retry = false) {
   } catch {
     if (revision !== admissionRevision) return;
     admissionPanel.hidden = false;
+    admissionAuth.hidden = true;
     admittedControls.hidden = true;
     admissionSettings.hidden = true;
     admissionStatus.textContent = "无法读取考试环境检查结果。";
@@ -175,12 +178,28 @@ async function submit(button, command) {
 }
 
 open.addEventListener("click", () => submit(open, "open_accoding"));
+for (const [button, feedback] of [
+  [document.querySelector("#campus-auth"), session],
+  [admissionAuth, admissionStatus],
+]) {
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await core.invoke("open_campus_auth");
+    } catch (error) {
+      feedback.textContent = typeof error === "string" ? error : "无法打开校园网认证窗口。";
+    } finally {
+      button.disabled = false;
+    }
+  });
+}
 
 const refreshExams = document.querySelector("#refresh-exams");
 const examStatus = document.querySelector("#exam-status");
 const examList = document.querySelector("#exams");
 const examFeedback = document.querySelector("#exam-session-feedback");
 const currentExam = document.querySelector("#current-exam");
+const examAlert = document.querySelector("#exam-alert");
 const currentExamTitle = document.querySelector("#current-exam-title");
 const currentExamStatus = document.querySelector("#current-exam-status");
 const closeExam = document.querySelector("#close-exam");
@@ -271,6 +290,7 @@ function renderExamSession() {
   closeExam.disabled = examBusy || (examView !== null && examView.state.execution !== "finished");
   if (exitConfirmation.open) renderExitConfirmation(examView);
   currentExam.hidden = examView === null;
+  examAlert.hidden = true;
   const needsSignIn = examView?.state.execution !== "finished"
     && examView?.last_error_code === "ACCODING_AUTH_EXPIRED";
   open.textContent = needsSignIn ? "重新登录 Accoding" : "打开 Accoding";
@@ -280,6 +300,17 @@ function renderExamSession() {
     return;
   }
   const { exam_id, connected, state, last_error_code } = examView;
+  const alerts = [];
+  if (!connected && state.execution !== "finished") {
+    alerts.push("监考连接已断开，正在自动重连。请保持客户端运行。");
+  }
+  if (state.recording === "failed") {
+    alerts.push(state.execution === "recording"
+      ? "录屏暂时中断，正在尝试恢复。请保持客户端运行。"
+      : "录像收尾异常，请保持客户端运行并联系监考老师。");
+  }
+  examAlert.textContent = alerts.join(" ");
+  examAlert.hidden = alerts.length === 0;
   const exam = examSelection?.id === exam_id ? examSelection : exams.find(({ id }) => id === exam_id);
   currentExamTitle.textContent = exam?.title ?? exam_id;
   const status = [

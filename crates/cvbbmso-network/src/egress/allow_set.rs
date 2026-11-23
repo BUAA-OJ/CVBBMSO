@@ -63,6 +63,7 @@ pub(crate) struct AllowSet {
     accoding: EndpointSet<IpAddr>,
     server: EndpointSet<IpAddr>,
     certificate: EndpointSet<SocketAddr>,
+    authentication: EndpointSet<SocketAddr>,
     grace: Duration,
 }
 
@@ -72,6 +73,7 @@ impl AllowSet {
             accoding: EndpointSet::default(),
             server: EndpointSet::default(),
             certificate: EndpointSet::default(),
+            authentication: EndpointSet::default(),
             grace,
         }
     }
@@ -114,6 +116,16 @@ impl AllowSet {
             self.certificate.active(now),
         )
     }
+
+    pub(crate) fn refresh_authentication(&mut self, next: Vec<SocketAddr>, now: Instant) {
+        if !next.is_empty() {
+            self.authentication.replace(next, now, self.grace);
+        }
+    }
+
+    pub(crate) fn authentication(&self, now: Instant) -> Vec<SocketAddr> {
+        self.authentication.active(now)
+    }
 }
 
 #[cfg(test)]
@@ -124,6 +136,21 @@ mod tests {
 
     fn address(last: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(203, 0, 113, last))
+    }
+
+    #[test]
+    fn campus_authentication_survives_dns_failure_and_rotates_with_grace() {
+        let grace = Duration::from_secs(120);
+        let mut set = AllowSet::new(grace);
+        let now = Instant::now();
+        let old = std::net::SocketAddr::new(address(1), 443);
+        let new = std::net::SocketAddr::new(address(2), 443);
+        set.refresh_authentication(vec![old], now);
+        set.refresh_authentication(Vec::new(), now);
+        assert_eq!(set.authentication(now), [old]);
+        set.refresh_authentication(vec![new], now);
+        assert_eq!(set.authentication(now), [old, new]);
+        assert_eq!(set.authentication(now + grace), [new]);
     }
 
     fn populated(grace: Duration) -> (AllowSet, Instant) {

@@ -25,6 +25,7 @@
           <p id="admission-status" role="status">正在检查考试环境…</p>
           <div class="actions">
             <button id="admission-retry" type="button" hidden>重试考试环境检查</button>
+            <button id="admission-auth" type="button" hidden>校园网认证</button>
             <button id="admission-settings" type="button" hidden>打开系统设置</button>
             <button id="admission-exit" type="button" hidden>退出客户端</button>
           </div>
@@ -35,6 +36,7 @@
           <div class="actions">
             <button id="open" type="button">打开 Accoding</button>
             <button id="inspect" type="button" disabled>检查会话</button>
+            <button id="campus-auth" type="button">校园网认证</button>
           </div>
           <p id="session" role="status"></p>
           <section class="exam-panel" aria-labelledby="exam-heading">
@@ -46,6 +48,7 @@
             <ul id="exams" class="exam-list"></ul>
             <p id="exam-session-feedback" role="status"></p>
             <div id="current-exam" hidden>
+              <p id="exam-alert" role="status" hidden></p>
               <div class="exam-heading">
                 <h3 id="current-exam-title"></h3>
                 <button id="close-exam" type="button">退出当前考试</button>

@@ -9,6 +9,7 @@ use std::ffi::OsString;
 use std::mem::{MaybeUninit, size_of};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::windows::ffi::OsStringExt;
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -22,6 +23,7 @@ use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKET_ADDRESS,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use super::{Services, parse_address};
 use crate::NetworkError;
@@ -53,6 +55,7 @@ pub(super) fn discover() -> Result<Services, NetworkError> {
     let dns = read_adapters(&mut services)?;
     let system = system_directory()?;
     let output = Command::new(system.join(r"WindowsPowerShell\v1.0\powershell.exe"))
+        .creation_flags(CREATE_NO_WINDOW)
         .current_dir(&system)
         .args([
             "-NoLogo",
@@ -74,6 +77,7 @@ pub(super) fn discover() -> Result<Services, NetworkError> {
 
     // Domain members can sync with a peer selected by W32Time at runtime.
     if let Ok(output) = Command::new(system.join("w32tm.exe"))
+        .creation_flags(CREATE_NO_WINDOW)
         .current_dir(&system)
         .args(["/query", "/source"])
         .output()

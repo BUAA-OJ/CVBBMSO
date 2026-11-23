@@ -35,7 +35,7 @@ mod proxy;
 
 #[cfg(target_os = "macos")]
 pub use self::egress::managed::MacosEgressGuard;
-pub use self::egress::{EgressGuard, EgressPolicy};
+pub use self::egress::{CAMPUS_AUTH_HOST, EgressGuard, EgressPolicy};
 
 /// Entry point for the signed macOS `LaunchDaemon` and its recovery subprocess.
 #[cfg(target_os = "macos")]

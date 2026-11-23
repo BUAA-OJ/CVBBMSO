@@ -10,6 +10,26 @@ use policy::{IDENTITY_URL, LOGIN_URL, denied_target_origin, permits, server_orig
 use url::Url;
 
 #[test]
+fn campus_authentication_is_confined_to_the_whitelisted_gateway() {
+    let entry = Url::parse(policy::CAMPUS_AUTH_URL).unwrap();
+    assert_eq!(entry.host_str(), Some(cvbbmso_network::CAMPUS_AUTH_HOST));
+    assert_eq!(entry.path(), "/srun_portal_success");
+    assert_eq!(entry.query(), Some("ac_id=78&theme=buaa"));
+    assert!(permits(&entry.origin(), &entry.join("/login").unwrap()));
+    for address in [
+        "https://sso.buaa.edu.cn/",
+        "https://gw.buaa.edu.cn.example.org/",
+        "http://gw.buaa.edu.cn/",
+        "https://gw.buaa.edu.cn:444/",
+        "https://user@gw.buaa.edu.cn/",
+    ] {
+        assert!(!permits(&entry.origin(), &Url::parse(address).unwrap()));
+    }
+    let oj = Url::parse(LOGIN_URL).unwrap();
+    assert!(!permits(&oj.origin(), &entry));
+}
+
+#[test]
 fn oj_navigation_requires_the_parsed_https_origin() {
     let origin = Url::parse(LOGIN_URL).unwrap().origin();
     assert_eq!(Url::parse(IDENTITY_URL).unwrap().origin(), origin);

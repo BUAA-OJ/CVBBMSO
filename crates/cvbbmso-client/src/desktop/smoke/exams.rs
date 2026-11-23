@@ -461,7 +461,7 @@ async fn recover_exam(
     fixture.auth.expired.send_replace(true);
     timeout(DEADLINE, first.closed).await??;
     timeout(DEADLINE, fixture.auth.stale_handshake.notified()).await?;
-    wait_for(ui, "document.querySelector('#current-exam-status').textContent.includes('正在重连监考服务') && document.querySelector('#open').textContent === '重新登录 Accoding'", "the expired original session reconnecting").await?;
+    wait_for(ui, "document.querySelector('#current-exam-status').textContent.includes('正在重连监考服务') && document.querySelector('#open').textContent === '重新登录 Accoding' && !document.querySelector('#exam-alert').hidden && document.querySelector('#exam-alert').textContent.includes('正在自动重连')", "the expired original session reconnecting with a visible warning").await?;
     let expected_denials = block_cross_site(oj, foreign, hits, decisions).await?;
     timeout(DEADLINE, fixture.auth.stale_handshake.notified()).await?;
     assert_eq!(fixture.auth.other_checks.load(Ordering::Relaxed), 1);
@@ -492,7 +492,7 @@ async fn recover_exam(
     assert_eq!(reconnected.candidate, Candidate::Renewed);
     assert_eq!(reconnected.hello, first.hello);
     reconnected.outgoing.send(sync()).await?;
-    wait_for(ui, "document.querySelector('#current-exam-status').textContent.includes('已连接监考服务') && document.querySelector('#open').textContent === '打开 Accoding'", "the renewed original account completing sync").await?;
+    wait_for(ui, "document.querySelector('#current-exam-status').textContent.includes('已连接监考服务') && document.querySelector('#open').textContent === '打开 Accoding' && document.querySelector('#exam-alert').hidden", "the renewed original account completing sync and clearing its warning").await?;
     for expected in expected_denials {
         let detail = timeout(DEADLINE, reconnected.denials.recv()).await?;
         assert_eq!(detail.as_deref(), Some(expected.as_str()));
@@ -626,7 +626,7 @@ async fn check_status_updates(ui: &WebviewWindow, first: &mut Connection) -> Res
             error_code: Some(error_code::RECORDING_FINISH_FAILED.into()),
         })
     );
-    wait_for(ui, "window.examEvents.at(-1)?.state.recording === 'failed' && document.querySelector('#current-exam-status').textContent.includes('正在收尾')", "server end command in the desktop UI").await?;
+    wait_for(ui, "window.examEvents.at(-1)?.state.recording === 'failed' && document.querySelector('#current-exam-status').textContent.includes('正在收尾') && !document.querySelector('#exam-alert').hidden && document.querySelector('#exam-alert').textContent.includes('录像收尾异常')", "server end command and visible recording failure in the desktop UI").await?;
     check_pending_close(ui).await?;
     first
         .outgoing

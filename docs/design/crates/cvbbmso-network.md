@@ -82,6 +82,10 @@ Windows 使用 WinINet、WinHTTP 与代理环境变量；macOS 使用 SystemConf
 
 ### 允许的出站流量
 
+校园网重新认证额外放行固定主机 `gw.buaa.edu.cn` 解析出的单播 IPv4/IPv6 地址，仅允许 TCP 443。地址变化沿用 120 秒宽限，暂时解析失败保留上次地址；该范围在初始安装和后续网络配置刷新中均保留。不放行其他校园域名或整个网段。
+
+Windows 后台发现加密 DNS 和时间同步配置时，PowerShell 与 `w32tm.exe` 使用 `CREATE_NO_WINDOW`，复查不会创建控制台窗口。
+
 | 目的 | 协议 / 端口 | 说明 |
 | --- | --- | --- |
 | `accoding_origin` 解析出的 IPv4/IPv6 地址 | Origin 端口（默认 443），TCP 与 UDP（QUIC） | 受控 WebView 登录、题目和提交 |
