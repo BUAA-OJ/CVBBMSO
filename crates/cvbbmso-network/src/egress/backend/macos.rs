@@ -17,9 +17,10 @@ use crate::egress::commands::{CAPTURE_PID, CAPTURE_PID_DIGITS, Commands};
 use crate::egress::{policy::Plan, state};
 
 mod lifecycle;
+mod managed_pf;
 mod rules;
 use lifecycle::Prepared;
-pub(crate) use lifecycle::{HELPER, watchdog_entry};
+pub(crate) use lifecycle::{managed_watchdog_entry, watchdog_entry};
 use rules::Rules;
 
 const ANCHOR: &str = "com.cvbbmso.egress";
@@ -40,9 +41,18 @@ pub(crate) fn install(plan: &Plan) -> Result<InstallResult, NetworkError> {
     Prepared::new()?.install(plan)
 }
 
+pub(crate) fn prepare_managed() -> Result<(), NetworkError> {
+    Prepared::clean_before_resolution()
+}
+
+pub(crate) fn install_managed(plan: &Plan) -> Result<InstallResult, NetworkError> {
+    Prepared::managed()?.install(plan)
+}
+
 struct PfGuard {
     expected: Mutex<Expected>,
     watchdog: Mutex<Option<lifecycle::Watchdog>>,
+    managed: bool,
 }
 
 struct Expected {
@@ -83,13 +93,14 @@ impl GuardBackend for PfGuard {
         if let Some(running) = watchdog.as_mut() {
             match state::read(&commands)? {
                 Some(state) if running.owns(&state) => {
-                    lifecycle::recover_job(&commands, &running.job)?;
+                    lifecycle::recover_job(&commands, &running.job, self.managed)?;
                 }
                 None => {
                     lifecycle::recover_without_owner(
                         &commands,
                         &running.job,
                         Some(std::process::id()),
+                        self.managed,
                     )?;
                 }
                 _ => {}
@@ -789,7 +800,7 @@ mod tests {
 
         recorder.reply(LIVE, Ok(BOTH));
         recorder.reply(REFERENCES, Ok(PROJECT_REFERENCE));
-        lifecycle::recover(&recorder).unwrap();
+        lifecycle::recover(&recorder, false).unwrap();
         assert_only_own_mutations(&recorder);
         assert_eq!(recorder.contents(PF_CONF).as_deref(), Some(BASE));
         assert!(recorder.contents(TOKEN).is_none());

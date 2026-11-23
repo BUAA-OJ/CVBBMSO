@@ -1,5 +1,25 @@
+[graph]
+# The server and portable checks run on Linux. The Tauri application is
+# shipped on Windows/macOS, so Linux-only WebKit/GTK crates are not built.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
 [advisories]
+# tauri-utils uses retired UNIC tables via urlpattern. The combined graph
+# also includes a proc macro for the unbuilt GTK backend. These are
+# maintenance notices.
 ignore = [
+    { id = "RUSTSEC-2024-0370", reason = "GTK-only macro in the combined Tauri graph, unbuilt on supported targets" },
+    { id = "RUSTSEC-2025-0075", reason = "UNIC tables required by Tauri urlpattern" },
+    { id = "RUSTSEC-2025-0080", reason = "UNIC tables required by Tauri urlpattern" },
+    { id = "RUSTSEC-2025-0081", reason = "UNIC tables required by Tauri urlpattern" },
+    { id = "RUSTSEC-2025-0098", reason = "UNIC tables required by Tauri urlpattern" },
+    { id = "RUSTSEC-2025-0100", reason = "UNIC tables required by Tauri urlpattern" },
     { id = "RUSTSEC-2026-0543", reason = "SeaORM 2.0.4 migrations enable chrono through SeaORM's default features. Remove this exception once the migration crate can disable that dependency." },
 ]
 
@@ -18,7 +38,14 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.9
-exceptions = []
+# Accept file-level copyleft for these specific transitive Tauri packages.
+exceptions = [
+    { name = "cssparser", version = "=0.36.0", allow = ["MPL-2.0"] },
+    { name = "cssparser-macros", version = "=0.6.1", allow = ["MPL-2.0"] },
+    { name = "dtoa-short", version = "=0.3.5", allow = ["MPL-2.0"] },
+    { name = "option-ext", version = "=0.2.0", allow = ["MPL-2.0"] },
+    { name = "selectors", version = "=0.36.1", allow = ["MPL-2.0"] },
+]
 # Workspace crates are unpublished, so they carry no public license expression.
 unused-allowed-license = "allow"
 

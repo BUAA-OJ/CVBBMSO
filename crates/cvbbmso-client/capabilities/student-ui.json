@@ -1,0 +1,22 @@
+{
+  "identifier": "student-ui",
+  "description": "Local student controls and addressed session and exam status",
+  "webviews": [
+    "student"
+  ],
+  "permissions": [
+    "allow-vm-preflight",
+    "allow-admission-status",
+    "allow-open-helper-approval-settings",
+    "allow-open-accoding",
+    "allow-inspect-session",
+    "allow-list-exams",
+    "allow-open-exam",
+    "allow-get-exam-status",
+    "allow-close-exam",
+    "allow-confirm-exit",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:window:allow-close"
+  ]
+}

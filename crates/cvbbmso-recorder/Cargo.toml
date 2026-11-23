@@ -1,0 +1,49 @@
+[package]
+name = "cvbbmso-recorder"
+description = "Primary-display screen recording, segmentation, recovery, and merging"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+cvbbmso-protocol.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "std",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+dispatch2.workspace = true
+objc2.workspace = true
+objc2-core-foundation.workspace = true
+objc2-core-graphics.workspace = true
+objc2-core-media.workspace = true
+objc2-core-video.workspace = true
+objc2-foundation.workspace = true
+objc2-screen-capture-kit.workspace = true
+objc2-video-toolbox.workspace = true
+
+[lints]
+workspace = true

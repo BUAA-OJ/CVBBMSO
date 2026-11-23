@@ -21,7 +21,9 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
       - uses: Swatinem/rust-cache@v2
       - name: Rendered rules must parse with pfctl
         run: cargo test -p cvbbmso-network --lib egress::backend::macos
@@ -33,7 +35,9 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
       - uses: Swatinem/rust-cache@v2
       - name: Filter plan must be well formed
         run: cargo test -p cvbbmso-network --lib egress::backend::windows

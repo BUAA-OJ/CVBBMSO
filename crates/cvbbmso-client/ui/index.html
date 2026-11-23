@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CVBBMSO</title>
+    <link rel="stylesheet" href="style.css">
+    <script type="module" src="main.js"></script>
+  </head>
+  <body>
+    <main>
+      <h1>CVBBMSO</h1>
+      <section id="vm-preflight" aria-labelledby="vm-heading">
+        <h2 id="vm-heading">设备检查</h2>
+        <p id="vm-status" role="status">正在检查运行环境…</p>
+        <p id="vm-diagnostic" hidden></p>
+        <div class="actions">
+          <button id="vm-retry" type="button" hidden>重试检查</button>
+          <button id="vm-quit" type="button">退出客户端</button>
+        </div>
+      </section>
+      <div id="student-controls" hidden>
+        <section id="admission-panel" aria-labelledby="admission-heading">
+          <h2 id="admission-heading">考试环境检查</h2>
+          <p id="admission-status" role="status">正在检查考试环境…</p>
+          <div class="actions">
+            <button id="admission-retry" type="button" hidden>重试考试环境检查</button>
+            <button id="admission-settings" type="button" hidden>打开系统设置</button>
+            <button id="admission-exit" type="button" hidden>退出客户端</button>
+          </div>
+        </section>
+        <div id="admitted-controls" hidden>
+          <h2>Accoding 登录</h2>
+          <p>在 Accoding 窗口登录后，可回到这里检查会话。</p>
+          <div class="actions">
+            <button id="open" type="button">打开 Accoding</button>
+            <button id="inspect" type="button" disabled>检查会话</button>
+          </div>
+          <p id="session" role="status"></p>
+          <section class="exam-panel" aria-labelledby="exam-heading">
+            <div class="exam-heading">
+              <h2 id="exam-heading">报名考试</h2>
+              <button id="refresh-exams" type="button" disabled>加载列表</button>
+            </div>
+            <p id="exam-status" role="status">登录 Accoding 后加载报名列表。</p>
+            <ul id="exams" class="exam-list"></ul>
+            <p id="exam-session-feedback" role="status"></p>
+            <div id="current-exam" hidden>
+              <div class="exam-heading">
+                <h3 id="current-exam-title"></h3>
+                <button id="close-exam" type="button">退出当前考试</button>
+              </div>
+              <p id="current-exam-status" role="status"></p>
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+    <dialog id="exit-confirmation" aria-labelledby="exit-heading" aria-describedby="exit-description">
+      <h2 id="exit-heading" tabindex="-1" autofocus>确定退出客户端？</h2>
+      <p id="exit-description">考试期间考生请勿擅自退出监考程序，如有问题请联系监考老师。</p>
+      <p id="exit-error" role="status" hidden></p>
+      <form method="dialog" class="actions">
+        <button type="submit">取消</button>
+        <button id="confirm-exit" type="button">确定退出</button>
+      </form>
+    </dialog>
+  </body>
+</html>
