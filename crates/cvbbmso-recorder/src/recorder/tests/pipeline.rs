@@ -26,6 +26,7 @@ enum Input {
     Frame(SampledFrame),
     Fence(oneshot::Sender<()>),
     Fault,
+    EncoderFault,
 }
 
 fn drive<E: VideoEncoder>(recorder: &mut Recorder) -> mpsc::Sender<Input> {
@@ -46,6 +47,7 @@ fn drive<E: VideoEncoder>(recorder: &mut Recorder) -> mpsc::Sender<Input> {
                     }
                     Input::Fence(ready) => ready.send(()).expect("fence receiver"),
                     Input::Fault => return Err(platform_fault()),
+                    Input::EncoderFault => return Err(RecordingError::Encoder(None)),
                 }
             }
             Ok(())
@@ -155,6 +157,17 @@ async fn start_waits_for_the_backend_and_can_retry_a_setup_failure() {
     recorder.start().await.expect("idempotent start");
     drop(input);
     recorder.stop().await.expect("stop");
+}
+
+#[tokio::test]
+async fn stopping_before_readiness_is_not_a_successful_start() {
+    let directory = TempDir::new().expect("directory");
+    let (mut recorder, _) = open(&directory).await;
+    recorder.driver = Some(Box::new(|job, stop, ready| {
+        job.run::<DelayedEncoder>(stop, ready, |_, _, _, _| Ok(()))
+    }));
+    assert!(matches!(recorder.start().await,
+        Err(RecordingError::Platform(Some(error))) if error.kind() == io::ErrorKind::Interrupted));
 }
 
 #[tokio::test]
@@ -268,7 +281,7 @@ fn assert_pending(future: impl Future) {
 }
 
 #[tokio::test]
-async fn permits_recovery_after_an_async_fault_without_publishing_its_open_segment() {
+async fn seals_captured_frames_before_reporting_a_platform_fault_and_recovers() {
     let directory = TempDir::new().expect("directory");
     let (mut recorder, mut events) = open(&directory).await;
     let source = drive::<DelayedEncoder>(&mut recorder);
@@ -277,11 +290,16 @@ async fn permits_recovery_after_an_async_fault_without_publishing_its_open_segme
     push_frame(&source, 16, 16, 1000);
     segment_event(&mut events, 1).await;
     source.send(Input::Fault).expect("inject fault");
+    segment_event(&mut events, 2).await;
     assert!(matches!(
         events.recv().await,
         Some(RecorderEvent::Fault(RecordingError::Platform(_)))
     ));
-    assert!(!recorder.store.video_path(2).exists());
+    let saved = fs::read(recorder.store.video_path(2)).expect("pre-fault segment retained");
+    assert_eq!(
+        MkvFile::parse(&saved).expect("readable tail").samples.len(),
+        1
+    );
 
     let source = drive::<DelayedEncoder>(&mut recorder);
     recorder.start().await.expect("retry after async fault");
@@ -289,12 +307,12 @@ async fn permits_recovery_after_an_async_fault_without_publishing_its_open_segme
     fence(&source).await;
     drop(source);
     let summary = recorder.finish().await.expect("finish");
-    assert_eq!(summary.segment_count.get(), 2);
+    assert_eq!(summary.segment_count.get(), 3);
     let RecorderEvent::SegmentFinalized(tail) = events.try_recv().expect("tail already delivered")
     else {
         panic!("unexpected tail event");
     };
-    assert_eq!(tail.index, 2);
+    assert_eq!(tail.index, 3);
 }
 
 #[tokio::test]
@@ -330,6 +348,51 @@ async fn finish_delivers_a_segment_sealed_before_an_interrupted_send() {
     }
     assert_eq!(recorder.finish().await.expect("cached summary"), summary);
     assert!(events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn repeated_display_faults_keep_every_captured_tail_in_sequence() {
+    let directory = TempDir::new().expect("directory");
+    let (mut recorder, mut events) = open(&directory).await;
+    for index in 1..=3 {
+        let source = drive::<DelayedEncoder>(&mut recorder);
+        recorder.start().await.expect("start or recover");
+        push_frame(&source, 16, 16, 0);
+        source.send(Input::Fault).expect("display lost");
+        segment_event(&mut events, index).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(RecorderEvent::Fault(RecordingError::Platform(_)))
+        ));
+    }
+    assert_eq!(
+        recorder
+            .finish()
+            .await
+            .expect("merge all tails")
+            .segment_count
+            .get(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn encoder_failure_does_not_publish_its_suspect_tail() {
+    let directory = TempDir::new().expect("directory");
+    let (mut recorder, mut events) = open(&directory).await;
+    let source = drive::<DelayedEncoder>(&mut recorder);
+    recorder.start().await.expect("start");
+    push_frame(&source, 16, 16, 0);
+    source.send(Input::EncoderFault).expect("encoder fault");
+    assert!(matches!(
+        events.recv().await,
+        Some(RecorderEvent::Fault(RecordingError::Encoder(_)))
+    ));
+    assert!(!recorder.store.video_path(1).exists());
+    assert!(matches!(
+        recorder.finish().await,
+        Err(RecordingError::NoSegments)
+    ));
 }
 
 #[cfg(any(windows, target_os = "macos"))]

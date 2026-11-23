@@ -166,6 +166,8 @@ stateDiagram-v2
 
 ## 本地数据所有权
 
+录屏故障事件的 `detail` 对平台故障保留采集操作与原生错误码，最多 200 字符；存储故障的远端说明保持类别文字，避免暴露本地路径。`recording_recovered` 在 Recorder 接受首帧并完成启动后产生，不能将其解释为连续录像已通过实机验收。
+
 本 crate 在 `<app-data>/exams/<exam-id>/<oj-user-id>/runtime/` 保存考试执行阶段、可靠事件队列和已入队的分片 `index`。队列保留至当前结束命令的 ACK，`sync.ack_event_through` 只决定补发起点。录像文件和分片元信息属于 [cvbbmso-recorder](cvbbmso-recorder.md)，位于同一考生目录下的 `recording/`。命令 ID 只在所属 WebSocket 会话有效。
 
 `Recorder::open` 会重新发出全部已恢复分片；已入队的分片保留其原 `seq` 继续等待确认，已确认的分片不再上报，未入队的分片分配下一个事件序号。服务端按 `seq` 去重，因此重复上报安全。分片事件仍以 `SegmentMeta.index` 作为稳定身份，服务端可按 `(exam_id, oj_user_id, index)` 做辅助去重。

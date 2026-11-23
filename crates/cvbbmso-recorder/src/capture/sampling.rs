@@ -21,6 +21,7 @@ use crate::RecordingError;
 const STOP_POLL: Duration = Duration::from_millis(50);
 const STOP_POLL_MS: u32 = 50;
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One sampled image and its monotonic presentation time since capture started.
 pub(crate) struct SampledFrame {
@@ -54,7 +55,7 @@ pub(crate) fn run(
     run_started(policy, stopped, || {}, sink)
 }
 
-/// Runs the desktop sampler, announcing when the capture backend is ready.
+/// Runs the sampler, announcing readiness after the first frame reaches the sink.
 pub(crate) fn run_started(
     policy: RecordingPolicy,
     stopped: &AtomicBool,
@@ -69,9 +70,26 @@ pub(crate) fn run_started(
         return Ok(());
     }
     let mut desktop = Desktop::open(fps.get())?;
-    started();
     let mut clock = MonotonicClock(Instant::now());
-    sample(&mut desktop, &mut clock, fps, stopped, sink)
+    sample_started(&mut desktop, &mut clock, fps, stopped, started, sink)
+}
+
+fn sample_started(
+    source: &mut impl FrameSource,
+    clock: &mut impl Clock,
+    fps: NonZeroU32,
+    stopped: &AtomicBool,
+    started: impl FnOnce(),
+    mut sink: impl FnMut(SampledFrame) -> Result<ControlFlow<()>, RecordingError>,
+) -> Result<(), RecordingError> {
+    let mut started = Some(started);
+    sample(source, clock, fps, stopped, |frame| {
+        let result = sink(frame)?;
+        if let Some(started) = started.take() {
+            started();
+        }
+        Ok(result)
+    })
 }
 
 /// Platform boundary and deterministic test seam for changed images.
@@ -134,6 +152,12 @@ fn sample(
         }
         if stopped.load(Ordering::Acquire) {
             return Ok(());
+        }
+        if latest.is_none() && clock.now() >= FIRST_FRAME_TIMEOUT {
+            return Err(RecordingError::Platform(Some(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "no desktop image received within five seconds",
+            ))));
         }
         if let Some(frame) = &latest {
             let sample = SampledFrame {

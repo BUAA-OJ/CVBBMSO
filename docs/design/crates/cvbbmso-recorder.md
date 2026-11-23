@@ -51,7 +51,7 @@ impl Recorder {
 
 `RecordingError` 是本 crate 唯一的公开错误类型，平台、编码和合并失败都是它的变体，而不是各自独立的枚举。`Io` 携带 `std::io::Error`；`Platform` 携带后端报出的错误，`None` 表示本平台没有采集后端；`Encoder` 携带编码器后端错误，`None` 表示本平台没有编码器；`Merge` 携带合并期间的文件或容器错误。`NoSegments` 是状态判定。来源通过 `#[source]` 保留，使应用层能用 `anyhow` 输出完整因果链。
 
-Windows 后端将原始 `windows::core::Error` 对象放入 `std::io::Error`，不把它转换为字符串；平台适配层可以通过 `get_ref()` 取回原错误及 HRESULT，公开接口仍不暴露平台类型。
+Windows 后端通过 `std::io::Error` 及其来源链保留原始 `windows::core::Error`，同时补充采集操作名；平台适配层可沿 `source()` 链取回原错误及 HRESULT，公开接口仍不暴露平台类型。
 
 `candidate_dir` 是考生目录 `<app-data>/exams/<exam-id>/<oj-user-id>/`，由运行时传入；`Recorder` 在其中创建 `recording/`。`open` 读取并恢复已封存分片，恢复分片按 `index` 升序通过接收端发送 `SegmentFinalized`。运行时为这些分片复用本地持久化的原 `event.seq`，因此 `open` 可以安全地重复发出全部分片。
 
@@ -92,6 +92,12 @@ Windows 后端将原始 `windows::core::Error` 对象放入 `std::io::Error`，�
 `finish` 在同目录的临时文件中合并视频，写入并同步完成后原子发布 `final.mp4`。录像摘要使用完整文件计算哈希。
 
 ## 录像生命周期
+
+Windows 采集线程持有防自动息屏、自动睡眠请求，采集结束或故障退出时恢复该线程原先的请求状态，不修改系统电源配置。手动锁屏、息屏和系统休眠仍可能使桌面采集不可用；运行时保留故障与恢复事件，不补造中断期间的画面。
+
+打开采集对象不代表已经取得画面。只有第一帧被编码输入接受后，`start` 才报告成功；首帧等待超过 5 秒按采集故障返回，交由运行时重试。Windows 平台故障保留采集操作名、HRESULT 和原始错误来源。
+
+采集来源故障时，编码器正常处理过的当前片段先尝试排空并封存，再发布故障事件，以减少中断前已有画面的损失。编码、存储故障不强制发布可疑尾段；封存失败仍保留原始采集故障，并由调用方获得封存错误。连续多次采集故障后继续以连续索引封存可用片段。
 
 ```mermaid
 stateDiagram-v2

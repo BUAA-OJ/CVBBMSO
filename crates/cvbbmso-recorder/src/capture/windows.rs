@@ -17,6 +17,10 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+use windows::Win32::System::Power::{
+    ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, EXECUTION_STATE,
+    SetThreadExecutionState,
+};
 use windows::core::{Error as WindowsError, Interface, Result as WindowsResult};
 
 use super::{Frame, Rotation, rotate};
@@ -31,6 +35,7 @@ pub(crate) struct Desktop {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     rotation: Rotation,
+    _awake: KeepAwake,
     // Declared last so the apartment outlives the interfaces created in it.
     _com: ComGuard,
     // The duplication and its COM apartment are bound to one thread; moving the
@@ -50,7 +55,7 @@ impl Desktop {
     ///
     /// Returns [`RecordingError::Platform`] when the display cannot be duplicated.
     pub(crate) fn open(_fps: u32) -> Result<Self, RecordingError> {
-        Self::open_inner().map_err(failure)
+        Self::open_inner().map_err(|error| failure("opening primary display", error))
     }
 
     /// Waits for the next changed frame.
@@ -62,13 +67,15 @@ impl Desktop {
     ///
     /// Returns [`RecordingError::Platform`] when the desktop can no longer be read.
     pub(crate) fn next_frame(&mut self, timeout_ms: u32) -> Result<Option<Frame>, RecordingError> {
-        self.next_frame_inner(timeout_ms).map_err(failure)
+        self.next_frame_inner(timeout_ms)
+            .map_err(|error| failure("reading desktop frame", error))
     }
 
     fn open_inner() -> WindowsResult<Self> {
         // SAFETY: every call follows the Desktop Duplication sequence; the
         // apartment guard is stored with the interfaces it created.
         unsafe {
+            let awake = KeepAwake::acquire()?;
             let com = ComGuard::initialize()?;
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
             let adapter: IDXGIAdapter = factory.EnumAdapters1(0)?.cast()?;
@@ -104,6 +111,7 @@ impl Desktop {
                 device,
                 context,
                 rotation,
+                _awake: awake,
                 _com: com,
                 _thread: PhantomData,
             })
@@ -189,6 +197,30 @@ fn desktop_update(
 /// Keeps the calling thread's COM apartment initialised.
 struct ComGuard;
 
+/// Owns only this capture thread's idle-sleep request, never system settings.
+struct KeepAwake(EXECUTION_STATE);
+
+impl KeepAwake {
+    fn acquire() -> WindowsResult<Self> {
+        // SAFETY: a thread-scoped request with no pointers; Drop restores it on
+        // the same thread because Desktop is not Send.
+        let previous = unsafe {
+            SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)
+        };
+        if previous.0 == 0 {
+            return Err(WindowsError::from_win32());
+        }
+        Ok(Self(previous))
+    }
+}
+
+impl Drop for KeepAwake {
+    fn drop(&mut self) {
+        // SAFETY: restore the capture thread's flags returned by acquisition.
+        let _ = unsafe { SetThreadExecutionState(self.0 | ES_CONTINUOUS) };
+    }
+}
+
 impl ComGuard {
     fn initialize() -> WindowsResult<Self> {
         // SAFETY: a successful call is matched once by `Drop`.
@@ -230,8 +262,19 @@ impl Drop for MapGuard<'_> {
 }
 
 /// Preserves the platform error without exposing its type in public signatures.
-fn failure(error: WindowsError) -> RecordingError {
-    RecordingError::Platform(Some(std::io::Error::other(error)))
+fn failure(operation: &'static str, source: WindowsError) -> RecordingError {
+    RecordingError::Platform(Some(std::io::Error::other(CaptureFailure {
+        operation,
+        source,
+    })))
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{operation}, HRESULT {code}: {message}", code = .source.code(), message = .source.message())]
+struct CaptureFailure {
+    operation: &'static str,
+    #[source]
+    source: WindowsError,
 }
 
 /// Copies a mapped surface into tightly packed rows.
