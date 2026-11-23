@@ -12,6 +12,8 @@ use url::Url;
 #[test]
 fn campus_authentication_is_confined_to_the_whitelisted_gateway() {
     let entry = Url::parse(policy::CAMPUS_AUTH_URL).unwrap();
+    assert_eq!(entry.host_str(), Some("gw.buaa.edu.cn"));
+    #[cfg(any(target_os = "macos", windows))]
     assert_eq!(entry.host_str(), Some(cvbbmso_network::CAMPUS_AUTH_HOST));
     assert_eq!(entry.path(), "/srun_portal_success");
     assert_eq!(entry.query(), Some("ac_id=78&theme=buaa"));
