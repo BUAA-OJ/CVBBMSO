@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="icon-title">
+  <title id="icon-title">CVBBMSO</title>
+  <defs>
+    <linearGradient id="disc" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f1f7ff"/>
+      <stop offset="100%" stop-color="#dcebf9"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#1289c4"/>
+      <stop offset="100%" stop-color="#06629e"/>
+    </linearGradient>
+  </defs>
+  <circle cx="128" cy="128" r="110" fill="url(#disc)"/>
+  <path d="M 115 79 C 91 85 73 105 73 130
+           C 73 159 97 183 128 183 C 158 183 183 159 183 129
+           V 81 Q 183 78 180 78 H 146"
+        fill="none" stroke="url(#mark)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

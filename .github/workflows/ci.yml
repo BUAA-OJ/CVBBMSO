@@ -2,10 +2,15 @@ name: CI
 
 on:
   pull_request:
-    branches: [main, feat/network]
+    branches: [main, feat/client, feat/network]
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      windows_candidate_origin:
+        description: HTTPS monitor origin for a Windows x64 candidate. Leave empty for desktop smoke.
+        required: false
+        type: string
   workflow_call:
 
 permissions:
@@ -67,13 +72,111 @@ jobs:
         with:
           toolchain: ${{ env.RUST_VERSION }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked --workspace --all-targets
+      - name: Check the minimum Rust version
+        run: |
+          rustc -Vv
+          cargo check --locked --workspace --all-targets
       - name: Test Windows filter plans without installing WFP rules
         if: matrix.os == 'windows-latest'
         run: cargo test --locked -p cvbbmso-network --lib egress::backend::windows
       - name: Test macOS egress with substitutes and PF syntax checks
         if: matrix.os == 'macos-latest'
         run: cargo test --locked -p cvbbmso-network --lib 'egress::'
+
+  desktop-smoke:
+    name: Desktop Release smoke (${{ matrix.os }})
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_candidate_origin == ''
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Record Windows version
+        if: runner.os == 'Windows'
+        run: |
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber
+          try {
+            Get-CimInstance Win32_ComputerSystem -Property Manufacturer,Model,HypervisorPresent -OperationTimeoutSec 3 -ErrorAction Stop |
+              Select-Object Manufacturer,Model,HypervisorPresent | Format-List
+            Get-CimInstance Win32_BaseBoard -Property Manufacturer,Product -OperationTimeoutSec 3 -ErrorAction Stop |
+              Select-Object Manufacturer,Product | Format-List
+          } catch {
+            Write-Output 'Computer-system or baseboard properties unavailable on this runner.'
+          }
+      - name: Record macOS and WebKit versions
+        if: runner.os == 'macOS'
+        run: |
+          sw_vers
+          sysctl hw.model kern.hv_vmm_present || true
+          defaults read /System/Library/Frameworks/WebKit.framework/Resources/Info CFBundleVersion
+      - name: Record the native probe result on the hosted runner
+        run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-vm-probe
+      - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-exam-smoke
+      - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke
+      - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-smoke-detected
+      - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-admission-exit
+      - run: cargo test --release --locked -p cvbbmso-client --bin cvbbmso-client -- --native-admission-cleanup-failure
+      - name: Build Windows x64 Release for VM acceptance
+        if: runner.os == 'Windows'
+        run: |
+          if ((rustc -vV) -notcontains 'host: x86_64-pc-windows-msvc') {
+            throw 'The Windows acceptance build must use the x64 MSVC host toolchain.'
+          }
+          cargo build --release --locked -p cvbbmso-client
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: cvbbmso-client-windows-x64-acceptance
+          path: target/release/cvbbmso-client.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-candidate:
+    name: Windows x64 installer candidate
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_candidate_origin != ''
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x64-installer
+      - name: Build the candidate MSI
+        env:
+          MONITOR_ORIGIN: ${{ inputs.windows_candidate_origin }}
+        run: ./scripts/windows/build-candidate.ps1 -MonitorOrigin $env:MONITOR_ORIGIN -OutputDirectory "$env:RUNNER_TEMP/cvbbmso-candidate"
+      - name: Verify installation, imports and uninstall
+        run: ./scripts/windows/test-candidate-install.ps1 -CandidateDirectory "$env:RUNNER_TEMP/cvbbmso-candidate"
+      - name: Store the candidate for acceptance
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvbbmso-windows-x64-candidate-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/cvbbmso-candidate/*.msi
+            ${{ runner.temp }}/cvbbmso-candidate/candidate.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Store MSI diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cvbbmso-windows-x64-msi-logs
+          path: ${{ runner.temp }}/cvbbmso-candidate/*.log
+          retention-days: 7
 
   deny:
     name: Dependency policy

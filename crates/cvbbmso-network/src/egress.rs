@@ -12,14 +12,18 @@ mod backend;
 mod cleanup;
 #[cfg(target_os = "macos")]
 mod commands;
+#[cfg(target_os = "macos")]
+pub(crate) mod managed;
 mod policy;
 mod resolver;
 mod services;
 #[cfg(target_os = "macos")]
 mod state;
 
+use std::future::{Future, poll_fn};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use self::allow_set::AllowSet;
@@ -81,9 +85,22 @@ impl EgressGuard {
     /// and [`NetworkError::Platform`] or [`NetworkError::Io`] when the platform
     /// filter or its supporting files cannot be installed.
     pub async fn install(policy: EgressPolicy) -> Result<Self, NetworkError> {
+        Self::install_using(
+            policy,
+            backend::platform::prepare,
+            backend::platform::install,
+        )
+        .await
+    }
+
+    async fn install_using(
+        policy: EgressPolicy,
+        prepare: fn() -> Result<(), NetworkError>,
+        install: fn(&Plan) -> Result<backend::InstallResult, NetworkError>,
+    ) -> Result<Self, NetworkError> {
         let endpoints = policy.validate()?;
-        let config = tokio::task::spawn_blocking(|| {
-            backend::platform::prepare()?;
+        let config = tokio::task::spawn_blocking(move || {
+            prepare()?;
             Services::discover()
         })
         .await
@@ -103,7 +120,7 @@ impl EgressGuard {
         )?;
         let destinations = config.resolve(&SystemResolver).await;
         let plan = make_plan(&endpoints, &allowed, destinations, now);
-        let backend = tokio::task::spawn_blocking(move || backend::platform::install(&plan))
+        let backend = tokio::task::spawn_blocking(move || install(&plan))
             .await
             .map_err(|_| NetworkError::Platform)??;
         Ok(Self {
@@ -183,7 +200,12 @@ impl EgressGuard {
     ///
     /// Returns an error if the platform could not complete cleanup.
     pub async fn shutdown(self) -> Result<(), NetworkError> {
-        tokio::task::spawn_blocking(move || self.backend.revert())
+        self.shutdown_inner().await
+    }
+
+    async fn shutdown_inner(&self) -> Result<(), NetworkError> {
+        let backend = Arc::clone(&self.backend);
+        tokio::task::spawn_blocking(move || backend.revert())
             .await
             .map_err(|_| NetworkError::Platform)?
     }
@@ -246,15 +268,32 @@ async fn resolve_endpoints(resolver: &impl Resolver, endpoints: &ValidatedPolicy
 
 async fn resolve_certificate(resolver: &impl Resolver) -> Vec<SocketAddr> {
     let mut certificate = Vec::new();
-    for &(host, port) in CERTIFICATE_HOSTS {
-        if let Ok(addresses) = resolver.resolve(host, port).await {
-            certificate.extend(
-                addresses
-                    .into_iter()
-                    .map(|address| SocketAddr::new(address, port)),
-            );
+    let mut pending = CERTIFICATE_HOSTS
+        .iter()
+        .map(|&(host, port)| (port, Box::pin(resolver.resolve(host, port))))
+        .collect::<Vec<_>>();
+    // Slow auxiliary names must not serialize the individual DNS timeouts.
+    poll_fn(|context| {
+        pending.retain_mut(|(port, lookup)| match lookup.as_mut().poll(context) {
+            Poll::Ready(result) => {
+                if let Ok(addresses) = result {
+                    certificate.extend(
+                        addresses
+                            .into_iter()
+                            .map(|address| SocketAddr::new(address, *port)),
+                    );
+                }
+                false
+            }
+            Poll::Pending => true,
+        });
+        if pending.is_empty() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
-    }
+    })
+    .await;
     certificate.sort_unstable();
     certificate.dedup();
     certificate

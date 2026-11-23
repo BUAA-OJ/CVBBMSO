@@ -1,0 +1,203 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+  background: light-dark(#eef2f5, #13222d);
+  color: light-dark(#182f43, #f2f6fa);
+}
+
+body {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  margin: 0;
+}
+
+main {
+  width: min(28rem, calc(100% - 3rem));
+  padding-block: 1.5rem;
+}
+
+h1 {
+  margin: 0 0 1.5rem;
+  font-size: 2rem;
+  letter-spacing: -0.04em;
+}
+
+h2 {
+  margin: 0;
+  font-size: 1.125rem;
+}
+
+p {
+  max-width: 26rem;
+  line-height: 1.6;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+button {
+  padding: 0.65rem 1rem;
+  font: inherit;
+  background: transparent;
+  color: inherit;
+  border: 1px solid currentColor;
+  border-radius: 0.4rem;
+  cursor: pointer;
+}
+
+button:first-child {
+  background: light-dark(#183f5b, #b5dbf3);
+  color: light-dark(#fff, #102735);
+  border-color: transparent;
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+[role="status"] {
+  min-height: 2.5rem;
+}
+
+.exam-panel {
+  padding-top: 1rem;
+  border-top: 1px solid light-dark(#c4d0da, #385064);
+}
+
+.exam-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.exam-list {
+  display: grid;
+  gap: 0.65rem;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.exam-list li {
+  padding: 0.75rem;
+  border: 1px solid light-dark(#c4d0da, #385064);
+  border-radius: 0.4rem;
+  overflow-wrap: anywhere;
+}
+
+.exam-list h3 {
+  display: inline;
+  margin: 0;
+  font-size: 1rem;
+}
+
+.exam-phase {
+  margin-inline-start: 0.75rem;
+  font-size: 0.85rem;
+  color: light-dark(#355a79, #b5dbf3);
+}
+
+.exam-list p {
+  margin: 0.3rem 0 0;
+  font-size: 0.85rem;
+}
+
+.open-exam {
+  margin-block-start: 0.65rem;
+}
+
+#exam-session-feedback:empty {
+  min-height: 0;
+  margin: 0;
+}
+
+#current-exam {
+  margin-block-start: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+#exit-confirmation {
+  box-sizing: border-box;
+  width: min(24rem, calc(100vw - 2rem));
+  padding: 1.75rem;
+  border: 1px solid light-dark(#d8e1e8, #385064);
+  border-radius: 0.875rem;
+  background: light-dark(#f8fafc, #1b303f);
+  color: inherit;
+  box-shadow: 0 1rem 3rem #081a2b33;
+}
+
+#exit-confirmation::backdrop {
+  background: #081a2b66;
+  backdrop-filter: blur(3px);
+}
+
+#exit-confirmation h2 {
+  font-size: 1.25rem;
+  line-height: 1.4;
+  font-weight: 600;
+  outline: none;
+}
+
+#exit-description {
+  margin: 0.75rem 0 1.75rem;
+  color: light-dark(#526879, #b5c7d5);
+}
+
+#exit-confirmation .actions {
+  justify-content: flex-end;
+  gap: 0.625rem;
+}
+
+#exit-confirmation button {
+  min-width: 5.5rem;
+  padding: 0.55rem 1rem;
+  border-color: light-dark(#c4d0da, #526879);
+  background: transparent;
+  color: inherit;
+}
+
+#exit-confirmation #confirm-exit {
+  border-color: transparent;
+  background: light-dark(#183f5b, #b5dbf3);
+  color: light-dark(#fff, #102735);
+}
+
+#exit-confirmation button:enabled:hover {
+  background: light-dark(#e5edf3, #2a4355);
+}
+
+#exit-confirmation #confirm-exit:enabled:hover {
+  background: light-dark(#255570, #c9e6f8);
+}
+
+#exit-confirmation button:enabled:active {
+  background: light-dark(#d5e1ea, #385064);
+}
+
+#exit-confirmation #confirm-exit:enabled:active {
+  background: light-dark(#123249, #9dc7e1);
+}
+
+#exit-confirmation button:focus:not(:focus-visible) {
+  outline: none;
+}
+
+#exit-confirmation button:focus-visible {
+  outline: 2px solid light-dark(#355a79, #b5dbf3);
+  outline-offset: 3px;
+}
+
+#exit-error {
+  min-height: 0;
+  margin: 0 0 0.75rem;
+  font-size: 0.85rem;
+  color: light-dark(#526879, #b5c7d5);
+}

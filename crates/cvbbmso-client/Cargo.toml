@@ -1,0 +1,66 @@
+[package]
+name = "cvbbmso-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "cvbbmso-client"
+path = "src/main.rs"
+harness = false
+
+[lints]
+workspace = true
+
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+cvbbmso-accoding.workspace = true
+cvbbmso-exam.workspace = true
+cvbbmso-network.workspace = true
+cvbbmso-protocol.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+url.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+libc.workspace = true
+objc2-core-graphics = { workspace = true, features = ["CGWindow"] }
+objc2-foundation.workspace = true
+objc2-web-kit.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+webview2-com.workspace = true
+windows-core.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+
+[target.'cfg(any(target_os = "macos", windows))'.build-dependencies]
+tauri-build.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+axum = { workspace = true, features = ["http1", "json", "tokio", "ws"] }
+base64.workspace = true
+cvbbmso-accoding.workspace = true
+cvbbmso-exam.workspace = true
+cvbbmso-protocol.workspace = true
+futures-util = { workspace = true, features = ["sink"] }
+rcgen.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "sync", "test-util", "time"] }
+tokio-rustls.workspace = true
+tokio-tungstenite = { workspace = true, features = ["connect", "rustls-tls-native-roots"] }
+url.workspace = true
+uuid.workspace = true

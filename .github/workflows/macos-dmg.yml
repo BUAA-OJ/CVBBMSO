@@ -1,0 +1,35 @@
+name: macOS DMG candidate
+
+on:
+  pull_request:
+    branches: [feat/client]
+    paths:
+      - '.github/workflows/macos-dmg.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'deploy/macos-egress/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+      - uses: Swatinem/rust-cache@v2
+      - run: ./deploy/macos-egress/test-authorization.sh
+      - run: cargo test --locked -p cvbbmso-network --lib
+      - run: ./deploy/macos-egress/build-dmg.sh candidate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cvbbmso-macos-unsigned-dmg-candidate
+          path: target/*-apple-darwin/release/*-unsigned-candidate.dmg
+          if-no-files-found: error
+          retention-days: 7
