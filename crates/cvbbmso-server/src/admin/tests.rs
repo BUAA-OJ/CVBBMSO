@@ -13,7 +13,7 @@ use tower::ServiceExt;
 
 use super::*;
 
-const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const TEST_ADMIN_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const LARGE_ID: i64 = i64::MAX;
 
 fn now() -> OffsetDateTime {
@@ -35,7 +35,7 @@ impl Fixture {
                 .await
                 .unwrap();
         Self {
-            app: router(exam.admin(), Token::parse(SECRET).unwrap()),
+            app: router(exam.admin(), Token::parse(TEST_ADMIN_TOKEN).unwrap()),
             exam,
             _files: files,
         }
@@ -50,7 +50,7 @@ impl Fixture {
         let mut request = Request::builder()
             .method(method)
             .uri(format!("/api/admin{path}"))
-            .header(header::AUTHORIZATION, format!("Bearer {SECRET}"));
+            .header(header::AUTHORIZATION, format!("Bearer {TEST_ADMIN_TOKEN}"));
         let body = data.map_or_else(Body::empty, |value| Body::from(value.to_string()));
         request = request.header(header::CONTENT_TYPE, "application/json");
         let response = self
@@ -150,7 +150,24 @@ async fn admin_routes_require_bearer_before_reading_or_mutating() {
             .contains("frame-ancestors 'none'")
     );
     let html = to_bytes(page.into_body(), 16_384).await.unwrap();
-    assert!(!String::from_utf8_lossy(&html).contains(SECRET));
+    assert!(!String::from_utf8_lossy(&html).contains(TEST_ADMIN_TOKEN));
+}
+
+#[tokio::test]
+async fn trailing_slash_redirects_to_the_dashboard() {
+    let response = Fixture::new()
+        .await
+        .app
+        .oneshot(
+            Request::builder()
+                .uri("/admin/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(response.headers()[header::LOCATION], "/admin");
 }
 
 #[tokio::test]

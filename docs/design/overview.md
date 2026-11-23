@@ -99,7 +99,7 @@ cvbbmso/
 - 单实例部署。WebSocket Hub 和考试调度器可假定单进程内存状态。
 - TLS 由反向代理终止；Rust 进程监听内网 HTTP/WS。对外地址为 `wss://<监考服务端>/api/exams/{exam_id}/ws`。
 - 客户端与服务端同版本部署；协议按同版本契约设计。
-- 管理入口是服务端本机 CLI，直接调用领域层。
+- 本机 CLI（设计）与可选的 HTTP 控制面板均通过 `AdminService` 执行管理操作。面板须配置独立的管理令牌，生产环境须经 HTTPS 反向代理并限制在管理网络、VPN 或受信任代理之后，详见[服务端部署说明](crates/cvbbmso-server.md#管理控制面板)。
 - 系统出站守卫需要管理员或 root 权限。Windows 由 WFP 动态会话清理规则。macOS 使用特权看门狗和 launchd 恢复任务，租约为 15 分钟。
 
 ## 协作时序

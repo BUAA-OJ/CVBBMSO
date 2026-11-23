@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use cvbbmso_protocol::{
     ExamEvent, ExamSummary, ExecutionState, RecordingPolicy, RecordingState, RecordingSummary,
+    admin::IncidentSource,
 };
 use sea_orm::{
     ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QueryTrait, Set,
@@ -9,8 +10,6 @@ use sea_orm::{
 use serde::{Serialize, Serializer};
 use time::OffsetDateTime;
 use uuid::Uuid;
-
-pub use cvbbmso_protocol::admin::IncidentSource;
 
 use crate::{
     DisconnectReason, DomainError, Service,

@@ -5,7 +5,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, Request, State, rejection::JsonRejection},
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
 use cvbbmso_domain::{AdminOperation, AdminOutput, AdminService, DomainError};
@@ -82,6 +82,7 @@ pub(crate) fn router(service: AdminService, token: Token) -> Router {
             "/admin",
             get(|| async { Html(include_str!("../ui/index.html")) }),
         )
+        .route("/admin/", get(|| async { Redirect::temporary("/admin") }))
         .route(
             "/admin/main.js",
             get(|| async {

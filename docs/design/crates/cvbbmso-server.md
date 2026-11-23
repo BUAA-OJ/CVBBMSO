@@ -67,7 +67,7 @@ $env:CVBBMSO_ADMIN_TOKEN = [Convert]::ToHexString([Security.Cryptography.RandomN
 cargo run --locked -p cvbbmso-server -- --listen-addr 127.0.0.1:8080 --database-url 'sqlite://exams.sqlite?mode=rwc'
 ```
 
-在浏览器打开 `http://127.0.0.1:8080/admin`，输入刚生成的令牌。仅本地回环可用明文 HTTP；不要在网络上使用这套本地示例配置。
+在浏览器打开 `http://127.0.0.1:8080/admin`，输入刚生成的令牌。`/admin/` 会重定向到 `/admin`。仅本地回环可用明文 HTTP；不要在网络上使用这套本地示例配置。
 
 | 方法 | `/api/admin` 下的路径 | 成功响应 |
 | --- | --- | --- |

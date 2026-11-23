@@ -12,8 +12,8 @@ mod events;
 mod exam;
 
 pub use admin::{
-    AdminOperation, AdminOutput, AdminService, EventRecord, IncidentRecord, IncidentSource,
-    ParticipantRecord, StudentRuntime,
+    AdminOperation, AdminOutput, AdminService, EventRecord, IncidentRecord, ParticipantRecord,
+    StudentRuntime,
 };
 pub use exam::{ConnectOutcome, DirectedCommand, DisconnectReason, ExamService};
 
