@@ -4,9 +4,7 @@
 
 ## 桌面底座
 
-主窗口顶部在监考连接断开或录像失败时显示独立的高对比警示，滚动页面时保持可见。恢复连接或结束后更新并清除不再适用的连接警示；录像最终失败时保留警示。原始状态文字继续保留。Windows 的考试与认证 WebView 使用 WebView2 的全请求来源过滤（`ICoreWebView2_22`），在 HTTP 请求发出前拒绝各自 Origin 以外的请求，包括 iframe 和 worker 发起的请求。运行时不支持此接口时，受限窗口打开失败。
-
-「校园网认证」在独立临时 WebView 中打开 `https://gw.buaa.edu.cn/srun_portal_success?ac_id=78&theme=buaa`。导航仅允许该 HTTPS Origin，弹窗和外部协议被拒绝，远程页面没有本地命令权限；Accoding 窗口的 Origin 限制不变。认证入口在准入通过后可用，也可在设备检查通过、监考服务不可达的阻断状态下用于重新联网；其他准入阻断状态和退出过程中拒绝打开。认证完成后，初始准入阻断时由用户重试检查，活动考试由既有机制自动重连。
+主窗口顶部在监考连接断开或录像失败时显示独立的高对比警示，滚动页面时保持可见。恢复连接或结束后更新并清除不再适用的连接警示；录像最终失败时保留警示。原始状态文字继续保留。
 
 客户端在 Windows 和 macOS 启动本地控制窗。Windows 使用安装后的程序，macOS 正式启动要求 macOS 14 或更新版本。先从 DMG 将已签名的 CVBBMSO.app 拖到「应用程序」，再以当前登录用户在 Finder 中双击打开。准入通过后，可以从控制窗打开独立的 Accoding 窗口。关闭控制窗或点击「退出客户端」时先显示退出确认，取消或按 Escape 后继续运行；入场后直至服务端确认本场结束回执，禁止主动关闭客户端或退出当前考试；计算录像 SHA-256、封存合并、可靠事件补报及等待最终 ACK 均在保护范围内。收尾完成后提示「考试结束后，请等待监考老师指示后再关闭客户端。」确定退出后清理网络守卫并关闭 Accoding 窗口。`inspect_session` 将 Cookie 是否可用定向通知本地 UI。加载报名列表时由监考服务复验 Accoding 身份。
 
@@ -33,7 +31,6 @@
 | `admission-status` 事件 | 无 | `{ status, reason? }` | 定向通知本地控制窗正式准入状态变化 |
 | `open_helper_approval_settings` | 无 | `()` | macOS 等待后台服务批准时，由本地控制窗点击操作后打开系统设置 |
 | `list_exams` | 无 | `ExamSummary[]` | 使用当前 Cookie 调用 `GET /api/exams` |
-| `open_campus_auth` | 无 | `()` | 在设备检查通过且准入就绪或监考服务不可达时，打开固定 Origin 的校园网认证窗口；仅本地 UI 可调用 |
 | `open_exam` | `{ exam_id: uuid }` | `{ "connected": true }` | 调用 `Exam::connect`；等待初始 `sync` 后返回。网络、出站守卫和权限预检已在启动时完成 |
 | `get_exam_status` | 无 | `ClientView` 或 `null` | 读取当前考试状态快照 |
 | `confirm_exit` | 无 | `()` | 本地控制窗确认退出后，触发现有考试与网络守卫收尾流程 |

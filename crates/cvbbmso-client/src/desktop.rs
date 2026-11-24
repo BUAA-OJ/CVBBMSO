@@ -1,7 +1,6 @@
 use std::{io, path::PathBuf};
 
 mod admission;
-mod campus;
 mod exam;
 #[cfg(test)]
 mod smoke;
@@ -20,7 +19,7 @@ use url::Url;
 use crate::{
     host_probe,
     monitor::{Monitor, MonitorError},
-    policy::{CAMPUS_AUTH_URL, IDENTITY_URL, LOGIN_URL, permits, server_origin},
+    policy::{IDENTITY_URL, LOGIN_URL, permits, server_origin},
     preflight::{Preflight, Verdict},
 };
 
@@ -33,7 +32,6 @@ const OJ: &str = "accoding";
 const SESSION_EVENT: &str = "accoding-session";
 
 struct Desktop {
-    campus_auth: Url,
     login: Url,
     identity: Url,
     data_dir: PathBuf,
@@ -65,7 +63,6 @@ impl Desktop {
             })
             .transpose()?;
         Ok(Self {
-            campus_auth: Url::parse(CAMPUS_AUTH_URL)?,
             login: Url::parse(LOGIN_URL)?,
             identity: Url::parse(IDENTITY_URL)?,
             data_dir,
@@ -156,7 +153,6 @@ fn builder() -> tauri::Builder<Wry> {
             exam::get_exam_status,
             exam::close_exam,
             confirm_exit,
-            campus::open_campus_auth,
         ])
         .on_window_event(|window, event| {
             #[cfg(target_os = "macos")]
@@ -331,10 +327,7 @@ fn open_browser(app: &AppHandle, desktop: &Desktop) -> tauri::Result<()> {
 
     let initialize = || {
         #[cfg(windows)]
-        {
-            platform::lock_down(&browser)?;
-            platform::restrict_origin(&browser, desktop.login.origin())?;
-        }
+        platform::lock_down(&browser)?;
         browser.navigate(desktop.login.clone())?;
         browser.show()?;
         browser.set_focus()

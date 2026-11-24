@@ -14,7 +14,6 @@ pub(in crate::desktop) struct Admission(Arc<Counters>);
 #[derive(Default)]
 struct Counters {
     proxy_once: AtomicBool,
-    monitor_once: AtomicBool,
     #[cfg(target_os = "macos")]
     screen_once: AtomicBool,
     #[cfg(target_os = "macos")]
@@ -43,7 +42,6 @@ impl Admission {
     pub(in crate::desktop) fn require_retry(&self) {
         self.pause();
         self.0.proxy_once.store(true, Ordering::Relaxed);
-        self.0.monitor_once.store(true, Ordering::Relaxed);
         #[cfg(target_os = "macos")]
         {
             self.0.screen_once.store(true, Ordering::Relaxed);
@@ -83,9 +81,6 @@ impl Admission {
     pub(super) fn check_network(&self) -> Result<(), Failure> {
         if self.0.proxy_once.swap(false, Ordering::Relaxed) {
             return Err(Failure::ProxyConfigured);
-        }
-        if self.0.monitor_once.swap(false, Ordering::Relaxed) {
-            return Err(Failure::MonitorUnreachable);
         }
         Ok(())
     }

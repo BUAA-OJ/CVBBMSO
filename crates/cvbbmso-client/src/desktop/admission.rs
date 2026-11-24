@@ -269,7 +269,7 @@ impl Admission {
         });
     }
 
-    pub(super) fn status(&self) -> Status {
+    fn status(&self) -> Status {
         *self.state.borrow()
     }
 

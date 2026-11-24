@@ -36,7 +36,7 @@ use crate::NetworkError;
 pub use self::policy::EgressPolicy;
 
 /// Campus network authentication host, allowed only over HTTPS (TCP port 443).
-pub const CAMPUS_AUTH_HOST: &str = "gw.buaa.edu.cn";
+const CAMPUS_AUTH_HOST: &str = "gw.buaa.edu.cn";
 
 /// How long an address that disappeared from DNS stays allowed.
 const ADDRESS_GRACE: Duration = Duration::from_secs(120);

@@ -1,16 +1,12 @@
 use std::{io, ptr::null_mut, sync::mpsc, time::Duration};
 
 use tauri::WebviewWindow;
-use url::{Origin, Url};
+use url::Url;
 use webview2_com::{
     LaunchingExternalUriSchemeEventHandler,
-    Microsoft::Web::WebView2::Win32::{
-        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
-        ICoreWebView2_18, ICoreWebView2_22, ICoreWebView2Settings3,
-    },
-    WebResourceRequestedEventHandler, take_pwstr,
+    Microsoft::Web::WebView2::Win32::{ICoreWebView2_18, ICoreWebView2Settings3},
 };
-use windows_core::{Interface, PWSTR, w};
+use windows_core::Interface;
 use windows_sys::Win32::Security::{
     CheckTokenMembership, CreateWellKnownSid, SECURITY_MAX_SID_SIZE, WinBuiltinAdministratorsSid,
 };
@@ -78,58 +74,6 @@ pub(super) fn cookie_pairs(
         .into_iter()
         .map(|cookie| (cookie.name().to_owned(), cookie.value().to_owned()))
         .collect())
-}
-
-/// Blocks requests outside the configured page origin before they reach the network.
-pub(super) fn restrict_origin(browser: &WebviewWindow, origin: Origin) -> tauri::Result<()> {
-    let (send, receive) = mpsc::channel();
-    browser.with_webview(move |native| {
-        let configure = || -> windows_core::Result<()> {
-            // SAFETY: the WebView and environment are live on their owning UI
-            // thread; request handlers and response creation stay on that thread.
-            unsafe {
-                let webview = native.controller().CoreWebView2()?;
-                let environment = native.environment();
-                // The legacy overload does not reliably intercept iframe requests.
-                webview
-                    .cast::<ICoreWebView2_22>()?
-                    .AddWebResourceRequestedFilterWithRequestSourceKinds(
-                        w!("*"),
-                        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
-                        COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
-                    )?;
-                let mut token = 0;
-                webview.add_WebResourceRequested(
-                    &WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
-                        if let Some(args) = args {
-                            let mut uri = PWSTR::null();
-                            args.Request()?.Uri(&raw mut uri)?;
-                            let uri = take_pwstr(uri);
-                            if !Url::parse(&uri)
-                                .is_ok_and(|url| crate::policy::permits(&origin, &url))
-                            {
-                                let response = environment.CreateWebResourceResponse(
-                                    None,
-                                    403,
-                                    w!("Forbidden"),
-                                    w!("Content-Length: 0\r\n"),
-                                )?;
-                                args.SetResponse(&response)?;
-                            }
-                        }
-                        Ok(())
-                    })),
-                    &raw mut token,
-                )?;
-            }
-            Ok(())
-        };
-        let _ = send.send(configure());
-    })?;
-    receive
-        .recv_timeout(Duration::from_secs(10))
-        .map_err(io::Error::other)?
-        .map_err(|error| io::Error::other(error).into())
 }
 
 #[cfg(test)]
