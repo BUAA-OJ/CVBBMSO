@@ -115,6 +115,29 @@ fn a_display_without_images_times_out_without_reporting_recovery() {
 }
 
 #[test]
+fn a_late_first_frame_is_not_delivered_or_reported_as_recovered() {
+    let started = Cell::new(false);
+    let mut clock = FakeClock::default();
+    let mut source = Source::new([Some(image(1))]);
+    source.read_delay = Some((
+        Rc::clone(&clock.elapsed),
+        FIRST_FRAME_TIMEOUT + Duration::from_millis(1),
+    ));
+    let result = sample_started(
+        &mut source,
+        &mut clock,
+        rate(10),
+        &AtomicBool::new(false),
+        || started.set(true),
+        |_| panic!("a late first frame must not reach the sink"),
+    );
+    assert!(
+        matches!(result, Err(RecordingError::Platform(Some(error))) if error.kind() == io::ErrorKind::TimedOut)
+    );
+    assert!(!started.get());
+}
+
+#[test]
 fn a_rejected_first_frame_does_not_report_recovery() {
     let started = Cell::new(false);
     let result = sample_started(

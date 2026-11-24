@@ -147,9 +147,7 @@ fn sample(
         // GPU readback can take time. Timestamp the sampling attempt, not the
         // completion of its buffer copy or the consumer's work.
         let sampled_at = clock.now();
-        if let Some(frame) = source.next_frame(timeout_ms)? {
-            latest = Some(Arc::new(frame));
-        }
+        let frame = source.next_frame(timeout_ms)?;
         if stopped.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -158,6 +156,9 @@ fn sample(
                 io::ErrorKind::TimedOut,
                 "no desktop image received within five seconds",
             ))));
+        }
+        if let Some(frame) = frame {
+            latest = Some(Arc::new(frame));
         }
         if let Some(frame) = &latest {
             let sample = SampledFrame {
