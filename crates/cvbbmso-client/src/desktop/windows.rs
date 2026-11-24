@@ -5,7 +5,8 @@ use url::{Origin, Url};
 use webview2_com::{
     LaunchingExternalUriSchemeEventHandler,
     Microsoft::Web::WebView2::Win32::{
-        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, ICoreWebView2_18, ICoreWebView2Settings3,
+        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL, COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
+        ICoreWebView2_18, ICoreWebView2_22, ICoreWebView2Settings3,
     },
     WebResourceRequestedEventHandler, take_pwstr,
 };
@@ -89,10 +90,14 @@ pub(super) fn restrict_origin(browser: &WebviewWindow, origin: Origin) -> tauri:
             unsafe {
                 let webview = native.controller().CoreWebView2()?;
                 let environment = native.environment();
-                webview.AddWebResourceRequestedFilter(
-                    w!("*"),
-                    COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
-                )?;
+                // The legacy overload does not reliably intercept iframe requests.
+                webview
+                    .cast::<ICoreWebView2_22>()?
+                    .AddWebResourceRequestedFilterWithRequestSourceKinds(
+                        w!("*"),
+                        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                        COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
+                    )?;
                 let mut token = 0;
                 webview.add_WebResourceRequested(
                     &WebResourceRequestedEventHandler::create(Box::new(move |_, args| {

@@ -924,6 +924,8 @@ async fn exercise(
     let portal = campus_window(app).await?;
     platform::assert_locked(&portal)?;
     check_ipc(ui, &portal).await?;
+    #[cfg(windows)]
+    check_campus_iframe(&portal, &foreign_url, hits).await?;
     let portal_foreign = foreign_url.join("?source=campus")?;
     portal.eval(format!("location.assign('{}')", portal_foreign.as_str()))?;
     expect_denial(decisions, "campus-navigation", &portal_foreign).await?;
@@ -957,6 +959,36 @@ async fn exercise(
     if hits.load(Ordering::Relaxed) != 0 {
         return Err(io::Error::other("Cross-origin navigation reached the listener").into());
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn check_campus_iframe(
+    portal: &WebviewWindow,
+    foreign: &Url,
+    hits: &AtomicUsize,
+) -> Result<(), Error> {
+    let address = serde_json::to_string(foreign.join("?source=campus-iframe")?.as_str())?;
+    portal.eval(format!(
+        r"
+        window.campusIframeLoaded = false;
+        const frame = document.createElement('iframe');
+        frame.onload = () => {{ window.campusIframeLoaded = true; }};
+        frame.src = {address};
+        document.body.append(frame);
+        "
+    ))?;
+    wait_for(
+        portal,
+        "window.campusIframeLoaded",
+        "cross-origin iframe response",
+    )
+    .await?;
+    assert_eq!(
+        hits.load(Ordering::Relaxed),
+        0,
+        "Cross-origin iframe reached the listener"
+    );
     Ok(())
 }
 
