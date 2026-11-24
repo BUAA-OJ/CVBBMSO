@@ -50,18 +50,21 @@ fn presented_desktop_image_is_delivered() {
 fn platform_failure_preserves_the_original_windows_error() {
     let original = WindowsError::new(DXGI_ERROR_ACCESS_LOST, "capture device context");
     let message = original.to_string();
-    let error = failure(original);
+    let error = failure("reading desktop frame", original);
     let storage = error
         .source()
         .and_then(|source| source.downcast_ref::<std::io::Error>())
         .expect("platform source");
     let windows = storage
         .get_ref()
+        .and_then(std::error::Error::source)
         .and_then(|cause| cause.downcast_ref::<WindowsError>())
         .expect("original Windows error, not a string replacement");
 
     assert_eq!(windows.code(), DXGI_ERROR_ACCESS_LOST);
     assert_eq!(windows.to_string(), message);
+    assert!(storage.to_string().contains("reading desktop frame"));
+    assert!(storage.to_string().contains("0x887A0026"));
 }
 
 /// Opt-in hardware acceptance: writes three BGRA images and their presentation

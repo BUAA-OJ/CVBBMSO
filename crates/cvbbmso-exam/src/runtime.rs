@@ -662,9 +662,12 @@ impl<C: Capture> Runtime<C> {
                 {
                     return;
                 }
-                tracing::warn!(%error, "recording fault");
-                self.incident(IncidentCode::RecordingFailed, Some(error.to_string()))
-                    .await;
+                tracing::warn!(?error, "recording fault");
+                self.incident(
+                    IncidentCode::RecordingFailed,
+                    Some(recording_detail(&error)),
+                )
+                .await;
                 if self.state.execution == ExecutionState::Recording {
                     self.set_state(ExecutionState::Recording, RecordingState::Failed)
                         .await;
@@ -734,10 +737,13 @@ impl<C: Capture> Runtime<C> {
                 self.resolve_start(CommandStatus::Completed, None).await;
             }
             Err(error) => {
-                tracing::warn!(%error, "starting capture failed");
+                tracing::warn!(?error, "starting capture failed");
                 if self.start_failures == 0 {
-                    self.incident(IncidentCode::RecordingFailed, Some(error.to_string()))
-                        .await;
+                    self.incident(
+                        IncidentCode::RecordingFailed,
+                        Some(recording_detail(&error)),
+                    )
+                    .await;
                 }
                 self.start_failures += 1;
                 self.set_state(ExecutionState::Recording, RecordingState::Failed)
@@ -809,8 +815,11 @@ impl<C: Capture> Runtime<C> {
             }
             Err(error) => {
                 let changed = self.update_state(ExecutionState::Finalizing, RecordingState::Failed);
-                self.incident(IncidentCode::RecordingFailed, Some(error.to_string()))
-                    .await;
+                self.incident(
+                    IncidentCode::RecordingFailed,
+                    Some(recording_detail(&error)),
+                )
+                .await;
                 if let Some(state) = changed {
                     self.announce(state).await;
                 }
@@ -851,8 +860,11 @@ impl<C: Capture> Runtime<C> {
         tracing::warn!("end_exam did not arrive in time; stopping the recording locally");
         self.retry_at = None;
         if let Err(error) = self.capture.stop().await {
-            self.incident(IncidentCode::RecordingFailed, Some(error.to_string()))
-                .await;
+            self.incident(
+                IncidentCode::RecordingFailed,
+                Some(recording_detail(&error)),
+            )
+            .await;
         }
         self.set_state(ExecutionState::Finalizing, RecordingState::Finalizing)
             .await;
@@ -1055,6 +1067,16 @@ impl<C: Capture> Runtime<C> {
             Err(error) => self.lose_connection(Some(error)),
         }
     }
+}
+
+fn recording_detail(error: &RecordingError) -> String {
+    // Platform failures carry the capture operation and native error code.
+    // Keep filesystem paths out of the remotely reported storage errors.
+    let detail = match error {
+        RecordingError::Platform(Some(source)) => format!("{error}: {source}"),
+        _ => error.to_string(),
+    };
+    detail.chars().take(MAX_DETAIL_CHARS).collect()
 }
 
 async fn sleep_until_some(deadline: Option<Instant>) {
