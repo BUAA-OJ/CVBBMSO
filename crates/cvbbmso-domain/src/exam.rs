@@ -479,6 +479,15 @@ impl ExamService {
         commands::due(state, start_at, end_at, self.0.now())
     }
 
+    /// Probes whether the write database pool can start and commit an immediate write transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if acquiring a write lock or committing the probe transaction fails.
+    pub async fn probe_storage(&self) -> Result<(), DomainError> {
+        db::immediate_transaction(&self.0.writer, |_| Box::pin(async { Ok(()) })).await
+    }
+
     /// Executes a batch of writes and heartbeat updates in a single `BEGIN IMMEDIATE` transaction.
     ///
     /// Individual business validation errors roll back only their own savepoint and are returned

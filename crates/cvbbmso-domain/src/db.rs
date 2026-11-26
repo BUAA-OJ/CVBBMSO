@@ -5,7 +5,8 @@ use migration::{Migrator, MigratorTrait};
 use sea_orm::{
     ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
     DatabaseTransaction, DbErr, EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect,
-    QueryTrait, RelationTrait, RuntimeErr, TransactionTrait,
+    QueryTrait, RelationTrait, RuntimeErr, SqliteTransactionMode, TransactionOptions,
+    TransactionTrait,
     sqlx::{
         self,
         sqlite::{SqliteJournalMode, SqliteSynchronous},
@@ -125,14 +126,12 @@ pub(crate) async fn immediate_transaction<T>(
     db: &DatabaseConnection,
     operation: impl for<'a> FnOnce(&'a DatabaseTransaction) -> TransactionFuture<'a, T>,
 ) -> Result<T, DomainError> {
-    let tx = db.begin().await?;
-    // SeaORM's SQLite driver opens transactions with BEGIN DEFERRED; promote to BEGIN IMMEDIATE
-    // on the pinned connection so write lock acquisition honors busy_timeout upfront.
-    if let Err(error) = tx.execute_unprepared("ROLLBACK; BEGIN IMMEDIATE").await {
-        let _ = tx.execute_unprepared("BEGIN").await;
-        let _ = tx.rollback().await;
-        return Err(error.into());
-    }
+    let tx = db
+        .begin_with_options(TransactionOptions {
+            sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+            ..Default::default()
+        })
+        .await?;
     match operation(&tx).await {
         Ok(output) => {
             tx.commit().await?;
