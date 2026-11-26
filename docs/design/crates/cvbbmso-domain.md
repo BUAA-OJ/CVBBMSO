@@ -21,6 +21,25 @@ pub struct DirectedCommand {
     pub command: cvbbmso_protocol::ServerMessage,
 }
 
+pub struct ScheduledCommand {
+    pub exam_id: uuid::Uuid,
+    pub oj_user_id: i64,
+    pub connection_id: Option<uuid::Uuid>,
+    pub state: cvbbmso_protocol::ClientState,
+    pub start_at: time::OffsetDateTime,
+    pub end_at: time::OffsetDateTime,
+    pub command: cvbbmso_protocol::ServerMessage,
+}
+
+pub enum BatchWrite { /* Connect / Disconnect / Status / Event / CommandResult / Admin */ }
+pub struct HeartbeatUpdate {
+    pub exam_id: uuid::Uuid,
+    pub oj_user_id: i64,
+    pub connection_id: uuid::Uuid,
+    pub last_seen_at: time::OffsetDateTime,
+}
+pub enum BatchOutput { Connected(ConnectOutcome), Admin(AdminOutput), Ack }
+
 pub enum DisconnectReason { Closed, HeartbeatTimeout, Replaced, ServerRestart }
 
 pub enum DomainError {
@@ -64,6 +83,14 @@ impl ExamService {
     pub async fn check_connected(
         &self, exam_id: uuid::Uuid, oj_user_id: i64,
     ) -> Result<(), DomainError>;
+
+    /// 在只读连接池上确认指定连接代次的报名与在线状态。
+    pub async fn check_connected_generation(
+        &self, exam_id: uuid::Uuid, oj_user_id: i64, connection_id: Option<uuid::Uuid>,
+    ) -> Result<(), DomainError>;
+
+    /// 关闭写连接与只读连接池。
+    pub async fn close(&self) -> Result<(), DomainError>;
 
     /// 建立或恢复考试考生记录；返回服务端快照与待下发命令。
     pub async fn connect(
@@ -111,6 +138,24 @@ impl ExamService {
 
     /// 根据固定考试时间返回在线考生的候选命令。
     pub async fn due_commands(&self) -> Result<Vec<DirectedCommand>, DomainError>;
+
+    /// 通过单次集合连接查询返回在线考生候选命令及快照状态。
+    pub async fn due_command_candidates(&self) -> Result<Vec<ScheduledCommand>, DomainError>;
+
+    /// 根据已知状态与考试时间边界计算当前是否应下发命令。
+    pub fn due_command_for(
+        &self,
+        state: cvbbmso_protocol::ClientState,
+        start_at: time::OffsetDateTime,
+        end_at: time::OffsetDateTime,
+    ) -> Option<cvbbmso_protocol::ServerMessage>;
+
+    /// 在单个 `BEGIN IMMEDIATE` 事务内执行批量写入（逐项 Savepoint 隔离业务错误）与心跳批量更新。
+    pub async fn execute_batch(
+        &self,
+        writes: Vec<BatchWrite>,
+        heartbeats: Vec<HeartbeatUpdate>,
+    ) -> Result<Vec<Result<BatchOutput, DomainError>>, DomainError>;
 }
 
 impl AdminService {
@@ -248,7 +293,7 @@ pub struct IncidentRecord {
 | 录像摘要 | 保存在 `recording_finalized` 可靠事件中的分片数和合并文件 SHA-256 |
 | 管理审计 | actor、操作、目标、时间 |
 
-`crates/cvbbmso-domain/migration/` 维护 SQLite 迁移。首次打开空库时，一条初始迁移创建七张业务表，录像摘要存放在可靠事件表中。
+`crates/cvbbmso-domain/migration/` 维护 SQLite 迁移。首次打开空库时，初始迁移创建七张业务表，后续迁移在 `student_runtimes` 增加 `connection_id` 用于连接代次校验与心跳批量回写。文件数据库打开时配置 `WAL`、`synchronous=FULL`、单写连接和 4 连接只读池；内存数据库保留单连接语义以供测试。`due_commands` / `due_command_candidates` 使用单次 `JOIN` 集合查询在只读连接池执行；`execute_batch` 使用 `BEGIN IMMEDIATE` 外层事务和逐项 Savepoint 隔离请求级业务错误，并在同一事务中分块批量更新有效连接的心跳时间戳。
 
 ## 考试阶段与调度
 

@@ -68,6 +68,7 @@ pub(crate) async fn has_end_result(
 pub(crate) async fn record(
     tx: &DatabaseTransaction,
     key: StudentKey,
+    connection_id: Option<Uuid>,
     command_id: Uuid,
     name: CommandName,
     status: CommandStatus,
@@ -76,7 +77,7 @@ pub(crate) async fn record(
     if !valid_result(name, status, error_code.as_deref()) {
         return Err(DomainError::Conflict);
     }
-    let runtime = Runtime::connected(tx, &key).await?;
+    let runtime = Runtime::connected_generation(tx, &key, connection_id).await?;
     let state = runtime.state()?;
     if name == CommandName::EndExam {
         if state.execution == ExecutionState::Finished

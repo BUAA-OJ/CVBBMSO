@@ -1,15 +1,19 @@
 use cvbbmso_protocol::{
-    ClientHello, ClientMessage, ClientState, CommandName, CommandStatus, ExamSummary,
+    ClientHello, ClientMessage, ClientState, CommandName, CommandStatus, ExamEvent, ExamSummary,
     ExecutionState, RecordingState, ServerMessage,
 };
-use sea_orm::{DatabaseTransaction, EntityTrait, Set, sea_query::OnConflict};
+use sea_orm::{
+    ConnectionTrait, DatabaseTransaction, DbBackend, EntityTrait, FromQueryResult, Set, Statement,
+    TransactionTrait, Value,
+    sea_query::{Expr, ExprTrait, JoinType, OnConflict, Order, Query},
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    AdminService, DomainError, Service, commands,
+    AdminOperation, AdminOutput, AdminService, DomainError, Service, admin, commands,
     db::{self, Runtime, StudentKey},
-    entity::runtime,
+    entity::{enrollment, exam as exam_table, runtime},
     events,
 };
 
@@ -31,6 +35,136 @@ pub struct DirectedCommand {
     pub oj_user_id: i64,
     /// The `ServerMessage::Command` to send.
     pub command: ServerMessage,
+}
+
+/// A due command candidate paired with the runtime snapshot observed when scheduling.
+#[derive(Debug)]
+pub struct ScheduledCommand {
+    /// The exam that issued the command.
+    pub exam_id: Uuid,
+    /// The enrolled Accoding user.
+    pub oj_user_id: i64,
+    /// The connection generation recorded on the student runtime, if set.
+    pub connection_id: Option<Uuid>,
+    /// The runtime state observed when evaluating the schedule.
+    pub state: ClientState,
+    /// The exam's scheduled start time.
+    pub start_at: OffsetDateTime,
+    /// The exam's scheduled end time.
+    pub end_at: OffsetDateTime,
+    /// The `ServerMessage::Command` candidate to deliver if still valid.
+    pub command: ServerMessage,
+}
+
+/// A single write operation executed inside a shared database batch transaction.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum BatchWrite {
+    /// Admits or replaces a student's connection.
+    Connect {
+        /// Exam identifier.
+        exam_id: Uuid,
+        /// Enrolled Accoding user ID.
+        oj_user_id: i64,
+        /// Server-assigned connection generation UUID.
+        connection_id: Uuid,
+        /// Client handshake payload.
+        hello: ClientHello,
+        /// Server UTC timestamp when `hello` was accepted.
+        observed_at: OffsetDateTime,
+    },
+    /// Marks a student offline and records loss if unfinished.
+    Disconnect {
+        /// Exam identifier.
+        exam_id: Uuid,
+        /// Enrolled Accoding user ID.
+        oj_user_id: i64,
+        /// Expected active connection generation, if scoped to a specific socket.
+        connection_id: Option<Uuid>,
+        /// Disconnect reason.
+        reason: DisconnectReason,
+        /// Server UTC timestamp when the disconnect was observed.
+        observed_at: OffsetDateTime,
+        /// Latest valid in-memory heartbeat timestamp for this connection, if any.
+        last_seen_at: Option<OffsetDateTime>,
+    },
+    /// Updates a connected student's state snapshot.
+    Status {
+        /// Exam identifier.
+        exam_id: Uuid,
+        /// Enrolled Accoding user ID.
+        oj_user_id: i64,
+        /// Expected active connection generation.
+        connection_id: Option<Uuid>,
+        /// Reported client state.
+        state: ClientState,
+    },
+    /// Persists a reliable client event and advances `ack_event_through`.
+    Event {
+        /// Exam identifier.
+        exam_id: Uuid,
+        /// Enrolled Accoding user ID.
+        oj_user_id: i64,
+        /// Expected active connection generation.
+        connection_id: Option<Uuid>,
+        /// Client event sequence number.
+        seq: i64,
+        /// Event payload.
+        event: ExamEvent,
+        /// Server UTC timestamp when the event was received.
+        observed_at: OffsetDateTime,
+    },
+    /// Archives a terminal command result and updates student state.
+    CommandResult {
+        /// Exam identifier.
+        exam_id: Uuid,
+        /// Enrolled Accoding user ID.
+        oj_user_id: i64,
+        /// Expected active connection generation.
+        connection_id: Option<Uuid>,
+        /// Issued command ID.
+        command_id: Uuid,
+        /// Issued command name.
+        name: CommandName,
+        /// Reported terminal status.
+        status: CommandStatus,
+        /// Optional protocol error code on failure.
+        error_code: Option<String>,
+    },
+    /// Executes an administrative mutation and records its audit entry.
+    Admin {
+        /// Audit actor name.
+        actor: String,
+        /// Administrative operation.
+        op: AdminOperation,
+        /// Latest in-memory heartbeat if removing a connected participant.
+        last_seen_at: Option<OffsetDateTime>,
+    },
+}
+
+/// A coalesced application heartbeat timestamp to flush for an active connection.
+#[derive(Debug, Clone, Copy)]
+pub struct HeartbeatUpdate {
+    /// Exam identifier.
+    pub exam_id: Uuid,
+    /// Enrolled Accoding user ID.
+    pub oj_user_id: i64,
+    /// Active connection generation UUID.
+    pub connection_id: Uuid,
+    /// Latest valid application heartbeat UTC timestamp.
+    pub last_seen_at: OffsetDateTime,
+}
+
+/// Output produced by an individual [`BatchWrite`] on success.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum BatchOutput {
+    /// Output for [`BatchWrite::Connect`].
+    Connected(ConnectOutcome),
+    /// Output for [`BatchWrite::Admin`].
+    Admin(AdminOutput),
+    /// Output for operations that return unit on success.
+    Ack,
 }
 
 /// How the server observed a connection's end.
@@ -96,6 +230,17 @@ impl ExamService {
         self.0.now()
     }
 
+    /// Closes the underlying write and read connection pools cleanly.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if closing either pool fails.
+    pub async fn close(&self) -> Result<(), DomainError> {
+        self.0.reader.clone().close().await?;
+        self.0.writer.clone().close().await?;
+        Ok(())
+    }
+
     /// Transitions connections left online by a previous server to offline.
     ///
     /// Call once before accepting connections after server startup.
@@ -105,7 +250,7 @@ impl ExamService {
     /// Returns a storage error if recovery cannot be committed.
     pub async fn recover_online(&self) -> Result<(), DomainError> {
         let now = self.0.now();
-        db::write(&self.0.database, |tx| {
+        db::write(&self.0.writer, |tx| {
             Box::pin(async move {
                 for runtime in Runtime::online(tx).await? {
                     disconnect(tx, &runtime, DisconnectReason::ServerRestart, now).await?;
@@ -123,7 +268,7 @@ impl ExamService {
     /// Returns an error for a nonpositive user ID or failed database read.
     pub async fn list_for(&self, oj_user_id: i64) -> Result<Vec<ExamSummary>, DomainError> {
         db::validate_user(oj_user_id)?;
-        db::exams(&self.0.database, Some(oj_user_id), self.0.now()).await
+        db::exams(&self.0.reader, Some(oj_user_id), self.0.now()).await
     }
 
     /// Checks enrollment and returns the scheduled exam duration.
@@ -139,7 +284,7 @@ impl ExamService {
         oj_user_id: i64,
     ) -> Result<time::Duration, DomainError> {
         let key = StudentKey::new(exam_id, oj_user_id)?;
-        db::transaction(&self.0.database, |tx| {
+        db::transaction(&self.0.reader, |tx| {
             Box::pin(async move {
                 let (start, end) = db::enrollment(tx, &key).await?.times()?;
                 Ok(end - start)
@@ -154,9 +299,29 @@ impl ExamService {
     ///
     /// Returns an error if the student is no longer enrolled or connected, or storage fails.
     pub async fn check_connected(&self, exam_id: Uuid, oj_user_id: i64) -> Result<(), DomainError> {
+        self.check_connected_generation(exam_id, oj_user_id, None)
+            .await
+    }
+
+    /// Checks on the read pool that the student's connection generation is enrolled and online.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if enrollment was revoked, the connection was replaced or disconnected,
+    /// or storage fails.
+    pub async fn check_connected_generation(
+        &self,
+        exam_id: Uuid,
+        oj_user_id: i64,
+        connection_id: Option<Uuid>,
+    ) -> Result<(), DomainError> {
         let key = StudentKey::new(exam_id, oj_user_id)?;
-        db::transaction(&self.0.database, |tx| {
-            Box::pin(async move { Runtime::connected(tx, &key).await.map(|_| ()) })
+        db::transaction(&self.0.reader, |tx| {
+            Box::pin(async move {
+                Runtime::connected_generation(tx, &key, connection_id)
+                    .await
+                    .map(|_| ())
+            })
         })
         .await
     }
@@ -176,10 +341,11 @@ impl ExamService {
         let key = StudentKey::new(exam_id, oj_user_id)?;
         validate_state(hello.state)?;
         let now = self.0.now();
-        db::write(&self.0.database, |tx| {
+        let connection_id = Uuid::new_v4();
+        db::write(&self.0.writer, |tx| {
             let key = key.clone();
             let hello = hello.clone();
-            Box::pin(async move { connect(tx, &key, &hello, now).await })
+            Box::pin(async move { connect(tx, &key, Some(connection_id), &hello, now).await })
         })
         .await
     }
@@ -197,8 +363,8 @@ impl ExamService {
     ) -> Result<(), DomainError> {
         let key = StudentKey::new(exam_id, oj_user_id)?;
         let now = self.0.now();
-        db::transaction(&self.0.database, |tx| {
-            Box::pin(async move { receive(tx, &key, message, now).await })
+        db::immediate_transaction(&self.0.writer, |tx| {
+            Box::pin(async move { receive(tx, &key, None, message, now).await })
         })
         .await
     }
@@ -223,9 +389,9 @@ impl ExamService {
         error_code: Option<String>,
     ) -> Result<(), DomainError> {
         let key = StudentKey::new(exam_id, oj_user_id)?;
-        db::transaction(&self.0.database, |tx| {
+        db::immediate_transaction(&self.0.writer, |tx| {
             Box::pin(commands::record(
-                tx, key, command_id, name, status, error_code,
+                tx, key, None, command_id, name, status, error_code,
             ))
         })
         .await
@@ -263,7 +429,7 @@ impl ExamService {
     ) -> Result<(), DomainError> {
         let key = StudentKey::new(exam_id, oj_user_id)?;
         // The connection manager retries contention between requests.
-        db::transaction(&self.0.database, |tx| {
+        db::immediate_transaction(&self.0.writer, |tx| {
             Box::pin(async move {
                 let runtime = Runtime::get(tx, &key).await?;
                 disconnect(tx, &runtime, reason, observed_at).await
@@ -280,14 +446,230 @@ impl ExamService {
     ///
     /// Returns a storage error when the schedule cannot be applied.
     pub async fn due_commands(&self) -> Result<Vec<DirectedCommand>, DomainError> {
-        let now = self.0.now();
-        db::transaction(&self.0.database, |tx| Box::pin(due_commands(tx, now))).await
+        Ok(self
+            .due_command_candidates()
+            .await?
+            .into_iter()
+            .map(|candidate| DirectedCommand {
+                exam_id: candidate.exam_id,
+                oj_user_id: candidate.oj_user_id,
+                command: candidate.command,
+            })
+            .collect())
     }
+
+    /// Queries all currently due commands with snapshot metadata in a single set-based join.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the read-pool query fails.
+    pub async fn due_command_candidates(&self) -> Result<Vec<ScheduledCommand>, DomainError> {
+        let now = self.0.now();
+        due_commands(&self.0.reader, now).await
+    }
+
+    /// Computes whether a command is currently due for the given state and exam bounds.
+    #[must_use]
+    pub fn due_command_for(
+        &self,
+        state: ClientState,
+        start_at: OffsetDateTime,
+        end_at: OffsetDateTime,
+    ) -> Option<ServerMessage> {
+        commands::due(state, start_at, end_at, self.0.now())
+    }
+
+    /// Executes a batch of writes and heartbeat updates in a single `BEGIN IMMEDIATE` transaction.
+    ///
+    /// Individual business validation errors roll back only their own savepoint and are returned
+    /// per item in the output vector. Storage-level failures roll back the entire outer transaction
+    /// and return `Err`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error if the outer transaction fails to start, encounters a database-level
+    /// error, or fails to commit.
+    pub async fn execute_batch(
+        &self,
+        writes: Vec<BatchWrite>,
+        heartbeats: Vec<HeartbeatUpdate>,
+    ) -> Result<Vec<Result<BatchOutput, DomainError>>, DomainError> {
+        if writes.is_empty() && heartbeats.is_empty() {
+            return Ok(Vec::new());
+        }
+        let service = self.0.clone();
+        db::immediate_transaction(&self.0.writer, move |tx| {
+            Box::pin(async move {
+                let mut outcomes = Vec::with_capacity(writes.len());
+                for write in writes {
+                    let sp = tx.begin().await?;
+                    match apply_batch_write(&sp, &service, write).await {
+                        Ok(output) => {
+                            sp.commit().await?;
+                            outcomes.push(Ok(output));
+                        }
+                        Err(error) if !matches!(error, DomainError::Storage { .. }) => {
+                            sp.rollback().await?;
+                            outcomes.push(Err(error));
+                        }
+                        Err(error) => {
+                            let _ = sp.rollback().await;
+                            return Err(error);
+                        }
+                    }
+                }
+                if !heartbeats.is_empty() {
+                    flush_heartbeats(tx, &heartbeats).await?;
+                }
+                Ok(outcomes)
+            })
+        })
+        .await
+    }
+}
+
+async fn apply_batch_write(
+    tx: &DatabaseTransaction,
+    service: &Service,
+    write: BatchWrite,
+) -> Result<BatchOutput, DomainError> {
+    match write {
+        BatchWrite::Connect {
+            exam_id,
+            oj_user_id,
+            connection_id,
+            hello,
+            observed_at,
+        } => {
+            let key = StudentKey::new(exam_id, oj_user_id)?;
+            validate_state(hello.state)?;
+            connect(tx, &key, Some(connection_id), &hello, observed_at)
+                .await
+                .map(BatchOutput::Connected)
+        }
+        BatchWrite::Disconnect {
+            exam_id,
+            oj_user_id,
+            connection_id,
+            reason,
+            observed_at,
+            last_seen_at,
+        } => {
+            let key = StudentKey::new(exam_id, oj_user_id)?;
+            let runtime = Runtime::get(tx, &key).await?;
+            if let Some(expected) = connection_id
+                && runtime.connection_id.as_deref() != Some(&expected.to_string())
+            {
+                return Ok(BatchOutput::Ack);
+            }
+            disconnect_with_last_seen(tx, &runtime, reason, observed_at, last_seen_at).await?;
+            Ok(BatchOutput::Ack)
+        }
+        BatchWrite::Status {
+            exam_id,
+            oj_user_id,
+            connection_id,
+            state,
+        } => {
+            let key = StudentKey::new(exam_id, oj_user_id)?;
+            receive(
+                tx,
+                &key,
+                connection_id,
+                ClientMessage::Status { state },
+                service.now(),
+            )
+            .await?;
+            Ok(BatchOutput::Ack)
+        }
+        BatchWrite::Event {
+            exam_id,
+            oj_user_id,
+            connection_id,
+            seq,
+            event,
+            observed_at,
+        } => {
+            let key = StudentKey::new(exam_id, oj_user_id)?;
+            receive(
+                tx,
+                &key,
+                connection_id,
+                ClientMessage::Event { seq, event },
+                observed_at,
+            )
+            .await?;
+            Ok(BatchOutput::Ack)
+        }
+        BatchWrite::CommandResult {
+            exam_id,
+            oj_user_id,
+            connection_id,
+            command_id,
+            name,
+            status,
+            error_code,
+        } => {
+            let key = StudentKey::new(exam_id, oj_user_id)?;
+            commands::record(tx, key, connection_id, command_id, name, status, error_code).await?;
+            Ok(BatchOutput::Ack)
+        }
+        BatchWrite::Admin {
+            actor,
+            op,
+            last_seen_at,
+        } => admin::mutate(tx, service, &actor, &op, last_seen_at)
+            .await
+            .map(BatchOutput::Admin),
+    }
+}
+
+async fn flush_heartbeats(
+    tx: &DatabaseTransaction,
+    heartbeats: &[HeartbeatUpdate],
+) -> Result<(), DomainError> {
+    const HEARTBEAT_CHUNK_SIZE: usize = 200;
+    for chunk in heartbeats.chunks(HEARTBEAT_CHUNK_SIZE) {
+        let mut placeholders = Vec::with_capacity(chunk.len());
+        let mut values = Vec::with_capacity(chunk.len() * 4);
+        for update in chunk {
+            db::validate_user(update.oj_user_id)?;
+            placeholders.push("(?, ?, ?, ?)");
+            values.push(Value::from(update.exam_id.to_string()));
+            values.push(Value::from(update.oj_user_id));
+            values.push(Value::from(update.connection_id.to_string()));
+            values.push(Value::from(db::stored_time(update.last_seen_at)?));
+        }
+        let sql = format!(
+            "WITH batch(exam_id, oj_user_id, connection_id, last_seen_at) AS (VALUES {values_list}) \
+             UPDATE student_runtimes \
+             SET last_seen_at = batch.last_seen_at \
+             FROM batch \
+             WHERE student_runtimes.exam_id = batch.exam_id \
+               AND student_runtimes.oj_user_id = batch.oj_user_id \
+               AND student_runtimes.connection_id = batch.connection_id \
+               AND student_runtimes.connected = 1 \
+               AND EXISTS ( \
+                   SELECT 1 FROM enrollments AS en \
+                   WHERE en.exam_id = student_runtimes.exam_id \
+                     AND en.oj_user_id = student_runtimes.oj_user_id \
+               )",
+            values_list = placeholders.join(", ")
+        );
+        tx.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            values,
+        ))
+        .await?;
+    }
+    Ok(())
 }
 
 async fn connect(
     tx: &DatabaseTransaction,
     key: &StudentKey,
+    connection_id: Option<Uuid>,
     hello: &ClientHello,
     now: OffsetDateTime,
 ) -> Result<ConnectOutcome, DomainError> {
@@ -319,6 +701,7 @@ async fn connect(
         oj_user_id: Set(key.user),
         device_id: Set(hello.device_id.to_string()),
         instance_id: Set(hello.instance_id.to_string()),
+        connection_id: Set(connection_id.map(|id| id.to_string())),
         connected: Set(true),
         execution: Set(db::enum_name(state.execution)?),
         recording: Set(db::enum_name(state.recording)?),
@@ -330,6 +713,7 @@ async fn connect(
             .update_columns([
                 Column::DeviceId,
                 Column::InstanceId,
+                Column::ConnectionId,
                 Column::Connected,
                 Column::Execution,
                 Column::Recording,
@@ -399,10 +783,11 @@ async fn restore_connection(
 async fn receive(
     tx: &DatabaseTransaction,
     key: &StudentKey,
+    connection_id: Option<Uuid>,
     message: ClientMessage,
     now: OffsetDateTime,
 ) -> Result<(), DomainError> {
-    let runtime = Runtime::connected(tx, key).await?;
+    let runtime = Runtime::connected_generation(tx, key, connection_id).await?;
     match message {
         ClientMessage::Heartbeat => {
             runtime::Entity::update(runtime::ActiveModel {
@@ -463,6 +848,16 @@ pub(crate) async fn disconnect(
     reason: DisconnectReason,
     now: OffsetDateTime,
 ) -> Result<(), DomainError> {
+    disconnect_with_last_seen(tx, runtime, reason, now, None).await
+}
+
+pub(crate) async fn disconnect_with_last_seen(
+    tx: &DatabaseTransaction,
+    runtime: &Runtime,
+    reason: DisconnectReason,
+    now: OffsetDateTime,
+    last_seen_at: Option<OffsetDateTime>,
+) -> Result<(), DomainError> {
     if !runtime.connected {
         return Ok(());
     }
@@ -471,34 +866,99 @@ pub(crate) async fn disconnect(
         events::save_server_incident(tx, &key, "connection_lost", now, Some(reason.detail()))
             .await?;
     }
-    runtime::Entity::update(runtime::ActiveModel {
+    let mut active = runtime::ActiveModel {
         exam_id: Set(key.exam.clone()),
         oj_user_id: Set(key.user),
         connected: Set(false),
         ..Default::default()
-    })
-    .exec_without_returning(tx)
-    .await?;
+    };
+    if let Some(last_seen) = last_seen_at {
+        let existing = db::parse_time(&runtime.last_seen_at)?;
+        if last_seen > existing {
+            active.last_seen_at = Set(db::stored_time(last_seen)?);
+        }
+    }
+    runtime::Entity::update(active)
+        .exec_without_returning(tx)
+        .await?;
     Ok(())
 }
 
+#[derive(Debug, FromQueryResult)]
+struct DueScheduleRow {
+    exam_id: String,
+    oj_user_id: i64,
+    connection_id: Option<String>,
+    execution: String,
+    recording: String,
+    start_at: String,
+    end_at: String,
+}
+
+pub(crate) fn build_due_schedule_query() -> sea_orm::sea_query::SelectStatement {
+    let r = runtime::Entity;
+    let en = enrollment::Entity;
+    let e = exam_table::Entity;
+    Query::select()
+        .column((r, runtime::Column::ExamId))
+        .column((r, runtime::Column::OjUserId))
+        .column((r, runtime::Column::ConnectionId))
+        .column((r, runtime::Column::Execution))
+        .column((r, runtime::Column::Recording))
+        .column((e, exam_table::Column::StartAt))
+        .column((e, exam_table::Column::EndAt))
+        .from(r)
+        .join(
+            JoinType::InnerJoin,
+            en,
+            Expr::col((en, enrollment::Column::ExamId))
+                .equals((r, runtime::Column::ExamId))
+                .and(
+                    Expr::col((en, enrollment::Column::OjUserId))
+                        .equals((r, runtime::Column::OjUserId)),
+                ),
+        )
+        .join(
+            JoinType::InnerJoin,
+            e,
+            Expr::col((e, exam_table::Column::ExamId)).equals((r, runtime::Column::ExamId)),
+        )
+        .and_where(Expr::col((r, runtime::Column::Connected)).eq(true))
+        .order_by((r, runtime::Column::ExamId), Order::Asc)
+        .order_by((r, runtime::Column::OjUserId), Order::Asc)
+        .to_owned()
+}
+
 async fn due_commands(
-    tx: &DatabaseTransaction,
+    db: &impl ConnectionTrait,
     now: OffsetDateTime,
-) -> Result<Vec<DirectedCommand>, DomainError> {
+) -> Result<Vec<ScheduledCommand>, DomainError> {
+    let query = build_due_schedule_query();
+    let statement = DbBackend::Sqlite.build(&query);
+    let rows = DueScheduleRow::find_by_statement(statement).all(db).await?;
     let mut commands = Vec::new();
-    for runtime in Runtime::online(tx).await? {
-        let key = runtime.key()?;
-        let exam = match db::enrollment(tx, &key).await {
-            Ok(exam) => exam,
-            Err(DomainError::NotEnrolled) => continue,
-            Err(error) => return Err(error),
+    for row in rows {
+        let exam_id = db::parse_uuid(&row.exam_id)?;
+        db::validate_user(row.oj_user_id)?;
+        let connection_id = row
+            .connection_id
+            .as_deref()
+            .map(db::parse_uuid)
+            .transpose()?;
+        let state = ClientState {
+            execution: db::parse_enum(&row.execution)?,
+            recording: db::parse_enum(&row.recording)?,
         };
-        let (start_at, end_at) = exam.times()?;
-        if let Some(command) = commands::due(runtime.state()?, start_at, end_at, now) {
-            commands.push(DirectedCommand {
-                exam_id: key.exam_id(),
-                oj_user_id: key.user,
+        let start_at = db::parse_time(&row.start_at)?;
+        let end_at = db::parse_time(&row.end_at)?;
+        if let Some(command) = commands::due(state, start_at, end_at, now) {
+            commands.push(ScheduledCommand {
+                exam_id,
+                oj_user_id: row.oj_user_id,
+                connection_id,
+                state,
+                start_at,
+                end_at,
                 command,
             });
         }

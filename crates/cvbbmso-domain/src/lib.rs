@@ -15,7 +15,10 @@ pub use admin::{
     AdminOperation, AdminOutput, AdminService, EventRecord, IncidentRecord, IncidentSource,
     ParticipantRecord, StudentRuntime,
 };
-pub use exam::{ConnectOutcome, DirectedCommand, DisconnectReason, ExamService};
+pub use exam::{
+    BatchOutput, BatchWrite, ConnectOutcome, DirectedCommand, DisconnectReason, ExamService,
+    HeartbeatUpdate, ScheduledCommand,
+};
 
 use std::{borrow::Cow, error::Error, sync::Arc};
 
@@ -68,12 +71,36 @@ impl DomainError {
         db::busy(self)
     }
 
+    /// Returns whether a persistent storage or I/O failure prevented the operation.
+    #[must_use]
+    pub fn is_storage_fault(&self) -> bool {
+        db::storage_fault(self)
+    }
+
+    /// Clones a shared error reference, preserving business variants and wrapping storage causes.
+    #[must_use]
+    pub fn clone_shared(error: &Arc<Self>) -> Self {
+        match error.as_ref() {
+            Self::NotFound => Self::NotFound,
+            Self::NotEnrolled => Self::NotEnrolled,
+            Self::InvalidInput => Self::InvalidInput,
+            Self::Conflict => Self::Conflict,
+            Self::Storage { .. } => Self::Storage {
+                source: Box::new(SharedStorageError(Arc::clone(error))),
+            },
+        }
+    }
+
     fn storage(source: impl Error + Send + Sync + 'static) -> Self {
         Self::Storage {
             source: Box::new(source),
         }
     }
 }
+
+#[derive(Debug, Error)]
+#[error("shared storage failure")]
+struct SharedStorageError(#[source] Arc<DomainError>);
 
 impl From<DbErr> for DomainError {
     fn from(error: DbErr) -> Self {
@@ -83,7 +110,8 @@ impl From<DbErr> for DomainError {
 
 #[derive(Clone)]
 struct Service {
-    database: DatabaseConnection,
+    writer: DatabaseConnection,
+    reader: DatabaseConnection,
     clock: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
 }
 
@@ -92,9 +120,10 @@ impl Service {
         database_url: &str,
         clock: impl Fn() -> OffsetDateTime + Send + Sync + 'static,
     ) -> Result<Self, DomainError> {
-        let database = db::open(database_url).await?;
+        let pools = db::open(database_url).await?;
         Ok(Self {
-            database,
+            writer: pools.writer,
+            reader: pools.reader,
             clock: Arc::new(clock),
         })
     }
