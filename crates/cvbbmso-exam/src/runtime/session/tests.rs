@@ -4,7 +4,7 @@ use cvbbmso_protocol::ClientMessage;
 use tokio::{io::duplex, sync::mpsc, time::timeout};
 use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
 
-use super::{Liveness, drive};
+use super::{Liveness, drive, initial_heartbeat_phase};
 use crate::ExamError;
 
 #[tokio::test(start_paused = true)]
@@ -30,4 +30,15 @@ async fn a_blocked_socket_write_expires_and_closes_the_outbound_queue() {
 
     assert!(matches!(error, ExamError::WebSocket(None)));
     assert!(outbound.is_closed());
+}
+
+#[test]
+fn initial_heartbeat_phase_stays_within_heartbeat_interval() {
+    let heartbeat = Duration::from_secs(5);
+    for sample in [0, 1, 4999, 5000, u64::MAX] {
+        let phase = initial_heartbeat_phase(heartbeat, sample);
+        assert!(phase >= Duration::from_millis(1));
+        assert!(phase <= heartbeat);
+    }
+    assert_eq!(initial_heartbeat_phase(Duration::ZERO, 42), Duration::ZERO);
 }

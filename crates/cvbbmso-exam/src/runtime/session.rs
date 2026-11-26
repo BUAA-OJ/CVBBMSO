@@ -5,7 +5,10 @@
 //! The runtime talks to it through channels; every report carries the
 //! session's generation so the runtime can ignore a connection it replaced.
 
-use std::time::Duration;
+use std::{
+    hash::{BuildHasher, Hasher, RandomState},
+    time::Duration,
+};
 
 use cvbbmso_protocol::{ClientMessage, ServerMessage};
 use futures_util::{SinkExt, StreamExt};
@@ -129,7 +132,9 @@ async fn drive<S: AsyncRead + AsyncWrite + Unpin>(
                                 return Err(ExamError::WebSocket(None));
                             }
                             synced = true;
-                            beat.reset();
+                            let phase = initial_heartbeat_phase(liveness.heartbeat, random_u64());
+                            beat = interval_at(Instant::now() + phase, liveness.heartbeat);
+                            beat.set_missed_tick_behavior(MissedTickBehavior::Delay);
                         } else if !synced && !rejected {
                             return Err(ExamError::WebSocket(None));
                         }
@@ -189,6 +194,19 @@ async fn write_frame<S: AsyncRead + AsyncWrite + Unpin>(
         .await
         .map_err(|_| ExamError::WebSocket(None))?
         .map_err(|error| ExamError::WebSocket(Some(error)))
+}
+
+fn random_u64() -> u64 {
+    RandomState::new().build_hasher().finish()
+}
+
+fn initial_heartbeat_phase(heartbeat: Duration, sample: u64) -> Duration {
+    let millis = u64::try_from(heartbeat.as_millis()).unwrap_or(u64::MAX);
+    if millis <= 1 {
+        return heartbeat;
+    }
+    let offset = (sample % millis).saturating_add(1);
+    Duration::from_millis(offset).min(heartbeat)
 }
 
 #[cfg(test)]
