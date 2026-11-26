@@ -3,9 +3,9 @@ use std::time::Duration;
 use axum::extract::ws::{Message, WebSocket};
 use cvbbmso_domain::DisconnectReason;
 use cvbbmso_protocol::{ClientHello, ClientMessage, ServerMessage};
-use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt, stream::FuturesUnordered};
 use tokio::{
-    sync::{Notify, mpsc, oneshot},
+    sync::{mpsc, oneshot},
     time::{self, Instant},
 };
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, error::ProtocolError};
@@ -69,7 +69,7 @@ async fn session(mut socket: WebSocket, hub: Hub, connection: Connection, timeou
     let write = write_frames(&mut writer, outgoing, closing, timeout);
     let read = async {
         if let Ok(deadline) = admission.await {
-            read_frames(&mut reader, &hub, connection, deadline).await;
+            read_frames(&mut reader, &hub, connection, deadline, timeout).await;
         }
     };
     tokio::pin!(write);
@@ -84,7 +84,7 @@ async fn first_message(
     timeout: Duration,
 ) -> Result<Option<ClientHello>, SocketError> {
     match next_message(reader, Instant::now() + timeout).await {
-        Ok(Some((ClientMessage::Hello(hello), _))) => Ok(Some(hello)),
+        Ok(Some((ClientMessage::Hello(hello), _, _))) => Ok(Some(hello)),
         Ok(None) => Ok(None),
         Err(ReadError::Malformed(reason)) => Err(SocketError::protocol(reason)),
         Ok(Some(_)) => Err(SocketError::hello_required("first message was not hello")),
@@ -97,15 +97,43 @@ pub(super) async fn read_frames(
     hub: &Hub,
     connection: Connection,
     mut deadline: Instant,
+    timeout: Duration,
 ) {
-    let mut buffered: Option<ReceivedMessage> = None;
+    let max_pending = hub.max_per_conn_pending();
+    let mut in_flight: FuturesUnordered<oneshot::Receiver<Option<Instant>>> =
+        FuturesUnordered::new();
+
     let (reason, error) = loop {
-        let incoming = match buffered.take() {
-            Some(incoming) => incoming.before(deadline),
-            None => next_message(reader, deadline).await,
+        // Apply TCP backpressure when this connection has reached its pending reliable message cap.
+        // Do not expire the heartbeat timer while reading is paused for server capacity.
+        if in_flight.len() >= max_pending {
+            match in_flight.next().await {
+                Some(Ok(Some(renewed))) => {
+                    deadline = deadline.max(renewed).max(Instant::now() + timeout);
+                    continue;
+                }
+                Some(_) => return,
+                None => continue,
+            }
+        }
+
+        let incoming = tokio::select! {
+            biased;
+            completed = in_flight.next(), if !in_flight.is_empty() => {
+                match completed {
+                    Some(Ok(Some(renewed))) => {
+                        deadline = deadline.max(renewed);
+                        continue;
+                    }
+                    Some(_) => return,
+                    None => continue,
+                }
+            }
+            incoming = next_message(reader, deadline) => incoming,
         };
-        let (message, received_at) = match incoming {
-            Ok(Some((ClientMessage::Hello(_), _))) => {
+
+        let (message, received_at, bytes) = match incoming {
+            Ok(Some((ClientMessage::Hello(_), _, _))) => {
                 break (
                     DisconnectReason::Closed,
                     Some(SocketError::protocol("repeated hello")),
@@ -122,32 +150,44 @@ pub(super) async fn read_frames(
             Err(ReadError::Timeout) => break (DisconnectReason::HeartbeatTimeout, None),
         };
 
-        let retrying = Notify::new();
-        let write = hub.receive(connection, message, received_at, || retrying.notify_one());
-        tokio::pin!(write);
-        let renewed = tokio::select! {
-            biased;
-            renewed = &mut write => renewed,
-            () = retrying.notified() => {
-                // Keep the next message's receive time so it can be checked
-                // against the deadline returned by the pending write.
+        if matches!(message, ClientMessage::Heartbeat) {
+            let Some(renewed) = hub.heartbeat(connection, received_at).await else {
+                return;
+            };
+            deadline = deadline.max(renewed);
+            continue;
+        }
+
+        let permit = if let Some(permit) = hub.budget().try_acquire(bytes) {
+            permit
+        } else {
+            let acquire = hub.budget().acquire(bytes);
+            tokio::pin!(acquire);
+            loop {
                 tokio::select! {
                     biased;
-                    incoming = read_message(reader) => {
-                        if matches!(incoming.message, Ok(None)) {
-                            break (DisconnectReason::Closed, None);
+                    completed = in_flight.next(), if !in_flight.is_empty() => {
+                        match completed {
+                            Some(Ok(Some(renewed))) => deadline = deadline.max(renewed),
+                            Some(_) => return,
+                            None => {}
                         }
-                        buffered = Some(incoming);
-                        write.await
                     }
-                    renewed = &mut write => renewed,
+                    permit = &mut acquire => {
+                        deadline = deadline.max(Instant::now() + timeout);
+                        break permit;
+                    }
                 }
             }
         };
-        let Some(renewed) = renewed else {
+
+        let Some(completion) = hub
+            .enqueue_reliable(connection, message, received_at, permit)
+            .await
+        else {
             return;
         };
-        deadline = renewed;
+        in_flight.push(completion);
     };
     hub.end(connection, reason, error).await;
 }
@@ -159,16 +199,20 @@ enum ReadError {
 
 struct ReceivedMessage {
     received_at: Instant,
+    bytes: usize,
     message: Result<Option<ClientMessage>, &'static str>,
 }
 
 impl ReceivedMessage {
-    fn before(self, deadline: Instant) -> Result<Option<(ClientMessage, Instant)>, ReadError> {
+    fn before(
+        self,
+        deadline: Instant,
+    ) -> Result<Option<(ClientMessage, Instant, usize)>, ReadError> {
         if self.received_at >= deadline {
             return Err(ReadError::Timeout);
         }
         self.message
-            .map(|message| message.map(|message| (message, self.received_at)))
+            .map(|message| message.map(|message| (message, self.received_at, self.bytes)))
             .map_err(ReadError::Malformed)
     }
 }
@@ -176,7 +220,7 @@ impl ReceivedMessage {
 async fn next_message(
     reader: &mut (impl Stream<Item = Result<Message, axum::Error>> + Unpin),
     deadline: Instant,
-) -> Result<Option<(ClientMessage, Instant)>, ReadError> {
+) -> Result<Option<(ClientMessage, Instant, usize)>, ReadError> {
     time::timeout_at(deadline, read_message(reader))
         .await
         .map_err(|_| ReadError::Timeout)?
@@ -189,10 +233,14 @@ async fn read_message(
     loop {
         let frame = reader.next().await;
         let received_at = Instant::now();
+        let mut bytes = 0usize;
         let message = match frame {
-            Some(Ok(Message::Text(text))) => serde_json::from_str(&text)
-                .map(Some)
-                .map_err(|_| "invalid JSON message"),
+            Some(Ok(Message::Text(text))) => {
+                bytes = text.len();
+                serde_json::from_str(&text)
+                    .map(Some)
+                    .map_err(|_| "invalid JSON message")
+            }
             Some(Ok(Message::Binary(_))) => Err("binary frame received"),
             Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
                 // A stream of ready control frames must still yield to the read timeout.
@@ -204,6 +252,7 @@ async fn read_message(
         };
         return ReceivedMessage {
             received_at,
+            bytes,
             message,
         };
     }

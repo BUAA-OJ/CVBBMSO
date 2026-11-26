@@ -84,6 +84,7 @@ struct Fixture {
     tasks: Vec<JoinHandle<()>>,
     clients: mpsc::UnboundedSender<DuplexStream>,
     write_retries: Arc<tokio::sync::Notify>,
+    batch_waiting: Arc<tokio::sync::Notify>,
 }
 
 impl Fixture {
@@ -132,6 +133,7 @@ impl Fixture {
             .unwrap();
         let (hub, manager) = Manager::new(Arc::clone(&exam), TIMEOUT);
         let write_retries = Arc::clone(&manager.write_retries);
+        let batch_waiting = Arc::clone(&manager.batch_waiting);
         let state = AppState {
             exam,
             verifier: Arc::new(IdentityVerifier::Test(Box::new(|cookies| {
@@ -152,6 +154,8 @@ impl Fixture {
                 };
                 Ok(AccodingUser::new(id, format!("student{id}"), "Student".into()).unwrap())
             }))),
+            auth_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            auth_wait_timeout: Duration::from_secs(5),
             hub,
             timeout: TIMEOUT,
         };
@@ -173,6 +177,7 @@ impl Fixture {
             tasks,
             clients,
             write_retries,
+            batch_waiting,
         }
     }
 
@@ -202,8 +207,16 @@ impl Fixture {
         router(self.state.clone()).oneshot(request).await.unwrap()
     }
 
-    async fn admin(&self, operation: AdminOperation) -> AdminOutput {
+    async fn direct_admin(&self, operation: AdminOperation) -> AdminOutput {
         self.admin.execute("staff".into(), operation).await.unwrap()
+    }
+
+    async fn admin(&self, operation: AdminOperation) -> AdminOutput {
+        self.state
+            .hub
+            .admin("staff".into(), operation)
+            .await
+            .unwrap()
     }
 }
 
@@ -543,7 +556,6 @@ async fn revoking_enrollment_rejects_events_on_the_existing_socket() {
             oj_user_id: STUDENT,
         })
         .await;
-    send(&mut socket, &navigation(2, "after")).await;
     socket_error(&mut socket, error_code::NOT_ENROLLED).await;
 
     fixture
@@ -559,15 +571,17 @@ async fn revoking_enrollment_rejects_events_on_the_existing_socket() {
             oj_user_id: STUDENT,
         })
         .await;
+    socket_error(&mut socket, error_code::NOT_ENROLLED).await;
     fixture
         .admin(AdminOperation::ParticipantsAdd {
             exam_id: fixture.exam_id,
             oj_user_id: STUDENT,
         })
         .await;
+    let mut socket = open_socket(&fixture, &state, 1).await;
     send(&mut socket, &navigation(2, "after re-enrolling")).await;
-    socket_error(&mut socket, error_code::NOT_ENROLLED).await;
-    assert_eq!(events(&fixture).await.len(), 1);
+    close_socket(&fixture, &mut socket).await;
+    assert_eq!(events(&fixture).await.len(), 2);
 }
 
 #[tokio::test]
@@ -602,12 +616,14 @@ async fn sqlite_contention_keeps_a_second_socket_open() {
     close_socket(&fixture, &mut first).await;
 
     send(&mut other, &ClientMessage::Heartbeat).await;
+    send(&mut other, &navigation(1, "during lock")).await;
     timeout(TIMEOUT, fixture.write_retries.notified())
         .await
         .unwrap();
-    send(&mut other, &navigation(1, "during lock")).await;
     lock.rollback().await.unwrap();
 
+    // Wait for the retried seq=1 event to commit before pipelining seq=2 and closing.
+    tokio::time::sleep(Duration::from_millis(80)).await;
     send(&mut other, &navigation(2, "after unlock")).await;
     close_socket(&fixture, &mut other).await;
     let stored = fixture
@@ -653,7 +669,12 @@ async fn closing_during_sqlite_contention_discards_the_blocked_event() {
             tokio::task::yield_now().await;
         }
     });
+    let batch_waiting = fixture.batch_waiting.notified();
+    tokio::pin!(batch_waiting);
+    batch_waiting.as_mut().enable();
     send(&mut first, &navigation(1, "abandoned event")).await;
+    timeout(TIMEOUT, batch_waiting).await.unwrap();
+    time::advance(Duration::from_millis(55)).await;
     timeout(TIMEOUT, fixture.write_retries.notified())
         .await
         .unwrap();
@@ -1069,6 +1090,7 @@ async fn occupied_port_preserves_the_existing_exam_connection() {
         listen_addr: listener.local_addr().unwrap(),
         database_url: fixture.database_url.clone(),
         heartbeat_timeout_secs: TIMEOUT.as_secs(),
+        tuning: crate::ServerTuning::default(),
     })
     .await;
     assert!(
@@ -1487,6 +1509,9 @@ async fn heartbeat_renews_the_exact_deadline_and_timeout_is_recorded_once() {
         .unwrap();
     let hub = fixture.state.hub.clone();
     let connection = peer.connection;
+    let batch_waiting = fixture.batch_waiting.notified();
+    tokio::pin!(batch_waiting);
+    batch_waiting.as_mut().enable();
     let pending = tokio::spawn(async move {
         hub.receive(
             connection,
@@ -1496,6 +1521,8 @@ async fn heartbeat_renews_the_exact_deadline_and_timeout_is_recorded_once() {
         )
         .await
     });
+    batch_waiting.await;
+    time::advance(Duration::from_millis(55)).await;
     fixture.write_retries.notified().await;
     time::advance(received_at + TIMEOUT - Instant::now()).await;
     tokio::select! {
@@ -1534,7 +1561,7 @@ async fn recovers_online_state_after_restart_and_reissues_pending_command() {
         .unwrap();
     exam.recover_online().await.unwrap();
     let AdminOutput::Student(runtime) = fixture
-        .admin(AdminOperation::StudentsShow {
+        .direct_admin(AdminOperation::StudentsShow {
             exam_id: fixture.exam_id,
             oj_user_id: STUDENT,
         })
@@ -1543,7 +1570,18 @@ async fn recovers_online_state_after_restart_and_reissues_pending_command() {
         panic!("expected student");
     };
     assert!(!runtime.connected);
-    let incidents_before_connect = incidents(&fixture).await;
+    let AdminOutput::Incidents(incidents_before_connect) = fixture
+        .direct_admin(AdminOperation::IncidentsList {
+            exam_id: fixture.exam_id,
+            oj_user_id: Some(STUDENT),
+            kind: None,
+            since: None,
+            until: None,
+        })
+        .await
+    else {
+        panic!("expected incidents");
+    };
     assert_eq!(incidents_before_connect.len(), 1);
     assert_eq!(incidents_before_connect[0].kind, "connection_lost");
     assert_eq!(
@@ -1618,4 +1656,268 @@ async fn request_logs_include_metadata_and_keep_cookie_values_private() {
             && log["span"]["oj_user_id"] == STUDENT
             && log["span"]["request_id"].as_str().is_some()
     }));
+}
+
+#[tokio::test]
+async fn heartbeat_writeback_cache_overlays_live_state_and_flushes_to_db() {
+    let fixture = Fixture::new().await;
+    let state = hello(ExecutionState::Ready, RecordingState::Idle);
+    // Keep exam in Scheduled phase during trigger_schedule so no StartExam frame
+    // races with close_socket's Close frame.
+    fixture.clock.store(START - 5, Ordering::Relaxed);
+    let mut socket = open_socket(&fixture, &state, 0).await;
+
+    fixture.clock.store(START - 3, Ordering::Relaxed);
+    send(&mut socket, &ClientMessage::Heartbeat).await;
+    // Wait until Hub has processed the heartbeat into live state.
+    let mut live = None;
+    for _ in 0..50 {
+        let AdminOutput::Student(student) = fixture
+            .admin(AdminOperation::StudentsShow {
+                exam_id: fixture.exam_id,
+                oj_user_id: STUDENT,
+            })
+            .await
+        else {
+            panic!("expected student");
+        };
+        if student.last_seen_at == Some(instant(START - 3)) {
+            live = Some(student);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let live = live.expect("heartbeat should be visible in live Hub state");
+    assert!(live.connected);
+
+    // Direct DB query only sees it after schedule tick flushes the write-back cache.
+    let AdminOutput::Student(before_flush) = fixture
+        .direct_admin(AdminOperation::StudentsShow {
+            exam_id: fixture.exam_id,
+            oj_user_id: STUDENT,
+        })
+        .await
+    else {
+        panic!("expected student");
+    };
+    assert_eq!(before_flush.last_seen_at, Some(instant(START - 5)));
+
+    fixture.state.hub.trigger_schedule().await;
+    let AdminOutput::Student(after_flush) = fixture
+        .direct_admin(AdminOperation::StudentsShow {
+            exam_id: fixture.exam_id,
+            oj_user_id: STUDENT,
+        })
+        .await
+    else {
+        panic!("expected student");
+    };
+    assert_eq!(after_flush.last_seen_at, Some(instant(START - 3)));
+
+    // A newer heartbeat not yet flushed is merged into Disconnect on close.
+    fixture.clock.store(START - 2, Ordering::Relaxed);
+    send(&mut socket, &ClientMessage::Heartbeat).await;
+    for _ in 0..50 {
+        let AdminOutput::Student(student) = fixture
+            .admin(AdminOperation::StudentsShow {
+                exam_id: fixture.exam_id,
+                oj_user_id: STUDENT,
+            })
+            .await
+        else {
+            panic!("expected student");
+        };
+        if student.last_seen_at == Some(instant(START - 2)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    close_socket(&fixture, &mut socket).await;
+
+    let AdminOutput::Student(after_close) = fixture
+        .direct_admin(AdminOperation::StudentsShow {
+            exam_id: fixture.exam_id,
+            oj_user_id: STUDENT,
+        })
+        .await
+    else {
+        panic!("expected student");
+    };
+    assert!(!after_close.connected);
+    assert_eq!(after_close.last_seen_at, Some(instant(START - 2)));
+}
+
+#[tokio::test]
+async fn group_commit_batches_concurrent_students() {
+    let fixture = Fixture::new().await;
+    fixture
+        .admin(AdminOperation::ParticipantsAdd {
+            exam_id: fixture.exam_id,
+            oj_user_id: OTHER_STUDENT,
+        })
+        .await;
+    let state = hello(ExecutionState::Ready, RecordingState::Idle);
+    let mut first = open_socket(&fixture, &state, 0).await;
+    let mut second = fixture
+        .upgrade(&fixture.path(), "connect.sid=other")
+        .await
+        .unwrap();
+    send(&mut second, &state).await;
+    assert!(matches!(
+        message(&mut second).await,
+        ServerMessage::Sync { .. }
+    ));
+
+    // Send reliable events concurrently from two students so they group-commit together.
+    send(&mut first, &navigation(1, "student 1")).await;
+    send(&mut second, &navigation(1, "student 2")).await;
+    close_socket(&fixture, &mut first).await;
+    close_socket(&fixture, &mut second).await;
+
+    assert_eq!(events(&fixture).await.len(), 1);
+    let AdminOutput::Events(other_events) = fixture
+        .admin(AdminOperation::EventsList {
+            exam_id: fixture.exam_id,
+            oj_user_id: OTHER_STUDENT,
+        })
+        .await
+    else {
+        panic!("expected events");
+    };
+    assert_eq!(other_events.len(), 1);
+}
+
+#[tokio::test]
+async fn graceful_shutdown_flushes_heartbeats_and_disconnects() {
+    let fixture = Fixture::new().await;
+    let state = hello(ExecutionState::Ready, RecordingState::Idle);
+    let mut socket = open_socket(&fixture, &state, 0).await;
+    fixture.clock.store(START + 15, Ordering::Relaxed);
+    send(&mut socket, &ClientMessage::Heartbeat).await;
+    for _ in 0..50 {
+        let AdminOutput::Student(student) = fixture
+            .admin(AdminOperation::StudentsShow {
+                exam_id: fixture.exam_id,
+                oj_user_id: STUDENT,
+            })
+            .await
+        else {
+            panic!("expected student");
+        };
+        if student.last_seen_at == Some(instant(START + 15)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    fixture.state.hub.shutdown().await;
+    let reopened = AdminService::open(&fixture.database_url).await.unwrap();
+    let AdminOutput::Student(runtime) = reopened
+        .execute(
+            "staff".into(),
+            AdminOperation::StudentsShow {
+                exam_id: fixture.exam_id,
+                oj_user_id: STUDENT,
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected student");
+    };
+    assert!(!runtime.connected);
+    assert_eq!(runtime.last_seen_at, Some(instant(START + 15)));
+}
+
+#[tokio::test]
+async fn write_budget_tracks_pending_payload_bytes() {
+    use crate::writer::WriteBudget;
+
+    let budget = WriteBudget::new(2, 100);
+    assert_eq!(budget.snapshot(), (0, 0));
+    let p1 = budget.try_acquire(60).unwrap();
+    assert_eq!(budget.snapshot(), (1, 60));
+    assert!(budget.try_acquire(50).is_none());
+    let p2 = budget.try_acquire(40).unwrap();
+    assert_eq!(budget.snapshot(), (2, 100));
+    assert!(budget.try_acquire(1).is_none());
+    drop(p1);
+    assert_eq!(budget.snapshot(), (1, 40));
+    drop(p2);
+    assert_eq!(budget.snapshot(), (0, 0));
+}
+
+#[tokio::test]
+async fn bounded_auth_concurrency_returns_service_unavailable_on_timeout() {
+    let mut fixture = Fixture::new().await;
+    fixture.state.auth_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    fixture.state.auth_wait_timeout = Duration::from_millis(20);
+    // Hold the single auth permit so incoming requests time out waiting.
+    let _held = fixture.state.auth_semaphore.acquire().await.unwrap();
+    let response = fixture
+        .request(
+            Request::get("/api/exams")
+                .header(header::COOKIE, COOKIE)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body(response).await["error"]["code"],
+        error_code::ACCODING_UNAVAILABLE
+    );
+}
+
+#[tokio::test]
+async fn independent_scheduler_task_dispatches_due_commands_over_read_pool() {
+    let mut fixture = Fixture::new().await;
+    let state = hello(ExecutionState::Ready, RecordingState::Idle);
+    let mut socket = open_socket(&fixture, &state, 0).await;
+
+    let scheduler = tokio::spawn(fixture.state.hub.clone().schedule());
+    fixture.tasks.push(scheduler);
+
+    fixture.clock.store(START, Ordering::Relaxed);
+    let start_id = tokio::time::timeout(
+        Duration::from_secs(5),
+        command(&mut socket, CommandName::StartExam, START),
+    )
+    .await
+    .unwrap();
+    confirm(&mut socket, start_id).await;
+    close_socket(&fixture, &mut socket).await;
+}
+
+#[tokio::test]
+async fn heartbeat_cache_ignores_stale_generation_after_replacement() {
+    let fixture = Fixture::new().await;
+    let first_hello = hello(ExecutionState::Ready, RecordingState::Idle);
+    let mut old_socket = open_socket(&fixture, &first_hello, 0).await;
+
+    fixture.clock.store(START - 4, Ordering::Relaxed);
+    send(&mut old_socket, &ClientMessage::Heartbeat).await;
+
+    // Replace with a newer connection at START - 2.
+    fixture.clock.store(START - 2, Ordering::Relaxed);
+    let second_hello = hello(ExecutionState::Ready, RecordingState::Idle);
+    let mut new_socket = open_socket(&fixture, &second_hello, 0).await;
+    assert!(matches!(
+        old_socket.next().await,
+        Some(Ok(Message::Close(_))) | None
+    ));
+
+    fixture.state.hub.trigger_schedule().await;
+    let AdminOutput::Student(runtime) = fixture
+        .direct_admin(AdminOperation::StudentsShow {
+            exam_id: fixture.exam_id,
+            oj_user_id: STUDENT,
+        })
+        .await
+    else {
+        panic!("expected student");
+    };
+    assert!(runtime.connected);
+    assert_eq!(runtime.last_seen_at, Some(instant(START - 2)));
+    close_socket(&fixture, &mut new_socket).await;
 }
