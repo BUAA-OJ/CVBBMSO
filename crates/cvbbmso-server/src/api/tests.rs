@@ -1924,3 +1924,39 @@ async fn heartbeat_cache_ignores_stale_generation_after_replacement() {
     assert_eq!(runtime.last_seen_at, Some(instant(START - 2)));
     close_socket(&fixture, &mut new_socket).await;
 }
+
+#[tokio::test]
+async fn failed_participant_removal_preserves_existing_websocket_session() {
+    let fixture = Fixture::new().await;
+    let state = hello(ExecutionState::Ready, RecordingState::Idle);
+    let mut socket = open_socket(&fixture, &state, 0).await;
+
+    // Advance past START so ParticipantsRemove returns Conflict (409).
+    fixture.clock.store(START, Ordering::Relaxed);
+    let remove = fixture.state.hub.admin(
+        "control_panel".into(),
+        AdminOperation::ParticipantsRemove {
+            exam_id: fixture.exam_id,
+            oj_user_id: STUDENT,
+        },
+    );
+    tokio::pin!(remove);
+
+    // Send a heartbeat while the removal barrier may be active, then wait for removal failure.
+    send(&mut socket, &ClientMessage::Heartbeat).await;
+    let result = remove.await;
+    assert!(matches!(result, Err(DomainError::Conflict)));
+
+    // Existing socket must still read subsequent heartbeats and events.
+    send(&mut socket, &ClientMessage::Heartbeat).await;
+    send(&mut socket, &navigation(1, "still-alive")).await;
+    close_socket(&fixture, &mut socket).await;
+    assert_eq!(
+        events(&fixture)
+            .await
+            .iter()
+            .map(|row| row.seq)
+            .collect::<Vec<_>>(),
+        [1]
+    );
+}

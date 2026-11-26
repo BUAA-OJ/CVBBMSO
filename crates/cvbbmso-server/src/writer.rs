@@ -133,6 +133,7 @@ pub(crate) enum WriterRequest {
         batch_id: Uuid,
         updates: Vec<HeartbeatUpdate>,
     },
+    StorageProbe,
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -250,6 +251,7 @@ impl DatabaseWriter {
                 batch.ops,
                 batch.heartbeat_batches,
                 batch.heartbeats,
+                batch.probe,
             )
             .await;
             if let Some(done) = batch.shutdown {
@@ -298,8 +300,17 @@ impl DatabaseWriter {
         ops: Vec<BatchWrite>,
         heartbeat_batches: Vec<Uuid>,
         heartbeats: Vec<HeartbeatUpdate>,
+        probe: bool,
     ) {
         if ops.is_empty() && heartbeats.is_empty() {
+            if probe {
+                let batch_error = self.exam.probe_storage().await.err().map(Arc::new);
+                let _ = self.completions.send(WriteCompletion::Batch {
+                    ops: Vec::new(),
+                    heartbeat_batches: Vec::new(),
+                    batch_error,
+                });
+            }
             return;
         }
         let op_count = ops.len();
@@ -348,6 +359,7 @@ struct PendingBatch {
     ops: Vec<BatchWrite>,
     heartbeat_batches: Vec<Uuid>,
     heartbeats: Vec<HeartbeatUpdate>,
+    probe: bool,
     immediate: bool,
     shutdown: Option<oneshot::Sender<()>>,
 }
@@ -369,6 +381,10 @@ impl PendingBatch {
             WriterRequest::Heartbeats { batch_id, updates } => {
                 self.heartbeat_batches.push(batch_id);
                 self.heartbeats.extend(updates);
+                self.immediate = true;
+            }
+            WriterRequest::StorageProbe => {
+                self.probe = true;
                 self.immediate = true;
             }
             WriterRequest::Shutdown(done) => {

@@ -82,10 +82,16 @@ pub(crate) struct Peer {
     pub(crate) admitted: oneshot::Sender<Instant>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionAck {
+    Deadline(Instant),
+    Paused,
+}
+
 struct HeartbeatMsg {
     connection: Connection,
     received_at: Instant,
-    ack: oneshot::Sender<Option<Instant>>,
+    ack: oneshot::Sender<SessionAck>,
 }
 
 enum Request {
@@ -99,7 +105,12 @@ enum Request {
         message: ClientMessage,
         received_at: Instant,
         permit: WritePermit,
-        processed: oneshot::Sender<Option<Instant>>,
+        processed: oneshot::Sender<SessionAck>,
+    },
+    Backpressure {
+        connection: Connection,
+        paused: bool,
+        ack: oneshot::Sender<SessionAck>,
     },
     End {
         connection: Connection,
@@ -150,7 +161,7 @@ impl Hub {
         &self,
         connection: Connection,
         received_at: Instant,
-    ) -> Option<Instant> {
+    ) -> Option<SessionAck> {
         let (ack, done) = oneshot::channel();
         self.heartbeats
             .send(HeartbeatMsg {
@@ -160,7 +171,33 @@ impl Hub {
             })
             .await
             .ok()?;
-        done.await.ok().flatten()
+        done.await.ok()
+    }
+
+    pub(crate) async fn pause_heartbeat(&self, connection: Connection) -> Option<SessionAck> {
+        let (ack, done) = oneshot::channel();
+        self.requests
+            .send(Request::Backpressure {
+                connection,
+                paused: true,
+                ack,
+            })
+            .await
+            .ok()?;
+        done.await.ok()
+    }
+
+    pub(crate) async fn resume_heartbeat(&self, connection: Connection) -> Option<SessionAck> {
+        let (ack, done) = oneshot::channel();
+        self.requests
+            .send(Request::Backpressure {
+                connection,
+                paused: false,
+                ack,
+            })
+            .await
+            .ok()?;
+        done.await.ok()
     }
 
     pub(crate) async fn enqueue_reliable(
@@ -169,7 +206,7 @@ impl Hub {
         message: ClientMessage,
         received_at: Instant,
         permit: WritePermit,
-    ) -> Option<oneshot::Receiver<Option<Instant>>> {
+    ) -> Option<oneshot::Receiver<SessionAck>> {
         let (processed, completion) = oneshot::channel();
         self.requests
             .send(Request::Reliable {
@@ -193,14 +230,20 @@ impl Hub {
         _on_retry: impl FnOnce(),
     ) -> Option<Instant> {
         if matches!(message, ClientMessage::Heartbeat) {
-            return self.heartbeat(connection, received_at).await;
+            return match self.heartbeat(connection, received_at).await? {
+                SessionAck::Deadline(deadline) => Some(deadline),
+                SessionAck::Paused => None,
+            };
         }
         let payload_bytes = serde_json::to_vec(&message).map_or(256, |v| v.len());
         let permit = self.budget.acquire(payload_bytes).await;
         let completion = self
             .enqueue_reliable(connection, message, received_at, permit)
             .await?;
-        completion.await.ok().flatten()
+        match completion.await.ok()? {
+            SessionAck::Deadline(deadline) => Some(deadline),
+            SessionAck::Paused => None,
+        }
     }
 
     pub(crate) async fn end(
@@ -291,6 +334,7 @@ impl Hub {
 struct Current {
     connection: Connection,
     deadline: Instant,
+    backpressure_paused: bool,
     frames: mpsc::Sender<ServerMessage>,
     close: oneshot::Sender<Option<SocketError>>,
     state: ClientState,
@@ -427,7 +471,7 @@ enum PendingOp {
         received_at: OffsetDateTime,
         attempt: u8,
         permit: WritePermit,
-        processed: oneshot::Sender<Option<Instant>>,
+        processed: oneshot::Sender<SessionAck>,
     },
     AdminRemove {
         actor: String,
@@ -479,7 +523,7 @@ enum InFlightKind {
         received_at: OffsetDateTime,
         attempt: u8,
         permit: WritePermit,
-        processed: oneshot::Sender<Option<Instant>>,
+        processed: oneshot::Sender<SessionAck>,
     },
     AdminRemove {
         reply: oneshot::Sender<Result<AdminOutput, DomainError>>,
@@ -498,7 +542,7 @@ struct WaitingRetry {
     received_at: OffsetDateTime,
     attempt: u8,
     permit: WritePermit,
-    processed: oneshot::Sender<Option<Instant>>,
+    processed: oneshot::Sender<SessionAck>,
 }
 
 #[derive(Default)]
@@ -542,6 +586,13 @@ struct StandaloneOp {
     kind: StandaloneKind,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageHealth {
+    Healthy,
+    Faulted,
+    Probing,
+}
+
 pub(crate) struct Manager {
     exam: Arc<ExamService>,
     config: HubConfig,
@@ -564,7 +615,7 @@ pub(crate) struct Manager {
     admin_queries_done_tx: mpsc::UnboundedSender<()>,
     admin_queries_done_rx: mpsc::UnboundedReceiver<()>,
     in_flight_admin_queries: usize,
-    storage_fault: bool,
+    storage: StorageHealth,
     shutting_down: bool,
     shutdown_waiters: Vec<oneshot::Sender<()>>,
     #[cfg(test)]
@@ -573,6 +624,8 @@ pub(crate) struct Manager {
     pub(crate) write_retries: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     pub(crate) batch_waiting: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    pub(crate) storage_recovered: Arc<tokio::sync::Notify>,
 }
 
 struct ReadCheckCompletion {
@@ -580,7 +633,7 @@ struct ReadCheckCompletion {
     command_id: Uuid,
     result: Result<(), DomainError>,
     permit: WritePermit,
-    processed: oneshot::Sender<Option<Instant>>,
+    processed: oneshot::Sender<SessionAck>,
 }
 
 impl Manager {
@@ -635,7 +688,7 @@ impl Manager {
             admin_queries_done_tx,
             admin_queries_done_rx,
             in_flight_admin_queries: 0,
-            storage_fault: false,
+            storage: StorageHealth::Healthy,
             shutting_down: false,
             shutdown_waiters: Vec::new(),
             #[cfg(test)]
@@ -644,6 +697,8 @@ impl Manager {
             write_retries: Arc::default(),
             #[cfg(test)]
             batch_waiting,
+            #[cfg(test)]
+            storage_recovered: Arc::default(),
         };
         (hub, manager)
     }
@@ -715,6 +770,11 @@ impl Manager {
                 permit,
                 processed,
             } => self.handle_reliable(connection, message, received_at, permit, processed),
+            Request::Backpressure {
+                connection,
+                paused,
+                ack,
+            } => self.handle_backpressure(connection, paused, ack),
             Request::End {
                 connection,
                 reason,
@@ -725,6 +785,12 @@ impl Manager {
             Request::ScheduleTick => {
                 self.retry_lost();
                 self.flush_heartbeats();
+                if self.storage == StorageHealth::Faulted
+                    && !self.shutting_down
+                    && self.writer.try_send(WriterRequest::StorageProbe).is_ok()
+                {
+                    self.storage = StorageHealth::Probing;
+                }
             }
             Request::Shutdown(done) => {
                 self.shutdown_waiters.push(done);
@@ -737,6 +803,39 @@ impl Manager {
         }
     }
 
+    fn handle_backpressure(
+        &mut self,
+        connection: Connection,
+        paused: bool,
+        ack: oneshot::Sender<SessionAck>,
+    ) {
+        if self.shutting_down {
+            return;
+        }
+        let Some(slot) = self.students.get_mut(&connection.student) else {
+            return;
+        };
+        if slot.closing {
+            return;
+        }
+        let Some(current) = slot.current.as_mut() else {
+            return;
+        };
+        if current.connection.id != connection.id {
+            return;
+        }
+        if paused {
+            current.backpressure_paused = true;
+            let _ = ack.send(SessionAck::Paused);
+        } else {
+            current.backpressure_paused = false;
+            current.deadline = current
+                .deadline
+                .max(Instant::now() + self.config.heartbeat_timeout);
+            let _ = ack.send(SessionAck::Deadline(current.deadline));
+        }
+    }
+
     fn handle_heartbeat(&mut self, msg: HeartbeatMsg) {
         if self.shutting_down {
             return;
@@ -745,7 +844,11 @@ impl Manager {
         let Some(slot) = self.students.get_mut(&student) else {
             return;
         };
-        if slot.barrier || slot.closing {
+        if slot.closing {
+            return;
+        }
+        if slot.barrier {
+            let _ = msg.ack.send(SessionAck::Paused);
             return;
         }
         let Some(current) = slot.current.as_mut() else {
@@ -764,11 +867,11 @@ impl Manager {
         let deadline = current.deadline;
         self.heartbeats
             .record(student, msg.connection.id, self.exam.now());
-        let _ = msg.ack.send(Some(deadline));
+        let _ = msg.ack.send(SessionAck::Deadline(deadline));
     }
 
     fn handle_connect(&mut self, connection: Connection, hello: ClientHello, peer: Peer) {
-        if self.shutting_down || self.storage_fault {
+        if self.shutting_down || self.storage != StorageHealth::Healthy {
             let _ = peer.close.send(Some(SocketError::INTERNAL_ERROR));
             return;
         }
@@ -792,7 +895,7 @@ impl Manager {
         message: ClientMessage,
         received_at: Instant,
         permit: WritePermit,
-        processed: oneshot::Sender<Option<Instant>>,
+        processed: oneshot::Sender<SessionAck>,
     ) {
         if self.shutting_down {
             return;
@@ -801,7 +904,7 @@ impl Manager {
         let Some(slot) = self.students.get_mut(&student) else {
             return;
         };
-        if slot.barrier || slot.closing {
+        if slot.closing {
             return;
         }
         let no_queued_work = !slot.is_busy() && slot.pending.is_empty();
@@ -898,7 +1001,11 @@ impl Manager {
         let Some(slot) = self.students.get_mut(&student) else {
             return;
         };
-        if slot.barrier || slot.closing {
+        if slot.closing {
+            return;
+        }
+        if slot.barrier {
+            let _ = check.processed.send(SessionAck::Paused);
             return;
         }
         let Some(current) = slot.current.as_mut() else {
@@ -916,7 +1023,7 @@ impl Manager {
                     self.begin_end(check.connection, DisconnectReason::Closed, None);
                     return;
                 }
-                let _ = check.processed.send(Some(current.deadline));
+                let _ = check.processed.send(SessionAck::Deadline(current.deadline));
             }
             Err(error) => {
                 self.begin_end(
@@ -946,10 +1053,9 @@ impl Manager {
             return;
         }
         if matches!(reason, DisconnectReason::HeartbeatTimeout)
-            && slot
-                .current
-                .as_ref()
-                .is_some_and(|current| Instant::now() < current.deadline)
+            && slot.current.as_ref().is_some_and(|current| {
+                current.backpressure_paused || Instant::now() < current.deadline
+            })
         {
             return;
         }
@@ -1510,14 +1616,14 @@ impl Manager {
         received_at: OffsetDateTime,
         attempt: u8,
         permit: WritePermit,
-        processed: oneshot::Sender<Option<Instant>>,
+        processed: oneshot::Sender<SessionAck>,
     ) -> Option<(WritePriority, BatchWrite, InFlightOp)> {
         let slot = self.students.get_mut(&student)?;
         let current = slot.current.as_mut()?;
         if current.connection.id != connection.id {
             return None;
         }
-        if Instant::now() >= current.deadline {
+        if !current.backpressure_paused && Instant::now() >= current.deadline {
             self.begin_end(connection, DisconnectReason::HeartbeatTimeout, None);
             return None;
         }
@@ -1677,20 +1783,28 @@ impl Manager {
         } = completion;
 
         if let Some(error) = &batch_error {
-            if error.is_storage_fault() && !self.storage_fault {
-                self.storage_fault = true;
-                tracing::error!(
-                    reason = %error.diagnostic(),
-                    "persistent SQLite storage failure detected; pausing new admissions"
-                );
+            if error.is_storage_fault() {
+                if self.storage == StorageHealth::Healthy {
+                    tracing::error!(
+                        reason = %error.diagnostic(),
+                        "persistent SQLite storage failure detected; pausing new admissions"
+                    );
+                }
+                self.storage = StorageHealth::Faulted;
             }
-        } else if self.storage_fault {
-            self.storage_fault = false;
+        } else if self.storage != StorageHealth::Healthy {
+            self.storage = StorageHealth::Healthy;
+            #[cfg(test)]
+            self.storage_recovered.notify_waiters();
             tracing::info!("SQLite storage recovered; resuming admissions");
         }
 
-        if let Some((active_id, mut flushed)) = self.heartbeats.in_flight.take()
-            && heartbeat_batches.contains(&active_id)
+        if self
+            .heartbeats
+            .in_flight
+            .as_ref()
+            .is_some_and(|(active_id, _)| heartbeat_batches.contains(active_id))
+            && let Some((_, mut flushed)) = self.heartbeats.in_flight.take()
             && let Some(error) = &batch_error
         {
             tracing::warn!(
@@ -1806,6 +1920,8 @@ impl Manager {
                         if let Some(current) = slot.current.take() {
                             let _ = current.close.send(Some(SocketError::not_enrolled()));
                         }
+                    } else {
+                        self.mark_ready(student);
                     }
                 }
                 let result = match (batch_error, outcome) {
@@ -1879,6 +1995,7 @@ impl Manager {
         let mut current = Current {
             connection,
             deadline,
+            backpressure_paused: false,
             frames: peer.frames,
             close: peer.close,
             state: requested_state,
@@ -1994,7 +2111,7 @@ impl Manager {
         received_at: OffsetDateTime,
         attempt: u8,
         permit: WritePermit,
-        processed: oneshot::Sender<Option<Instant>>,
+        processed: oneshot::Sender<SessionAck>,
         outcome: Option<Result<BatchOutput, DomainError>>,
         batch_error: Option<&Arc<DomainError>>,
     ) {
@@ -2027,7 +2144,7 @@ impl Manager {
         match outcome {
             Some(Ok(BatchOutput::Ack)) => {
                 if let Some(state_changed) = apply_reliable_ack(current, op) {
-                    let _ = processed.send(Some(current.deadline));
+                    let _ = processed.send(SessionAck::Deadline(current.deadline));
                     if state_changed
                         && slot.schedule_dirty
                         && !has_state_work
@@ -2076,7 +2193,7 @@ impl Manager {
         received_at: OffsetDateTime,
         attempt: u8,
         permit: WritePermit,
-        processed: oneshot::Sender<Option<Instant>>,
+        processed: oneshot::Sender<SessionAck>,
         error: &DomainError,
     ) {
         let Some(slot) = self.students.get_mut(&student) else {
@@ -2087,7 +2204,7 @@ impl Manager {
         };
         if error.is_storage_busy() && !slot.closing && !self.shutting_down {
             let now = Instant::now();
-            if now >= current.deadline {
+            if !current.backpressure_paused && now >= current.deadline {
                 self.begin_end(connection, DisconnectReason::HeartbeatTimeout, None);
                 return;
             }
@@ -2141,7 +2258,7 @@ impl Manager {
             if current.connection.id != waiting.connection.id {
                 continue;
             }
-            if now >= current.deadline {
+            if !current.backpressure_paused && now >= current.deadline {
                 self.begin_end(waiting.connection, DisconnectReason::HeartbeatTimeout, None);
                 continue;
             }

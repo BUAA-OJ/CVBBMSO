@@ -12,7 +12,7 @@ use tokio_tungstenite::tungstenite::{Error as WebSocketError, error::ProtocolErr
 use tracing::Instrument;
 use uuid::Uuid;
 
-use crate::hub::{Connection, Hub, OUTBOUND_CAPACITY, Peer, SocketError, StudentKey};
+use crate::hub::{Connection, Hub, OUTBOUND_CAPACITY, Peer, SessionAck, SocketError, StudentKey};
 
 pub(crate) async fn run(
     socket: WebSocket,
@@ -69,7 +69,7 @@ async fn session(mut socket: WebSocket, hub: Hub, connection: Connection, timeou
     let write = write_frames(&mut writer, outgoing, closing, timeout);
     let read = async {
         if let Ok(deadline) = admission.await {
-            read_frames(&mut reader, &hub, connection, deadline, timeout).await;
+            read_frames(&mut reader, &hub, connection, deadline).await;
         }
     };
     tokio::pin!(write);
@@ -97,36 +97,45 @@ pub(super) async fn read_frames(
     hub: &Hub,
     connection: Connection,
     mut deadline: Instant,
-    timeout: Duration,
 ) {
     let max_pending = hub.max_per_conn_pending();
-    let mut in_flight: FuturesUnordered<oneshot::Receiver<Option<Instant>>> =
-        FuturesUnordered::new();
+    let mut in_flight: FuturesUnordered<oneshot::Receiver<SessionAck>> = FuturesUnordered::new();
 
     let (reason, error) = loop {
         // Apply TCP backpressure when this connection has reached its pending reliable message cap.
-        // Do not expire the heartbeat timer while reading is paused for server capacity.
+        // Pause and resume heartbeat tracking in Hub so both sides share one deadline.
         if in_flight.len() >= max_pending {
-            match in_flight.next().await {
-                Some(Ok(Some(renewed))) => {
-                    deadline = deadline.max(renewed).max(Instant::now() + timeout);
-                    continue;
-                }
-                Some(_) => return,
-                None => continue,
+            if hub.pause_heartbeat(connection).await.is_none() {
+                return;
             }
+            while in_flight.len() >= max_pending {
+                match in_flight.next().await {
+                    Some(Ok(SessionAck::Deadline(renewed))) => {
+                        deadline = deadline.max(renewed);
+                    }
+                    Some(Ok(SessionAck::Paused)) => {}
+                    Some(Err(_)) => return,
+                    None => break,
+                }
+            }
+            match hub.resume_heartbeat(connection).await {
+                Some(SessionAck::Deadline(renewed)) => deadline = deadline.max(renewed),
+                Some(SessionAck::Paused) => {}
+                None => return,
+            }
+            continue;
         }
 
         let incoming = tokio::select! {
             biased;
             completed = in_flight.next(), if !in_flight.is_empty() => {
                 match completed {
-                    Some(Ok(Some(renewed))) => {
+                    Some(Ok(SessionAck::Deadline(renewed))) => {
                         deadline = deadline.max(renewed);
                         continue;
                     }
-                    Some(_) => return,
-                    None => continue,
+                    Some(Ok(SessionAck::Paused)) | None => continue,
+                    Some(Err(_)) => return,
                 }
             }
             incoming = next_message(reader, deadline) => incoming,
@@ -151,34 +160,18 @@ pub(super) async fn read_frames(
         };
 
         if matches!(message, ClientMessage::Heartbeat) {
-            let Some(renewed) = hub.heartbeat(connection, received_at).await else {
-                return;
-            };
-            deadline = deadline.max(renewed);
+            match hub.heartbeat(connection, received_at).await {
+                Some(SessionAck::Deadline(renewed)) => deadline = deadline.max(renewed),
+                Some(SessionAck::Paused) => {}
+                None => return,
+            }
             continue;
         }
 
-        let permit = if let Some(permit) = hub.budget().try_acquire(bytes) {
-            permit
-        } else {
-            let acquire = hub.budget().acquire(bytes);
-            tokio::pin!(acquire);
-            loop {
-                tokio::select! {
-                    biased;
-                    completed = in_flight.next(), if !in_flight.is_empty() => {
-                        match completed {
-                            Some(Ok(Some(renewed))) => deadline = deadline.max(renewed),
-                            Some(_) => return,
-                            None => {}
-                        }
-                    }
-                    permit = &mut acquire => {
-                        deadline = deadline.max(Instant::now() + timeout);
-                        break permit;
-                    }
-                }
-            }
+        let Some(permit) =
+            acquire_permit(hub, connection, bytes, &mut in_flight, &mut deadline).await
+        else {
+            return;
         };
 
         let Some(completion) = hub
@@ -190,6 +183,39 @@ pub(super) async fn read_frames(
         in_flight.push(completion);
     };
     hub.end(connection, reason, error).await;
+}
+
+async fn acquire_permit(
+    hub: &Hub,
+    connection: Connection,
+    bytes: usize,
+    in_flight: &mut FuturesUnordered<oneshot::Receiver<SessionAck>>,
+    deadline: &mut Instant,
+) -> Option<crate::writer::WritePermit> {
+    if let Some(permit) = hub.budget().try_acquire(bytes) {
+        return Some(permit);
+    }
+    hub.pause_heartbeat(connection).await?;
+    let acquire = hub.budget().acquire(bytes);
+    tokio::pin!(acquire);
+    let permit = loop {
+        tokio::select! {
+            biased;
+            completed = in_flight.next(), if !in_flight.is_empty() => {
+                match completed {
+                    Some(Ok(SessionAck::Deadline(renewed))) => *deadline = (*deadline).max(renewed),
+                    Some(Ok(SessionAck::Paused)) | None => {}
+                    Some(Err(_)) => return None,
+                }
+            }
+            permit = &mut acquire => break permit,
+        }
+    };
+    match hub.resume_heartbeat(connection).await? {
+        SessionAck::Deadline(renewed) => *deadline = (*deadline).max(renewed),
+        SessionAck::Paused => {}
+    }
+    Some(permit)
 }
 
 enum ReadError {
