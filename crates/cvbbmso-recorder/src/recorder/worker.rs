@@ -83,8 +83,16 @@ impl Job {
             // to the caller, which is already waiting for their outcome.
             if let Err(error) = captured {
                 if started {
+                    // A lost display does not invalidate already encoded frames.
+                    // Encoder/storage faults must not publish a suspect segment.
+                    let sealed = if matches!(&error, RecordingError::Platform(_)) {
+                        recording.seal_segment()
+                    } else {
+                        Ok(())
+                    };
                     stop.store(true, Ordering::Release);
                     recording.events.send(RecorderEvent::Fault(error));
+                    sealed?;
                     return Ok(true);
                 }
                 return Err(error);

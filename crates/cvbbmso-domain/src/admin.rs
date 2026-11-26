@@ -2,13 +2,14 @@ use std::collections::BTreeSet;
 
 use cvbbmso_protocol::{
     ExamEvent, ExamSummary, ExecutionState, RecordingPolicy, RecordingState, RecordingSummary,
+    admin::IncidentSource,
 };
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, EntityTrait, QueryFilter,
     QueryOrder, QueryTrait, Set,
     sea_query::{Expr, OnConflict, Query},
 };
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Serialize, Serializer};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -196,17 +197,6 @@ pub struct EventRecord {
     pub event: ExamEvent,
     /// The original server receipt time in UTC.
     pub received_at: OffsetDateTime,
-}
-
-/// The origin of a persisted incident.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum IncidentSource {
-    /// Detected by the server.
-    Server,
-    /// Reported by the client.
-    Client,
 }
 
 /// An independent incident in the exam evidence history.

@@ -24,6 +24,7 @@ mod recording;
 mod state;
 mod utc;
 
+pub mod admin;
 pub mod error_code;
 
 pub use digest::Sha256Digest;

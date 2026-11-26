@@ -123,6 +123,19 @@ button:disabled {
   overflow-wrap: anywhere;
 }
 
+#exam-alert {
+  position: sticky;
+  top: 0.75rem;
+  z-index: 1;
+  min-height: 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid light-dark(#ae6018, #d9a15c);
+  border-radius: 0.4rem;
+  background: light-dark(#fff2df, #3a2c1b);
+  color: light-dark(#77400f, #ffdcaa);
+  font-weight: 600;
+}
+
 #exit-confirmation {
   box-sizing: border-box;
   width: min(24rem, calc(100vw - 2rem));

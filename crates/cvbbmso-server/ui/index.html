@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>考试控制面板 · CVBBMSO</title>
+  <link rel="stylesheet" href="/admin/style.css">
+  <script src="/admin/main.js" defer></script>
+</head>
+<body>
+  <header class="top"><span>CVBBMSO</span><strong>考试控制面板</strong><button id="logout" type="button" hidden>退出面板</button></header>
+  <main>
+    <p id="notice" role="status" aria-live="polite" hidden></p>
+    <section id="login" class="card login">
+      <h1>进入考试控制面板</h1>
+      <p>输入服务器管理员令牌。令牌仅保留在当前页面内存中。</p>
+      <form id="login-form">
+        <label>管理员令牌<input id="token" type="password" autocomplete="off" required minlength="64" maxlength="64" pattern="[0-9a-f]{64}"></label>
+        <button>进入面板</button>
+      </form>
+    </section>
+    <div id="dashboard" hidden>
+      <div class="heading">
+        <div><h1>考试管理</h1><p id="exam-summary">请选择一场考试</p></div>
+        <label>当前考试<select id="exam-select" aria-label="当前考试"></select></label>
+      </div>
+      <nav aria-label="控制面板栏目">
+        <button type="button" data-view="exams" aria-pressed="true">考试与名单</button>
+        <button type="button" data-view="students" aria-pressed="false">考生状态</button>
+        <button type="button" data-view="evidence" aria-pressed="false">异常与事件</button>
+      </nav>
+      <div id="exams" class="grid">
+        <section class="card">
+          <h2>新建考试</h2>
+          <form id="create-form">
+            <label>考试名称<input name="title" required maxlength="120"></label>
+            <div class="fields">
+              <label>开考（本地时间）<input name="start" type="datetime-local" required></label>
+              <label>结束（本地时间）<input name="end" type="datetime-local" required></label>
+            </div>
+            <div class="fields">
+              <label>分片时长（秒）<input name="duration" type="number" required min="1" max="4294967295" value="30"></label>
+              <label>每秒帧数<input name="fps" type="number" required min="1" max="4294967295" value="10"></label>
+            </div>
+            <button>创建考试</button>
+          </form>
+        </section>
+        <section class="card">
+          <h2>管理报名名单</h2>
+          <p>输入 Accoding 用户 ID，以空格、逗号或换行分隔，每次最多 1,000 个。</p>
+          <form id="import-form">
+            <label>用户 ID<textarea name="ids" rows="4" maxlength="24000" required placeholder="12345&#10;12346"></textarea></label>
+            <button>添加到名单</button>
+          </form>
+          <ul id="enrollments" class="enrollments"></ul>
+        </section>
+      </div>
+      <section id="students" class="card" hidden>
+        <div class="section-heading"><h2>考生状态</h2><span id="poll-status" class="muted">每 5 秒刷新</span></div>
+        <div class="table-scroll"><table>
+          <thead><tr><th>用户 ID</th><th>报名</th><th>连接</th><th>执行阶段</th><th>最近心跳</th><th>查看</th></tr></thead>
+          <tbody id="student-rows"></tbody>
+        </table></div>
+      </section>
+      <section id="evidence" class="card" hidden>
+        <div class="section-heading">
+          <h2>异常与事件</h2>
+          <label>考生<select id="student-select" aria-label="筛选考生"></select></label>
+          <button type="button" id="refresh-evidence">刷新</button>
+        </div>
+        <h3>异常记录</h3><ul id="incidents" class="records"></ul>
+        <h3>可靠事件</h3><ul id="events" class="records"></ul>
+        <h3>录像摘要</h3><p id="recording" class="muted"></p>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

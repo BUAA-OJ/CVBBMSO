@@ -270,7 +270,11 @@ impl Recorder {
                 return Ok(());
             }
         }
-        self.wait_for_capture().await
+        self.wait_for_capture().await?;
+        Err(RecordingError::Platform(Some(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "capture stopped before the first accepted frame",
+        ))))
     }
 
     async fn wait_for_capture(&mut self) -> Result<(), RecordingError> {

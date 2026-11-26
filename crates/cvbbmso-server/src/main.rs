@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod admin;
 mod api;
 mod hub;
 mod socket;
@@ -155,7 +156,14 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match serve(config).await {
+    let admin_token = match admin::Token::from_environment() {
+        Ok(token) => token,
+        Err(error) => {
+            log_failure(&ServerError::Config(Box::new(error)));
+            return ExitCode::from(2);
+        }
+    };
+    match serve(config, admin_token).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             log_failure(&error);
@@ -205,7 +213,7 @@ async fn shutdown_signal() {
     }
 }
 
-async fn serve(config: ServerConfig) -> Result<(), ServerError> {
+async fn serve(config: ServerConfig, admin_token: Option<admin::Token>) -> Result<(), ServerError> {
     let timeout = config.heartbeat_timeout()?;
     let hub_config = config.hub_config(timeout);
     let auth_config = config.auth_config();
@@ -214,13 +222,16 @@ async fn serve(config: ServerConfig) -> Result<(), ServerError> {
     let exam = Arc::new(ExamService::open(&config.database_url).await?);
     exam.recover_online().await?;
     let (hub, manager) = hub::Manager::with_config(Arc::clone(&exam), hub_config);
-    let router = api::router(api::AppState::new(
+    let mut router = api::router(api::AppState::new(
         exam,
         verifier,
         hub.clone(),
         timeout,
         auth_config,
     ));
+    if let Some(token) = admin_token {
+        router = router.merge(admin::router(hub.clone(), token));
+    }
     tracing::info!(listen_addr = %listener.local_addr()?, "server listening");
 
     let manager_task = tokio::spawn(manager.run());

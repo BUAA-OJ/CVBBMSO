@@ -72,6 +72,87 @@ fn rate(fps: u32) -> NonZeroU32 {
 }
 
 #[test]
+fn readiness_follows_the_first_accepted_frame_and_is_announced_once() {
+    let started = Cell::new(0);
+    let frames = Cell::new(0);
+    sample_started(
+        &mut Source::new([None, Some(image(1)), None]),
+        &mut FakeClock::default(),
+        rate(10),
+        &AtomicBool::new(false),
+        || started.set(started.get() + 1),
+        |_| {
+            assert_eq!(started.get(), u32::from(frames.get() > 0));
+            frames.set(frames.get() + 1);
+            Ok(if frames.get() == 2 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            })
+        },
+    )
+    .expect("capture");
+    assert_eq!(started.get(), 1);
+}
+
+#[test]
+fn a_display_without_images_times_out_without_reporting_recovery() {
+    let started = Cell::new(false);
+    let mut clock = FakeClock::default();
+    let result = sample_started(
+        &mut Source::new([]),
+        &mut clock,
+        rate(10),
+        &AtomicBool::new(false),
+        || started.set(true),
+        |_| panic!("no image was available"),
+    );
+    assert!(
+        matches!(result, Err(RecordingError::Platform(Some(error))) if error.kind() == io::ErrorKind::TimedOut)
+    );
+    assert!(!started.get());
+    assert_eq!(clock.now(), FIRST_FRAME_TIMEOUT);
+}
+
+#[test]
+fn a_late_first_frame_is_not_delivered_or_reported_as_recovered() {
+    let started = Cell::new(false);
+    let mut clock = FakeClock::default();
+    let mut source = Source::new([Some(image(1))]);
+    source.read_delay = Some((
+        Rc::clone(&clock.elapsed),
+        FIRST_FRAME_TIMEOUT + Duration::from_millis(1),
+    ));
+    let result = sample_started(
+        &mut source,
+        &mut clock,
+        rate(10),
+        &AtomicBool::new(false),
+        || started.set(true),
+        |_| panic!("a late first frame must not reach the sink"),
+    );
+    assert!(
+        matches!(result, Err(RecordingError::Platform(Some(error))) if error.kind() == io::ErrorKind::TimedOut)
+    );
+    assert!(!started.get());
+}
+
+#[test]
+fn a_rejected_first_frame_does_not_report_recovery() {
+    let started = Cell::new(false);
+    let result = sample_started(
+        &mut Source::new([Some(image(1))]),
+        &mut FakeClock::default(),
+        rate(10),
+        &AtomicBool::new(false),
+        || started.set(true),
+        |_| Err(RecordingError::Encoder(None)),
+    );
+    assert!(matches!(result, Err(RecordingError::Encoder(None))));
+    assert!(!started.get());
+}
+
+#[test]
 fn changing_images_are_sampled_on_absolute_ticks_without_rounding_drift() {
     let mut clock = FakeClock::default();
     let mut source = Source::new((0..16).map(|value| Some(image(value))));

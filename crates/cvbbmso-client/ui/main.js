@@ -181,6 +181,7 @@ const examStatus = document.querySelector("#exam-status");
 const examList = document.querySelector("#exams");
 const examFeedback = document.querySelector("#exam-session-feedback");
 const currentExam = document.querySelector("#current-exam");
+const examAlert = document.querySelector("#exam-alert");
 const currentExamTitle = document.querySelector("#current-exam-title");
 const currentExamStatus = document.querySelector("#current-exam-status");
 const closeExam = document.querySelector("#close-exam");
@@ -271,6 +272,7 @@ function renderExamSession() {
   closeExam.disabled = examBusy || (examView !== null && examView.state.execution !== "finished");
   if (exitConfirmation.open) renderExitConfirmation(examView);
   currentExam.hidden = examView === null;
+  examAlert.hidden = true;
   const needsSignIn = examView?.state.execution !== "finished"
     && examView?.last_error_code === "ACCODING_AUTH_EXPIRED";
   open.textContent = needsSignIn ? "重新登录 Accoding" : "打开 Accoding";
@@ -280,6 +282,17 @@ function renderExamSession() {
     return;
   }
   const { exam_id, connected, state, last_error_code } = examView;
+  const alerts = [];
+  if (!connected && state.execution !== "finished") {
+    alerts.push("监考连接已断开，正在自动重连。请保持客户端运行。");
+  }
+  if (state.recording === "failed") {
+    alerts.push(state.execution === "recording"
+      ? "录屏暂时中断，正在尝试恢复。请保持客户端运行。"
+      : "录像收尾异常，请保持客户端运行并联系监考老师。");
+  }
+  examAlert.textContent = alerts.join(" ");
+  examAlert.hidden = alerts.length === 0;
   const exam = examSelection?.id === exam_id ? examSelection : exams.find(({ id }) => id === exam_id);
   currentExamTitle.textContent = exam?.title ?? exam_id;
   const status = [

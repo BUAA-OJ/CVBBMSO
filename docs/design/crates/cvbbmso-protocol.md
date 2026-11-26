@@ -149,6 +149,8 @@ pub enum ExamEvent {
 }
 ```
 
+管理员 HTTP 独立于考生协议，数据结构位于 `cvbbmso_protocol::admin`，使用相同的时间、UUID、录像参数和事件格式。管理载荷里的用户 ID 与事件序号使用十进制字符串；路由、认证及错误映射见 [服务端文档](cvbbmso-server.md#管理控制面板)。
+
 ## 错误码
 
 所有 HTTP 错误体、WebSocket `error` 和 `command_result.error_code` 使用同一套错误码。错误码表示稳定类别；展示文案由 `message` 提供。

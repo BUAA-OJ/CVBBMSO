@@ -45,6 +45,26 @@ const INSTANCE: Uuid = Uuid::from_u128(0x30);
 const USER: i64 = 42;
 const WAIT: Duration = Duration::from_secs(5);
 
+#[test]
+fn capture_diagnostics_keep_native_context_and_bound_remote_details() {
+    let error = RecordingError::Platform(Some(std::io::Error::other(
+        "reading desktop frame: access lost (0x887A0026)",
+    )));
+    assert!(
+        super::recording_detail(&error).contains("reading desktop frame: access lost (0x887A0026)")
+    );
+    let long = RecordingError::Platform(Some(std::io::Error::other("失".repeat(400))));
+    assert_eq!(
+        super::recording_detail(&long).chars().count(),
+        super::MAX_DETAIL_CHARS
+    );
+    let storage = RecordingError::Io(std::io::Error::other("private recording directory"));
+    assert_eq!(
+        super::recording_detail(&storage),
+        "recording storage operation failed"
+    );
+}
+
 fn timing() -> Timing {
     Timing {
         liveness: Liveness {

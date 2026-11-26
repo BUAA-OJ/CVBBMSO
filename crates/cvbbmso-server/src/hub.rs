@@ -219,7 +219,6 @@ impl Hub {
             .await;
     }
 
-    #[allow(dead_code)] // Coordinated admin entry point for upcoming admin HTTP/UDS endpoints.
     pub(crate) async fn admin(
         &self,
         actor: String,

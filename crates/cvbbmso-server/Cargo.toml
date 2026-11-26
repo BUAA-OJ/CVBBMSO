@@ -6,7 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-axum = { workspace = true, features = ["http1", "json", "matched-path", "tokio", "ws"] }
+axum = { workspace = true, features = ["http1", "json", "matched-path", "query", "tokio", "ws"] }
 base64.workspace = true
 clap = { workspace = true, features = ["derive", "env", "error-context", "help", "std", "usage"] }
 cvbbmso-accoding.workspace = true
@@ -14,6 +14,7 @@ cvbbmso-domain.workspace = true
 cvbbmso-protocol.workspace = true
 futures-util = { workspace = true, features = ["sink"] }
 serde_json.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

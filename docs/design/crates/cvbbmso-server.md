@@ -20,7 +20,7 @@ enum ServerError {
     Io,
 }
 
-async fn serve(config: ServerConfig) -> Result<(), ServerError>;
+async fn serve(config: ServerConfig, admin_token: Option<admin::Token>) -> Result<(), ServerError>;
 ```
 
 `serve` 先绑定监听地址，再打开数据库并恢复遗留在线记录。恢复成功后才启动 HTTP Router、WebSocket Hub（含统一 `DatabaseWriter` 组提交与心跳回写缓存）和独立考试调度任务，并在收到停机信号后按序排空在途操作、回写心跳与断开记录后关闭数据库。`heartbeat_timeout_secs` 默认 25 秒，组提交窗口、批次上限、全局与单连接背压阈值及认证并发上限均支持通过 CLI 参数或环境变量调整。服务端按单实例部署，TLS 由反向代理终止；Rust 进程监听内网 HTTP/WS。客户端与服务端同版本部署。
@@ -53,6 +53,39 @@ async fn serve(config: ServerConfig) -> Result<(), ServerError>;
 错误码本身由 [cvbbmso-protocol](cvbbmso-protocol.md) 定义；本表维护 HTTP 状态码映射。同一考生从新设备连接时，服务端按“替换旧连接”处理。
 
 HTTP 与 WebSocket 拒绝日志同时记录协议错误码和经过脱敏的失败原因。日志仅记录错误类别和安全诊断字段，例如上游 HTTP 状态与 SQLite 错误号。客户端继续收到协议错误码和通用文案。
+
+## 管理控制面板
+
+`/admin` 提供同源页面，不依赖额外前端服务。管理员身份与考生 Cookie 独立；未设置 `CVBBMSO_ADMIN_TOKEN` 时不挂载页面和管理 API。令牌由服务端进程环境注入，格式为 32 字节随机值的小写十六进制表示；格式无效时拒绝启动。浏览器仅在当前页面内存保存令牌，显式发送 `Authorization: Bearer <token>`，不使用 Cookie、URL 参数或浏览器持久存储。退出或刷新后需重新输入。管理响应禁止缓存。
+
+生产环境应经 HTTPS 反向代理访问，并将 `/admin`、`/admin/` 下的资源和 `/api/admin/` 限制在管理网、VPN 或受信任代理之后；不要记录 `Authorization`。首版为单个共享管理员凭据，不区分个人和角色；写入领域审计的操作者为 `control_panel`。通过更新环境变量并重启服务轮换令牌。
+
+本地试用（PowerShell 7，在仓库根目录运行）：
+
+```powershell
+$env:CVBBMSO_ADMIN_TOKEN = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLowerInvariant()
+cargo run --locked -p cvbbmso-server -- --listen-addr 127.0.0.1:8080 --database-url 'sqlite://exams.sqlite?mode=rwc'
+```
+
+在浏览器打开 `http://127.0.0.1:8080/admin`，输入刚生成的令牌。`/admin/` 会重定向到 `/admin`。仅本地回环可用明文 HTTP；不要在网络上使用这套本地示例配置。
+
+| 方法 | `/api/admin` 下的路径 | 成功响应 |
+| --- | --- | --- |
+| `GET` | `/exams` | `200 ExamSummary[]` |
+| `POST` | `/exams` | `201 CreatedExam`，请求为 `CreateExam` |
+| `GET` | `/exams/{exam_id}` | `200 ExamDetail` |
+| `GET` | `/exams/{exam_id}/roster` | `200 RosterEntry[]`，按用户 ID 升序 |
+| `POST` | `/exams/{exam_id}/participants` | `200 ImportedParticipants`，请求为 `ImportParticipants` |
+| `DELETE` | `/exams/{exam_id}/participants/{oj_user_id}` | `204`，只允许在开考前撤销 |
+| `GET` | `/exams/{exam_id}/incidents` | `200 Incident[]`，支持 `?oj_user_id=...` |
+| `GET` | `/exams/{exam_id}/students/{oj_user_id}/events` | `200 Event[]`，按序号升序 |
+| `GET` | `/exams/{exam_id}/students/{oj_user_id}/recording` | `200 RecordingSummary`，无摘要时返回 `404` |
+
+管理载荷由 `cvbbmso_protocol::admin` 定义。创建考试的标题去掉首尾空白后为 1–120 个字符，起止时间使用带时区的 RFC 3339，`policy` 使用现有 `RecordingPolicy`。报名导入支持逐个或批量提交，单次为 1–1,000 个正 `i64` 用户 ID，使用 `{"oj_user_ids":["12345"]}`；重复报名忽略，响应 `count` 仅统计新增。管理 JSON 请求体上限为 64 KiB。JSON 中的考生 ID 和事件序号用十进制字符串传输，避免浏览器损失 64 位整数精度。
+
+名单合并当前报名和运行记录；`runtime: null` 代表从未连接，`runtime.connected: false` 代表有历史记录但当前离线，`enrolled: false` 代表报名已撤销但仍有运行记录。面板可见时每 5 秒轮询考生状态，异常与事件按需查询。首版历史查询未分页，不提供录像上传、下载或播放。
+
+管理业务错误返回 `{"code":"..."}`：`401 ADMIN_AUTH_REQUIRED`、`400 INVALID_INPUT`、`404 NOT_FOUND`、`409 CONFLICT`、`413 BODY_TOO_LARGE`、`415 JSON_REQUIRED`、`503 STORAGE_BUSY`、`500 INTERNAL_ERROR`。路径或查询参数无法解析时由 Axum 拒绝；考生端错误格式保持不变。
 
 ## WebSocket 处理
 
@@ -109,4 +142,4 @@ flowchart TD
 
 ## 模块协作
 
-`cvbbmso-server` 拥有 HTTP/WS 传输及连接生命周期。身份校验委托 `cvbbmso-accoding`，考试授权、时序、ACK、异常保存委托 `cvbbmso-domain`。CLI 直接访问领域层，服务器提供 HTTP/WS 服务。
+`cvbbmso-server` 拥有 HTTP/WS 传输及连接生命周期。考生身份校验委托 `cvbbmso-accoding`，考试授权、时序、ACK、异常保存委托 `cvbbmso-domain`。控制面板通过服务端管理路由经 Hub 协调调用 `AdminService`，不直接访问数据库。
