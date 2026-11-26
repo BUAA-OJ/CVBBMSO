@@ -381,6 +381,7 @@ async fn idle_storage_fault_recovers_on_schedule_tick_and_admits_next_connect() 
     manager.handle_batch_completion(WriteCompletion::Batch {
         ops: Vec::new(),
         heartbeat_batches: Vec::new(),
+        probed: false,
         batch_error: Some(Arc::new(storage_err)),
     });
     assert_eq!(manager.storage, StorageHealth::Faulted);
@@ -508,6 +509,7 @@ async fn unrelated_batch_completion_preserves_in_flight_heartbeat_snapshot() {
     manager.handle_batch_completion(WriteCompletion::Batch {
         ops: Vec::new(),
         heartbeat_batches: vec![Uuid::new_v4()],
+        probed: false,
         batch_error: None,
     });
     assert!(manager.heartbeats.in_flight.is_some());
@@ -516,8 +518,288 @@ async fn unrelated_batch_completion_preserves_in_flight_heartbeat_snapshot() {
     manager.handle_batch_completion(WriteCompletion::Batch {
         ops: Vec::new(),
         heartbeat_batches: vec![active_batch_id],
+        probed: false,
         batch_error: Some(Arc::new(DomainError::InvalidInput)),
     });
     assert!(manager.heartbeats.in_flight.is_none());
     assert!(manager.heartbeats.dirty.contains_key(&student));
+}
+
+#[tokio::test]
+async fn busy_storage_probe_requeues_and_recovers_after_unlock() {
+    use sea_orm::{
+        ConnectionTrait, Database, SqliteTransactionMode, TransactionOptions, TransactionTrait,
+    };
+
+    let files = tempfile::tempdir().unwrap();
+    let db_path = files.path().join("probe_busy.sqlite");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let exam = Arc::new(ExamService::open(&url).await.unwrap());
+    let start = OffsetDateTime::from_unix_timestamp(2_000_000_000).unwrap();
+    let student = StudentKey {
+        exam_id: setup_test_exam(&exam, 1, start).await,
+        oj_user_id: 1,
+    };
+
+    let (hub, mut manager) = Manager::new(Arc::clone(&exam), Duration::from_secs(25));
+    let recovered = Arc::clone(&manager.storage_recovered);
+    manager.storage = StorageHealth::Faulted;
+    let manager_task = tokio::spawn(manager.run());
+
+    // Hold an exclusive SQLite write lock so the first storage probe fails with SQLITE_BUSY.
+    let locker = Database::connect(&url).await.unwrap();
+    let lock_tx = locker
+        .begin_with_options(TransactionOptions {
+            sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let _ = lock_tx.execute_unprepared("SELECT 1").await.unwrap();
+
+    hub.trigger_schedule().await;
+    time::sleep(Duration::from_millis(350)).await;
+    hub.barrier().await;
+
+    // Admission must still be rejected while locked.
+    let (_, _, close_rx, _) = connect_test_student(&hub, student).await;
+    assert!(close_rx.await.unwrap().is_some());
+
+    // Release the lock and verify the next schedule tick probes again and recovers admissions.
+    lock_tx.rollback().await.unwrap();
+    let notified = recovered.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    hub.trigger_schedule().await;
+    notified.await;
+
+    let (_, mut frames_rx, _, admitted_rx) = connect_test_student(&hub, student).await;
+    admitted_rx.await.unwrap();
+    assert!(matches!(
+        frames_rx.recv().await,
+        Some(cvbbmso_protocol::ServerMessage::Sync { .. })
+    ));
+
+    manager_task.abort();
+}
+
+fn make_test_current(
+    connection: Connection,
+    deadline: Instant,
+    backpressure_paused: bool,
+) -> (
+    Current,
+    mpsc::Receiver<cvbbmso_protocol::ServerMessage>,
+    oneshot::Receiver<Option<SocketError>>,
+) {
+    let (frames_tx, frames_rx) = mpsc::channel(4);
+    let (close_tx, close_rx) = oneshot::channel();
+    let current = Current {
+        connection,
+        deadline,
+        backpressure_paused,
+        frames: frames_tx,
+        close: close_tx,
+        state: cvbbmso_protocol::ClientState {
+            execution: cvbbmso_protocol::ExecutionState::Ready,
+            recording: cvbbmso_protocol::RecordingState::Idle,
+        },
+        exam_times: None,
+        start: None,
+        end: None,
+    };
+    (current, frames_rx, close_rx)
+}
+
+#[tokio::test]
+async fn deferred_command_ack_rechecks_and_delivers_after_failed_removal() {
+    use cvbbmso_protocol::{
+        ClientHello, ClientState, ExecutionState, Platform, RecordingState, ServerMessage,
+    };
+
+    let files = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        files.path().join("deferred_ack.sqlite").display()
+    );
+    let exam = Arc::new(ExamService::open(&url).await.unwrap());
+    let start = OffsetDateTime::from_unix_timestamp(2_000_000_000).unwrap();
+    let student = StudentKey {
+        exam_id: setup_test_exam(&exam, 11, start).await,
+        oj_user_id: 11,
+    };
+    let conn_id = Uuid::new_v4();
+    let connection = Connection {
+        student,
+        id: conn_id,
+        request_id: Uuid::new_v4(),
+    };
+    let state = ClientState {
+        execution: ExecutionState::Ready,
+        recording: RecordingState::Idle,
+    };
+    let hello = ClientHello {
+        device_id: Uuid::new_v4(),
+        instance_id: Uuid::new_v4(),
+        platform: Platform::Windows,
+        state,
+    };
+    exam.execute_batch(
+        vec![BatchWrite::Connect {
+            exam_id: student.exam_id,
+            oj_user_id: student.oj_user_id,
+            connection_id: conn_id,
+            hello,
+            observed_at: start,
+        }],
+        Vec::new(),
+    )
+    .await
+    .unwrap();
+
+    let (hub, mut manager) = Manager::new(Arc::clone(&exam), Duration::from_secs(25));
+    let op_id = Uuid::new_v4();
+    let (current, mut frames_rx, _close_rx) =
+        make_test_current(connection, Instant::now() + Duration::from_secs(25), false);
+    manager.students.insert(
+        student,
+        StudentSlot {
+            current: Some(current),
+            executing: Some(op_id),
+            barrier: true,
+            ..StudentSlot::default()
+        },
+    );
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let kind = InFlightKind::AdminRemove { reply: reply_tx };
+    manager.in_flight_ops.insert(
+        op_id,
+        InFlightOp {
+            operation_id: op_id,
+            student,
+            kind,
+        },
+    );
+
+    let command_id = Uuid::new_v4();
+    let permit = hub.budget().try_acquire(64).unwrap();
+    let (processed_tx, mut processed_rx) = oneshot::channel();
+    manager.handle_read_check(ReadCheckCompletion {
+        connection,
+        command_id,
+        result: Ok(()),
+        permit,
+        processed: processed_tx,
+    });
+    assert!(frames_rx.try_recv().is_err());
+    assert!(processed_rx.try_recv().is_err());
+
+    manager.handle_batch_completion(WriteCompletion::Batch {
+        ops: vec![(op_id, Some(Err(DomainError::Conflict)))],
+        heartbeat_batches: Vec::new(),
+        probed: false,
+        batch_error: None,
+    });
+    assert!(matches!(
+        reply_rx.await.unwrap(),
+        Err(DomainError::Conflict)
+    ));
+
+    let rechecked = manager.read_checks_rx.recv().await.unwrap();
+    manager.handle_read_check(rechecked);
+    assert_eq!(
+        frames_rx.try_recv().unwrap(),
+        ServerMessage::CommandAck { command_id }
+    );
+    assert!(matches!(
+        processed_rx.try_recv().unwrap(),
+        SessionAck::Deadline(_)
+    ));
+}
+
+#[tokio::test]
+async fn backpressure_pause_preserves_busy_retry_delay_past_old_deadline() {
+    use sea_orm::{
+        ConnectionTrait, Database, SqliteTransactionMode, TransactionOptions, TransactionTrait,
+    };
+
+    let files = tempfile::tempdir().unwrap();
+    let db_path = files.path().join("retry_delay.sqlite");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let exam = Arc::new(ExamService::open(&url).await.unwrap());
+
+    // Capture a real SQLITE_BUSY DomainError.
+    let locker = Database::connect(&url).await.unwrap();
+    let lock_tx = locker
+        .begin_with_options(TransactionOptions {
+            sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let _ = lock_tx.execute_unprepared("SELECT 1").await.unwrap();
+    let busy_err = exam.probe_storage().await.unwrap_err();
+    assert!(busy_err.is_storage_busy());
+    lock_tx.rollback().await.unwrap();
+
+    time::pause();
+    let (hub, mut manager) = Manager::new(exam, Duration::from_secs(25));
+    let student = StudentKey {
+        exam_id: Uuid::new_v4(),
+        oj_user_id: 21,
+    };
+    let connection = Connection {
+        student,
+        id: Uuid::new_v4(),
+        request_id: Uuid::new_v4(),
+    };
+    let old_deadline = Instant::now();
+    time::advance(Duration::from_secs(2)).await;
+    let now = Instant::now();
+    assert!(now > old_deadline);
+
+    let (frames_tx, _frames_rx) = mpsc::channel(4);
+    let (close_tx, _close_rx) = oneshot::channel();
+    manager.students.insert(
+        student,
+        StudentSlot {
+            current: Some(Current {
+                connection,
+                deadline: old_deadline,
+                backpressure_paused: true,
+                frames: frames_tx,
+                close: close_tx,
+                state: cvbbmso_protocol::ClientState {
+                    execution: cvbbmso_protocol::ExecutionState::Ready,
+                    recording: cvbbmso_protocol::RecordingState::Idle,
+                },
+                exam_times: None,
+                start: None,
+                end: None,
+            }),
+            ..StudentSlot::default()
+        },
+    );
+
+    let permit = hub.budget().try_acquire(64).unwrap();
+    let (processed_tx, _processed_rx) = oneshot::channel();
+    manager.handle_reliable_error(
+        student,
+        connection,
+        ReliableOp::Status(cvbbmso_protocol::ClientState {
+            execution: cvbbmso_protocol::ExecutionState::Ready,
+            recording: cvbbmso_protocol::RecordingState::Idle,
+        }),
+        OffsetDateTime::UNIX_EPOCH,
+        1,
+        permit,
+        processed_tx,
+        &busy_err,
+    );
+
+    let (&(retry_at, _), _) = manager
+        .retry_timers
+        .first_key_value()
+        .expect("expected scheduled busy retry");
+    assert!(retry_at >= now + WRITE_RETRY_DELAY);
 }

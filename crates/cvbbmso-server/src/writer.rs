@@ -141,6 +141,7 @@ pub(crate) enum WriteCompletion {
     Batch {
         ops: Vec<(Uuid, Option<Result<BatchOutput, DomainError>>)>,
         heartbeat_batches: Vec<Uuid>,
+        probed: bool,
         batch_error: Option<Arc<DomainError>>,
     },
 }
@@ -308,6 +309,7 @@ impl DatabaseWriter {
                 let _ = self.completions.send(WriteCompletion::Batch {
                     ops: Vec::new(),
                     heartbeat_batches: Vec::new(),
+                    probed: true,
                     batch_error,
                 });
             }
@@ -331,6 +333,7 @@ impl DatabaseWriter {
                 let _ = self.completions.send(WriteCompletion::Batch {
                     ops: paired,
                     heartbeat_batches,
+                    probed: probe,
                     batch_error: None,
                 });
             }
@@ -346,6 +349,7 @@ impl DatabaseWriter {
                 let _ = self.completions.send(WriteCompletion::Batch {
                     ops: paired,
                     heartbeat_batches,
+                    probed: probe,
                     batch_error: Some(Arc::new(error)),
                 });
             }

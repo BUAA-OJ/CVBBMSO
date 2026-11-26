@@ -545,12 +545,20 @@ struct WaitingRetry {
     processed: oneshot::Sender<SessionAck>,
 }
 
+struct DeferredReadCheck {
+    connection: Connection,
+    command_id: Uuid,
+    permit: WritePermit,
+    processed: oneshot::Sender<SessionAck>,
+}
+
 #[derive(Default)]
 struct StudentSlot {
     current: Option<Current>,
     executing: Option<Uuid>,
     waiting_retry: Option<(Uuid, WaitingRetry)>,
     pending: VecDeque<PendingOp>,
+    deferred_read_checks: Vec<DeferredReadCheck>,
     lost: Option<LostConnection>,
     barrier: bool,
     closing: bool,
@@ -571,6 +579,7 @@ impl StudentSlot {
             && self.executing.is_none()
             && self.waiting_retry.is_none()
             && self.pending.is_empty()
+            && self.deferred_read_checks.is_empty()
             && self.lost.is_none()
             && !self.barrier
     }
@@ -944,24 +953,7 @@ impl Manager {
                         return;
                     }
                     Some(_) if no_queued_work => {
-                        let exam = Arc::clone(&self.exam);
-                        let reply_tx = self.read_checks_tx.clone();
-                        tokio::spawn(async move {
-                            let check = exam
-                                .check_connected_generation(
-                                    connection.student.exam_id,
-                                    connection.student.oj_user_id,
-                                    Some(connection.id),
-                                )
-                                .await;
-                            let _ = reply_tx.send(ReadCheckCompletion {
-                                connection,
-                                command_id,
-                                result: check,
-                                permit,
-                                processed,
-                            });
-                        });
+                        self.spawn_read_check(connection, command_id, permit, processed);
                         return;
                     }
                     _ => ReliableOp::CommandResult {
@@ -995,8 +987,34 @@ impl Manager {
         self.mark_ready(student);
     }
 
+    fn spawn_read_check(
+        &self,
+        connection: Connection,
+        command_id: Uuid,
+        permit: WritePermit,
+        processed: oneshot::Sender<SessionAck>,
+    ) {
+        let exam = Arc::clone(&self.exam);
+        let reply_tx = self.read_checks_tx.clone();
+        tokio::spawn(async move {
+            let check = exam
+                .check_connected_generation(
+                    connection.student.exam_id,
+                    connection.student.oj_user_id,
+                    Some(connection.id),
+                )
+                .await;
+            let _ = reply_tx.send(ReadCheckCompletion {
+                connection,
+                command_id,
+                result: check,
+                permit,
+                processed,
+            });
+        });
+    }
+
     fn handle_read_check(&mut self, check: ReadCheckCompletion) {
-        let _permit = check.permit;
         let student = check.connection.student;
         let Some(slot) = self.students.get_mut(&student) else {
             return;
@@ -1005,9 +1023,17 @@ impl Manager {
             return;
         }
         if slot.barrier {
-            let _ = check.processed.send(SessionAck::Paused);
+            // Defer ACK delivery until the admin removal finishes so a failed removal re-checks
+            // enrollment and connection generation instead of silently dropping CommandAck.
+            slot.deferred_read_checks.push(DeferredReadCheck {
+                connection: check.connection,
+                command_id: check.command_id,
+                permit: check.permit,
+                processed: check.processed,
+            });
             return;
         }
+        let _permit = check.permit;
         let Some(current) = slot.current.as_mut() else {
             return;
         };
@@ -1768,6 +1794,7 @@ impl Manager {
             InFlightKind::AdminRemove { reply } => {
                 if let Some(slot) = self.students.get_mut(&student) {
                     slot.barrier = false;
+                    slot.deferred_read_checks.clear();
                 }
                 let _ = reply.send(Err(DomainError::InvalidInput));
             }
@@ -1779,6 +1806,7 @@ impl Manager {
         let WriteCompletion::Batch {
             ops,
             heartbeat_batches,
+            probed,
             batch_error,
         } = completion;
 
@@ -1790,6 +1818,8 @@ impl Manager {
                         "persistent SQLite storage failure detected; pausing new admissions"
                     );
                 }
+                self.storage = StorageHealth::Faulted;
+            } else if probed && self.storage == StorageHealth::Probing {
                 self.storage = StorageHealth::Faulted;
             }
         } else if self.storage != StorageHealth::Healthy {
@@ -1912,17 +1942,28 @@ impl Manager {
                 );
             }
             InFlightKind::AdminRemove { reply } => {
+                let mut deferred = Vec::new();
                 if let Some(slot) = self.students.get_mut(&student) {
                     slot.barrier = false;
                     if batch_error.is_none() && matches!(outcome, Some(Ok(BatchOutput::Admin(_)))) {
                         self.heartbeats.clear_student(student);
                         slot.pending.clear();
+                        slot.deferred_read_checks.clear();
                         if let Some(current) = slot.current.take() {
                             let _ = current.close.send(Some(SocketError::not_enrolled()));
                         }
                     } else {
+                        deferred = std::mem::take(&mut slot.deferred_read_checks);
                         self.mark_ready(student);
                     }
+                }
+                for check in deferred {
+                    self.spawn_read_check(
+                        check.connection,
+                        check.command_id,
+                        check.permit,
+                        check.processed,
+                    );
                 }
                 let result = match (batch_error, outcome) {
                     (Some(err), _) => Err(DomainError::clone_shared(err)),
@@ -2211,7 +2252,11 @@ impl Manager {
             if attempt < WRITE_ATTEMPTS {
                 #[cfg(test)]
                 self.write_retries.notify_one();
-                let retry_at = (now + WRITE_RETRY_DELAY).min(current.deadline);
+                let retry_at = if current.backpressure_paused {
+                    now + WRITE_RETRY_DELAY
+                } else {
+                    (now + WRITE_RETRY_DELAY).min(current.deadline)
+                };
                 let timer_id = Uuid::new_v4();
                 slot.waiting_retry = Some((
                     timer_id,
