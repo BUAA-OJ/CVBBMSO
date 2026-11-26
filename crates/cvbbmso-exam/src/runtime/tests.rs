@@ -1230,3 +1230,16 @@ async fn reopening_a_finished_exam_closes_the_connection() {
     conn.closed().await;
     assert!(!handle.subscribe().borrow().connected);
 }
+
+#[test]
+fn jittered_backoff_stays_within_half_to_full_window() {
+    use super::jittered_backoff;
+
+    let backoff = Duration::from_secs(10);
+    for sample in [0, 1, 2500, 5000, u64::MAX] {
+        let delay = jittered_backoff(backoff, sample);
+        assert!(delay >= Duration::from_secs(5));
+        assert!(delay <= backoff);
+    }
+    assert_eq!(jittered_backoff(Duration::ZERO, 7), Duration::ZERO);
+}

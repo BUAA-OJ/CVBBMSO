@@ -12,7 +12,14 @@
 mod capture;
 mod session;
 
-use std::{collections::HashMap, future::Future, io, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    hash::{BuildHasher, Hasher, RandomState},
+    io,
+    path::PathBuf,
+    time::Duration,
+};
 
 use cvbbmso_accoding::AccodingCookies;
 use cvbbmso_protocol::{
@@ -1048,7 +1055,8 @@ impl<C: Capture> Runtime<C> {
             Some(error) => tracing::warn!(%error, "monitor connection lost"),
             None => {}
         }
-        self.reconnect_at = Some(Instant::now() + self.backoff);
+        let delay = jittered_backoff(self.backoff, random_u64());
+        self.reconnect_at = Some(Instant::now() + delay);
         self.backoff = (self.backoff * 2).min(self.timing.reconnect_max);
     }
 
@@ -1084,6 +1092,19 @@ async fn sleep_until_some(deadline: Option<Instant>) {
         Some(deadline) => sleep_until(deadline).await,
         None => std::future::pending().await,
     }
+}
+
+fn random_u64() -> u64 {
+    RandomState::new().build_hasher().finish()
+}
+
+fn jittered_backoff(backoff: Duration, sample: u64) -> Duration {
+    let half = backoff / 2;
+    let span_millis = u64::try_from(backoff.saturating_sub(half).as_millis()).unwrap_or(u64::MAX);
+    if span_millis == 0 {
+        return backoff;
+    }
+    half + Duration::from_millis(sample % (span_millis + 1))
 }
 
 #[cfg(test)]

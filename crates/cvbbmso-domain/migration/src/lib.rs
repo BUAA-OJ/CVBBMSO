@@ -3,6 +3,7 @@
 pub use sea_orm_migration::prelude::*;
 
 mod m20261121_043144_initial;
+mod m20261126_000001_add_connection_id;
 
 /// Applies the exam schema migrations in order.
 pub struct Migrator;
@@ -10,6 +11,9 @@ pub struct Migrator;
 #[sea_orm_migration::async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(m20261121_043144_initial::Migration)]
+        vec![
+            Box::new(m20261121_043144_initial::Migration),
+            Box::new(m20261126_000001_add_connection_id::Migration),
+        ]
     }
 }

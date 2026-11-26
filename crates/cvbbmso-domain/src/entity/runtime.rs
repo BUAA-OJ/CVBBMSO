@@ -9,6 +9,7 @@ pub struct Model {
     pub oj_user_id: i64,
     pub device_id: String,
     pub instance_id: String,
+    pub connection_id: Option<String>,
     pub connected: bool,
     pub execution: String,
     pub recording: String,

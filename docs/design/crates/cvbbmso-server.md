@@ -23,7 +23,7 @@ enum ServerError {
 async fn serve(config: ServerConfig, admin_token: Option<admin::Token>) -> Result<(), ServerError>;
 ```
 
-`serve` 先绑定监听地址，再打开数据库并恢复遗留在线记录。恢复成功后才启动 HTTP Router、WebSocket 连接管理器和考试调度任务。`heartbeat_timeout_secs` 默认 25 秒。服务端按单实例部署，TLS 由反向代理终止；Rust 进程监听内网 HTTP/WS。客户端与服务端同版本部署。
+`serve` 先绑定监听地址，再打开数据库并恢复遗留在线记录。恢复成功后才启动 HTTP Router、WebSocket Hub（含统一 `DatabaseWriter` 组提交与心跳回写缓存）和独立考试调度任务，并在收到停机信号后按序排空在途操作、回写心跳与断开记录后关闭数据库。`heartbeat_timeout_secs` 默认 25 秒，组提交窗口、批次上限、全局与单连接背压阈值及认证并发上限均支持通过 CLI 参数或环境变量调整。服务端按单实例部署，TLS 由反向代理终止；Rust 进程监听内网 HTTP/WS。客户端与服务端同版本部署。
 
 ## HTTP API
 
@@ -100,15 +100,18 @@ cargo run --locked -p cvbbmso-server -- --listen-addr 127.0.0.1:8080 --database-
 - 事件确认通过 `sync.ack_event_through` 返回；服务端持久化连续事件并在重连时通过 `sync` 返回确认位置。
 - 收到 `command_result` 后，服务端在同一事务归档终态并更新考生状态，提交后回复 `CommandAck { command_id }`。会话内重报相同结果会收到相同 ACK；命令 ID 必须由当前会话发出。非法状态组合或未知命令按 `COMMAND_STATE_CONFLICT` / `PROTOCOL_ERROR` 处理，并在协议错误时关闭连接。
 - `CommandAck` 丢失后，客户端可用 `finalizing` 重连。服务端保留已提交的完成状态，并下发新的 `end_exam` 让客户端重报终态。
-- 考前撤销报名时，服务端将运行记录设为离线并保留此前证据。旧连接继续发送业务消息时会被关闭。
+- 考前撤销报名时，Hub 对目标考生建立写入屏障，暂停心跳续期及新业务准入并等待在途操作完成，在事务内删除报名、将运行记录设为离线并合并最新心跳后，立即向旧连接发送 `NOT_ENROLLED` 并关闭连接。
+- 调度器在独立任务中每秒通过只读连接池查询候选命令并交由 Hub 校验连接代次、当前状态及命令槽位后下发；若存在影响命令资格的在途写入，待提交后重新评估。
 - `status` 用于状态对齐；同一连接内执行阶段倒退由 domain 拒绝，映射为 `PROTOCOL_ERROR` 并关闭连接，原状态保留。结束状态由 `end_exam` 的 `command_result` 判定。重连仍按 `hello.state` 重新生成命令。
 
 同一 `(exam_id, oj_user_id)` 同时保留一条有效 WebSocket。服务端维护“当前连接”：
 
-- 新连接到达时替换旧连接，并关闭旧 socket；旧 socket 之后触发的关闭事件按替换结果处理。
-- 服务端对处于 `finished` 的连接按正常完成处理；其余当前连接的关闭或心跳超时调用 `ExamService::disconnect`。
-- 收到 `end_exam` 的 `command_result` 后，服务端将执行状态置为 `finished`，回复 `CommandAck`；该连接随后关闭，属于正常完成。
+- 新连接到达时等待旧连接已开始的在途事务及待恢复失联记录结算，再提交新连接并替换旧连接，随后关闭旧 socket；旧 socket 之后触发的关闭事件按替换结果处理。
+- 服务端对处于 `finished` 的连接按正常完成处理；其余当前连接的关闭或心跳超时调用 `Disconnect` 提交离线与 `connection_lost`。
+- 收到 `end_exam` 的 `command_result` 后，服务端在组提交事务归档终态并将执行状态置为 `finished`，提交成功后回复 `CommandAck`；该连接随后关闭，属于正常完成。
 - 被替换的旧连接以 `Replaced` 原因记录 `connection_lost`，`detail` 为 `replaced`。
+- 合法应用层心跳通过轻量路径即时续期并写入内存 `HeartbeatCache`，约每秒由 `DatabaseWriter` 按 `(exam_id, oj_user_id, connection_id, connected)` 条件批量落盘；连接断开或撤销时将最新有效心跳并入对应生命周期事务。
+- WebSocket 读取与可靠业务写入解耦，限制单连接待处理可靠消息数及全局待写队列数量与载荷字节数；触发背压时暂停读取且不误判心跳超时。HTTP/WS 认证阶段对上游 Accoding 请求限制并发并设等待超时。
 
 ## 连接丢失与恢复
 
@@ -132,10 +135,11 @@ flowchart TD
 - 客户端异常退出或网络中断时，服务器观测到 WebSocket 关闭或心跳超时，记录 `connection_lost`。客户端退出后保持离线时，CLI 仍能查到该记录。
 - 重连成功时，根据旧记录的在线状态和执行阶段记录失联与恢复。若新 `hello.instance_id` 与上次不同且上次状态为 `recording/finalizing`，再记录 `process_restarted`。三条记录独立保存，CLI 按 `occurred_at`、`incident_id` 排序展示。
 - 服务端启动时恢复遗留在线记录，给未完成的考生记 `connection_lost`，`detail` 为 `server_restart`。
-- SQLite 忙锁时，同一消息最多尝试写入四轮，轮间等待 50 毫秒。到达当前心跳截止时间或观察到传输关闭后，停止后续重试。只有成功写入的心跳才按接收时间续期。等待重试期间最多预读一条后续消息，按接收顺序处理。心跳到期前耗尽尝试次数时，发送既有的 `INTERNAL_ERROR` 并关闭连接。
+- SQLite 忙锁时，同一可靠消息由对应考生的有序队列最多尝试写入四轮，轮间等待 50 毫秒（不同考生互不阻塞；只读 `CommandAck` 重放经只读连接池即时确认）。到达当前心跳截止时间或观察到传输关闭后，停止后续重试。心跳到期前耗尽尝试次数时，发送既有的 `INTERNAL_ERROR` 并关闭连接。
+- 持续性 SQLite 存储故障（如磁盘满或 I/O 异常）期间，服务端记录告警并暂停新连接准入，待后续写入恢复后自动解除；未确认可靠事件由客户端本地 Journal 保留。
 - 已开始的事务先结算，再处理断开或接纳替代连接。断开写入失败时保留观察时间并重试，成功后该考生才能重新接入。
 - 正常完成考试时连接静默关闭，按正常完成处理。
 
 ## 模块协作
 
-`cvbbmso-server` 拥有 HTTP/WS 传输及连接生命周期。考生身份校验委托 `cvbbmso-accoding`，考试授权、时序、ACK、异常保存委托 `cvbbmso-domain`。控制面板通过服务端管理路由调用 `AdminService`，不直接访问数据库。
+`cvbbmso-server` 拥有 HTTP/WS 传输及连接生命周期。考生身份校验委托 `cvbbmso-accoding`，考试授权、时序、ACK、异常保存委托 `cvbbmso-domain`。控制面板通过服务端管理路由经 Hub 协调调用 `AdminService`，不直接访问数据库。

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use axum::{
     body::{Body, to_bytes},
     http::{Method, Request},
@@ -12,6 +14,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tower::ServiceExt;
 
 use super::*;
+use crate::hub::Manager;
 
 const TEST_ADMIN_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const LARGE_ID: i64 = i64::MAX;
@@ -22,21 +25,32 @@ fn now() -> OffsetDateTime {
 
 struct Fixture {
     app: Router,
-    exam: ExamService,
+    exam: Arc<ExamService>,
+    manager: tokio::task::JoinHandle<()>,
     _files: tempfile::TempDir,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.manager.abort();
+    }
 }
 
 impl Fixture {
     async fn new() -> Self {
         let files = tempfile::tempdir().unwrap();
         let path = files.path().join("admin.sqlite");
-        let exam =
+        let exam = Arc::new(
             ExamService::open_with_clock(&format!("sqlite://{}?mode=rwc", path.display()), now)
                 .await
-                .unwrap();
+                .unwrap(),
+        );
+        let (hub, manager) = Manager::new(Arc::clone(&exam), Duration::from_secs(25));
+        let manager = tokio::spawn(manager.run());
         Self {
-            app: router(exam.admin(), Token::parse(TEST_ADMIN_TOKEN).unwrap()),
+            app: router(hub, Token::parse(TEST_ADMIN_TOKEN).unwrap()),
             exam,
+            manager,
             _files: files,
         }
     }
@@ -134,6 +148,7 @@ async fn admin_routes_require_bearer_before_reading_or_mutating() {
     );
     let page = fixture
         .app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/admin")
@@ -155,9 +170,10 @@ async fn admin_routes_require_bearer_before_reading_or_mutating() {
 
 #[tokio::test]
 async fn trailing_slash_redirects_to_the_dashboard() {
-    let response = Fixture::new()
-        .await
+    let fixture = Fixture::new().await;
+    let response = fixture
         .app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/admin/")

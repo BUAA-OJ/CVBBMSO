@@ -147,7 +147,7 @@ impl Fixture {
         self.service
             .admin()
             .0
-            .database
+            .writer
             .execute_unprepared(sql)
             .await
             .unwrap();
@@ -315,7 +315,7 @@ async fn participant_import_counts_only_new_enrollments() {
         f.service.check_enrollment(f.exam, user).await.unwrap();
     }
     let rows = audit::Entity::find()
-        .all(&f.service.admin().0.database)
+        .all(&f.service.admin().0.writer)
         .await
         .unwrap();
     let operations = rows
@@ -377,7 +377,7 @@ async fn time_boundaries_determine_command_candidates() {
                 let command_id = command(&commands[0].command, CommandName::StartExam, START);
                 assert_eq!(
                     stored_command::Entity::find()
-                        .count(&f.service.admin().0.database)
+                        .count(&f.service.admin().0.writer)
                         .await
                         .unwrap(),
                     0
@@ -551,7 +551,7 @@ fn valid_states() -> [ClientState; 8] {
 
 async fn persisted_state(f: &Fixture) -> ClientState {
     let key = db::StudentKey::new(f.exam, USER).unwrap();
-    db::Runtime::get(&f.service.admin().0.database, &key)
+    db::Runtime::get(&f.service.admin().0.writer, &key)
         .await
         .unwrap()
         .state()
@@ -668,7 +668,7 @@ async fn end_success_requires_the_contiguous_recording_summary() {
         Err(DomainError::Conflict)
     ));
     // The previous server could persist a finished hello without an end result.
-    let database = f.service.admin().0.database;
+    let database = f.service.admin().0.writer;
     crate::entity::runtime::Entity::update(crate::entity::runtime::ActiveModel {
         exam_id: Set(f.exam.to_string()),
         oj_user_id: Set(USER),
@@ -692,7 +692,7 @@ async fn end_success_requires_the_contiguous_recording_summary() {
     assert_eq!(f.runtime().await.execution, ExecutionState::Finalizing);
     assert!(
         stored_command::Entity::find_by_id(end.to_string())
-            .one(&f.service.admin().0.database)
+            .one(&f.service.admin().0.writer)
             .await
             .unwrap()
             .is_none()
@@ -844,7 +844,7 @@ async fn failed_audit_rolls_back_enrollment() {
     f.admin(op).await;
     f.service.check_enrollment(f.exam, USER + 1).await.unwrap();
     let audits = audit::Entity::find()
-        .all(&f.service.admin().0.database)
+        .all(&f.service.admin().0.writer)
         .await
         .unwrap();
     let operations = audits
@@ -1054,7 +1054,7 @@ async fn failed_runtime_update_rolls_back_end_command_result() {
     .unwrap();
     assert_eq!(f.runtime().await.execution, ExecutionState::Finished);
     let row = stored_command::Entity::find_by_id(command_id.to_string())
-        .one(&f.service.admin().0.database)
+        .one(&f.service.admin().0.writer)
         .await
         .unwrap()
         .unwrap();
@@ -1065,18 +1065,18 @@ async fn failed_runtime_update_rolls_back_end_command_result() {
 }
 
 #[tokio::test]
-async fn one_initial_migration_creates_the_final_tables() {
+async fn migrations_create_the_final_tables() {
     use migration::{Migrator, MigratorTrait};
     use sea_orm::Statement;
 
     let fixture = Fixture::memory().await;
-    let database = fixture.service.admin().0.database;
+    let database = fixture.service.admin().0.writer;
     assert_eq!(
         Migrator::get_applied_migrations(&database)
             .await
             .unwrap()
             .len(),
-        1
+        2
     );
     let tables = database
         .query_all_raw(Statement::from_string(
@@ -1114,8 +1114,8 @@ async fn initial_migration_rolls_back_database_with_evidence() {
         .await
         .unwrap();
     let service = f.service.admin();
-    Migrator::down(&service.0.database, None).await.unwrap();
-    Migrator::up(&service.0.database, None).await.unwrap();
+    Migrator::down(&service.0.writer, None).await.unwrap();
+    Migrator::up(&service.0.writer, None).await.unwrap();
     assert!(matches!(
         f.service.check_enrollment(f.exam, USER).await,
         Err(DomainError::NotFound)
@@ -1145,7 +1145,7 @@ async fn stale_write_snapshot_rechecks_enrollment_after_concurrent_cli_commit() 
         .await
         .unwrap()
         .admin();
-    let database = f.service.admin().0.database;
+    let database = f.service.admin().0.writer;
     let key = db::StudentKey::new(f.exam, USER).unwrap();
     let mut attempts = 0;
     let outcome = db::write(&database, |tx| {
@@ -1184,4 +1184,457 @@ async fn stale_write_snapshot_rechecks_enrollment_after_concurrent_cli_commit() 
         panic!("expected exam")
     };
     assert_eq!(summary.title, "Programming");
+}
+
+#[tokio::test]
+async fn wal_and_read_only_pool_configured_for_file_databases() {
+    use sea_orm::{DbBackend, Statement};
+
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("exam.sqlite").display()
+    );
+    let f = Fixture::open(&url).await;
+    let service = f.service.admin().0;
+
+    let journal: String = service
+        .writer
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA journal_mode",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index(0)
+        .unwrap();
+    assert_eq!(journal.to_ascii_lowercase(), "wal");
+
+    let synchronous: i64 = service
+        .writer
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA synchronous",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index(0)
+        .unwrap();
+    assert_eq!(synchronous, 2);
+
+    let foreign_keys: i64 = service
+        .reader
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA foreign_keys",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index(0)
+        .unwrap();
+    assert_eq!(foreign_keys, 1);
+
+    let write_attempt = service
+        .reader
+        .execute_unprepared("UPDATE exams SET title = 'blocked'")
+        .await;
+    assert!(write_attempt.is_err());
+
+    f.connect(ready()).await;
+    let candidates = f.service.due_command_candidates().await.unwrap();
+    assert!(candidates.is_empty());
+}
+
+#[tokio::test]
+async fn due_schedule_query_uses_indexes_and_filters_unenrolled_or_offline() {
+    use sea_orm::{DbBackend, Statement};
+
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("exam.sqlite").display()
+    );
+    let f = Fixture::open(&url).await;
+    f.admin(AdminOperation::ParticipantsAdd {
+        exam_id: f.exam,
+        oj_user_id: USER + 1,
+    })
+    .await;
+    f.admin(AdminOperation::ParticipantsAdd {
+        exam_id: f.exam,
+        oj_user_id: USER + 2,
+    })
+    .await;
+    f.connect(ready()).await;
+    f.service.connect(f.exam, USER + 1, ready()).await.unwrap();
+    f.service.connect(f.exam, USER + 2, ready()).await.unwrap();
+    f.service
+        .disconnect(f.exam, USER + 2, DisconnectReason::Closed)
+        .await
+        .unwrap();
+    f.admin(AdminOperation::ParticipantsRemove {
+        exam_id: f.exam,
+        oj_user_id: USER + 1,
+    })
+    .await;
+
+    let query = crate::exam::build_due_schedule_query();
+    let (sql, values) = query.build(sea_orm::sea_query::SqliteQueryBuilder);
+    let explain = Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        format!("EXPLAIN QUERY PLAN {sql}"),
+        values,
+    );
+    let rows = f
+        .service
+        .admin()
+        .0
+        .reader
+        .query_all_raw(explain)
+        .await
+        .unwrap();
+    let plan: Vec<String> = rows
+        .into_iter()
+        .map(|row| row.try_get_by_index::<String>(3).unwrap())
+        .collect();
+    let joined_plan = plan.join(" | ");
+    assert!(
+        joined_plan.contains("USING INDEX student_runtimes_online"),
+        "expected partial index usage on student_runtimes, got: {joined_plan}"
+    );
+    assert!(
+        joined_plan.contains("sqlite_autoindex_enrollments_1"),
+        "expected PK index usage on enrollments, got: {joined_plan}"
+    );
+
+    f.set(START);
+    let candidates = f.service.due_command_candidates().await.unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].oj_user_id, USER);
+    assert!(candidates[0].connection_id.is_some());
+}
+
+#[tokio::test]
+async fn execute_batch_isolates_business_errors_with_savepoints() {
+    use crate::{BatchOutput, BatchWrite};
+
+    let f = Fixture::memory().await;
+    f.admin(AdminOperation::ParticipantsAdd {
+        exam_id: f.exam,
+        oj_user_id: USER + 1,
+    })
+    .await;
+    let conn1 = Uuid::new_v4();
+    let conn2 = Uuid::new_v4();
+    let ClientMessage::Event { event: nav, .. } = incident_event(1, time(START)) else {
+        unreachable!()
+    };
+
+    let outcomes = f
+        .service
+        .execute_batch(
+            vec![
+                BatchWrite::Connect {
+                    exam_id: f.exam,
+                    oj_user_id: USER,
+                    connection_id: conn1,
+                    hello: ready(),
+                    observed_at: time(START),
+                },
+                BatchWrite::Connect {
+                    exam_id: f.exam,
+                    oj_user_id: USER + 1,
+                    connection_id: conn2,
+                    hello: ready(),
+                    observed_at: time(START),
+                },
+                BatchWrite::Event {
+                    exam_id: f.exam,
+                    oj_user_id: USER,
+                    connection_id: Some(conn1),
+                    seq: 1,
+                    event: nav.clone(),
+                    observed_at: time(START),
+                },
+                BatchWrite::Status {
+                    exam_id: f.exam,
+                    oj_user_id: USER,
+                    connection_id: Some(conn1),
+                    state: state(ExecutionState::Recording, RecordingState::Capturing),
+                },
+                // Invalid transition (Recording -> Ready) must roll back only its savepoint.
+                BatchWrite::Status {
+                    exam_id: f.exam,
+                    oj_user_id: USER,
+                    connection_id: Some(conn1),
+                    state: state(ExecutionState::Ready, RecordingState::Idle),
+                },
+                // Subsequent valid write for USER + 1 must still commit.
+                BatchWrite::Event {
+                    exam_id: f.exam,
+                    oj_user_id: USER + 1,
+                    connection_id: Some(conn2),
+                    seq: 1,
+                    event: nav,
+                    observed_at: time(START),
+                },
+            ],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(outcomes[0], Ok(BatchOutput::Connected(_))));
+    assert!(matches!(outcomes[1], Ok(BatchOutput::Connected(_))));
+    assert!(matches!(outcomes[2], Ok(BatchOutput::Ack)));
+    assert!(matches!(outcomes[3], Ok(BatchOutput::Ack)));
+    assert!(matches!(outcomes[4], Err(DomainError::InvalidInput)));
+    assert!(matches!(outcomes[5], Ok(BatchOutput::Ack)));
+    assert_eq!(f.runtime().await.execution, ExecutionState::Recording);
+}
+
+#[tokio::test]
+async fn execute_batch_rolls_back_entire_batch_on_storage_error() {
+    use crate::BatchWrite;
+
+    let f = Fixture::memory().await;
+    f.admin(AdminOperation::ParticipantsAdd {
+        exam_id: f.exam,
+        oj_user_id: USER + 1,
+    })
+    .await;
+    let conn1 = Uuid::new_v4();
+    let conn2 = Uuid::new_v4();
+    f.service
+        .execute_batch(
+            vec![
+                BatchWrite::Connect {
+                    exam_id: f.exam,
+                    oj_user_id: USER,
+                    connection_id: conn1,
+                    hello: ready(),
+                    observed_at: time(START),
+                },
+                BatchWrite::Connect {
+                    exam_id: f.exam,
+                    oj_user_id: USER + 1,
+                    connection_id: conn2,
+                    hello: ready(),
+                    observed_at: time(START),
+                },
+            ],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let ClientMessage::Event { event: nav, .. } = incident_event(1, time(START)) else {
+        unreachable!()
+    };
+    f.trigger_ddl(
+        "CREATE TRIGGER fail_second_event BEFORE INSERT ON events
+           WHEN NEW.oj_user_id = 8
+           BEGIN SELECT RAISE(ABORT, 'batch storage fault'); END",
+    )
+    .await;
+    let err = f
+        .service
+        .execute_batch(
+            vec![
+                BatchWrite::Event {
+                    exam_id: f.exam,
+                    oj_user_id: USER,
+                    connection_id: Some(conn1),
+                    seq: 1,
+                    event: nav.clone(),
+                    observed_at: time(START + 1),
+                },
+                BatchWrite::Event {
+                    exam_id: f.exam,
+                    oj_user_id: USER + 1,
+                    connection_id: Some(conn2),
+                    seq: 1,
+                    event: nav,
+                    observed_at: time(START + 1),
+                },
+            ],
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DomainError::Storage { .. }));
+    let AdminOutput::Events(user_events) = f
+        .admin(AdminOperation::EventsList {
+            exam_id: f.exam,
+            oj_user_id: USER,
+        })
+        .await
+    else {
+        panic!("expected events")
+    };
+    assert!(user_events.is_empty());
+}
+
+#[tokio::test]
+async fn execute_batch_flushes_heartbeats_for_matching_active_connections_only() {
+    use crate::{BatchWrite, HeartbeatUpdate};
+
+    let f = Fixture::memory().await;
+    f.admin(AdminOperation::ParticipantsAdd {
+        exam_id: f.exam,
+        oj_user_id: USER + 1,
+    })
+    .await;
+    f.admin(AdminOperation::ParticipantsAdd {
+        exam_id: f.exam,
+        oj_user_id: USER + 2,
+    })
+    .await;
+    let conn1 = Uuid::new_v4();
+    let conn2 = Uuid::new_v4();
+    let conn3 = Uuid::new_v4();
+    f.service
+        .execute_batch(
+            vec![
+                BatchWrite::Connect {
+                    exam_id: f.exam,
+                    oj_user_id: USER,
+                    connection_id: conn1,
+                    hello: ready(),
+                    observed_at: time(START - 10),
+                },
+                BatchWrite::Connect {
+                    exam_id: f.exam,
+                    oj_user_id: USER + 1,
+                    connection_id: conn2,
+                    hello: ready(),
+                    observed_at: time(START - 10),
+                },
+                BatchWrite::Connect {
+                    exam_id: f.exam,
+                    oj_user_id: USER + 2,
+                    connection_id: conn3,
+                    hello: ready(),
+                    observed_at: time(START - 10),
+                },
+            ],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    f.service
+        .disconnect(f.exam, USER + 2, DisconnectReason::Closed)
+        .await
+        .unwrap();
+
+    // Flush heartbeats with: valid conn1, stale generation for USER + 1, offline USER + 2.
+    f.service
+        .execute_batch(
+            Vec::new(),
+            vec![
+                HeartbeatUpdate {
+                    exam_id: f.exam,
+                    oj_user_id: USER,
+                    connection_id: conn1,
+                    last_seen_at: time(START + 5),
+                },
+                HeartbeatUpdate {
+                    exam_id: f.exam,
+                    oj_user_id: USER + 1,
+                    connection_id: Uuid::new_v4(),
+                    last_seen_at: time(START + 5),
+                },
+                HeartbeatUpdate {
+                    exam_id: f.exam,
+                    oj_user_id: USER + 2,
+                    connection_id: conn3,
+                    last_seen_at: time(START + 5),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(f.runtime().await.last_seen_at, Some(time(START + 5)));
+    let AdminOutput::Student(other) = f
+        .admin(AdminOperation::StudentsShow {
+            exam_id: f.exam,
+            oj_user_id: USER + 1,
+        })
+        .await
+    else {
+        panic!("expected student")
+    };
+    assert_eq!(other.last_seen_at, Some(time(START - 10)));
+    let AdminOutput::Student(offline) = f
+        .admin(AdminOperation::StudentsShow {
+            exam_id: f.exam,
+            oj_user_id: USER + 2,
+        })
+        .await
+    else {
+        panic!("expected student")
+    };
+    assert_eq!(offline.last_seen_at, Some(time(START - 10)));
+}
+
+#[tokio::test]
+async fn immediate_transaction_acquires_write_lock_upfront() {
+    use sea_orm::ConnectionTrait;
+
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("exam.sqlite").display()
+    );
+    let f = Fixture::open(&url).await;
+    let writer_pool = f.service.admin().0.writer;
+
+    let mut opts = sea_orm::ConnectOptions::new(&url);
+    opts.map_sqlx_sqlite_opts(|o| o.busy_timeout(std::time::Duration::from_millis(10)));
+    let second = sea_orm::Database::connect(opts).await.unwrap();
+
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let holder = tokio::spawn(async move {
+        db::immediate_transaction(&writer_pool, |_tx| {
+            Box::pin(async move {
+                let _ = locked_tx.send(());
+                let _ = release_rx.await;
+                Ok(())
+            })
+        })
+        .await
+    });
+    locked_rx.await.unwrap();
+
+    // Another writer trying to acquire BEGIN IMMEDIATE must fail with SQLITE_BUSY immediately
+    // even though the holder has not executed any SQL write statement inside its transaction.
+    let err = db::immediate_transaction(&second, |tx| {
+        Box::pin(async move {
+            tx.execute_unprepared("SELECT 1").await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        err.is_storage_busy(),
+        "expected BEGIN IMMEDIATE lock contention, got: {err:?}"
+    );
+
+    let _ = release_tx.send(());
+    holder.await.unwrap().unwrap();
+
+    // Verify `second` pool remains healthy after a busy BEGIN IMMEDIATE failure.
+    db::immediate_transaction(&second, |tx| {
+        Box::pin(async move {
+            tx.execute_unprepared("SELECT 1").await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
 }

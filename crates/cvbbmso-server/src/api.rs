@@ -16,6 +16,7 @@ use cvbbmso_accoding::{AccodingCookies, AccodingError, Verifier};
 use cvbbmso_domain::{DomainError, ExamService};
 use cvbbmso_protocol::{AccodingUser, ExamListResponse, error_code};
 use serde_json::json;
+use tokio::{sync::Semaphore, time::Instant};
 use tracing::{Instrument, Span};
 use uuid::Uuid;
 
@@ -25,11 +26,30 @@ use crate::{
 };
 
 const MAX_INBOUND_WS_BYTES: usize = 64 * 1024;
+const DEFAULT_AUTH_MAX_CONCURRENCY: usize = 64;
+const DEFAULT_AUTH_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AuthConfig {
+    pub(crate) max_concurrency: usize,
+    pub(crate) wait_timeout: Duration,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrency: DEFAULT_AUTH_MAX_CONCURRENCY,
+            wait_timeout: DEFAULT_AUTH_WAIT_TIMEOUT,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct AppState {
     exam: Arc<ExamService>,
     verifier: Arc<IdentityVerifier>,
+    auth_semaphore: Arc<Semaphore>,
+    auth_wait_timeout: Duration,
     hub: Hub,
     timeout: Duration,
 }
@@ -52,10 +72,13 @@ impl AppState {
         verifier: Verifier,
         hub: Hub,
         timeout: Duration,
+        auth: AuthConfig,
     ) -> Self {
         Self {
             exam,
             verifier: Arc::new(IdentityVerifier::Accoding(verifier)),
+            auth_semaphore: Arc::new(Semaphore::new(auth.max_concurrency.max(1))),
+            auth_wait_timeout: auth.wait_timeout,
             hub,
             timeout,
         }
@@ -63,12 +86,28 @@ impl AppState {
 
     async fn authenticate(&self, headers: &HeaderMap) -> Result<AccodingUser, HttpError> {
         let cookies = parse_cookies(headers).map_err(|error| HttpError::authentication(&error))?;
-        let user = match self.verifier.as_ref() {
+        let _permit = tokio::time::timeout(self.auth_wait_timeout, self.auth_semaphore.acquire())
+            .await
+            .map_err(|_| {
+                tracing::warn!("Accoding authentication concurrency queue timed out");
+                HttpError {
+                    reason: Cow::Borrowed("Accoding authentication concurrency wait timed out"),
+                    ..HttpError::ACCODING_UNAVAILABLE
+                }
+            })?
+            .map_err(|_| HttpError::INTERNAL_ERROR)?;
+        let started = Instant::now();
+        let result = match self.verifier.as_ref() {
             IdentityVerifier::Accoding(verifier) => verifier.verify(&cookies).await,
             #[cfg(test)]
             IdentityVerifier::Test(verify) => verify(&cookies),
-        }
-        .map_err(|error| HttpError::authentication(&error))?;
+        };
+        let elapsed_ms = started.elapsed().as_millis();
+        let user = result.map_err(|error| {
+            tracing::debug!(elapsed_ms, "Accoding verification failed");
+            HttpError::authentication(&error)
+        })?;
+        tracing::debug!(elapsed_ms, "Accoding verification succeeded");
         Span::current().record("oj_user_id", user.id);
         Ok(user)
     }

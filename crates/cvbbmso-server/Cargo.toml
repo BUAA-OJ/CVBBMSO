@@ -17,7 +17,7 @@ serde_json.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["json"] }

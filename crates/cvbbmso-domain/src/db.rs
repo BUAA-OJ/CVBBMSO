@@ -5,7 +5,12 @@ use migration::{Migrator, MigratorTrait};
 use sea_orm::{
     ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseConnection,
     DatabaseTransaction, DbErr, EntityTrait, JoinType, QueryFilter, QueryOrder, QuerySelect,
-    QueryTrait, RelationTrait, RuntimeErr, TransactionTrait, sqlx,
+    QueryTrait, RelationTrait, RuntimeErr, SqliteTransactionMode, TransactionOptions,
+    TransactionTrait,
+    sqlx::{
+        self,
+        sqlite::{SqliteJournalMode, SqliteSynchronous},
+    },
 };
 use serde::{Serialize, de::DeserializeOwned};
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
@@ -18,32 +23,85 @@ use crate::{
 
 pub(crate) use crate::entity::{exam::Model as StoredExam, runtime::Model as Runtime};
 
-pub(crate) async fn open(url: &str) -> Result<DatabaseConnection, DomainError> {
+const READ_POOL_MAX_CONNECTIONS: u32 = 4;
+const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+
+pub(crate) struct Pools {
+    pub(crate) writer: DatabaseConnection,
+    pub(crate) reader: DatabaseConnection,
+}
+
+fn is_memory_url(url: &str) -> bool {
+    let without_scheme = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"));
+    let Some(rest) = without_scheme else {
+        return false;
+    };
+    let path = rest.split('?').next().unwrap_or("");
+    let query = rest.split_once('?').map_or("", |(_, q)| q);
+    path == ":memory:"
+        || query
+            .split('&')
+            .any(|param| param.eq_ignore_ascii_case("mode=memory"))
+}
+
+pub(crate) async fn open(url: &str) -> Result<Pools, DomainError> {
     if !url.starts_with("sqlite:") {
         return Err(DomainError::InvalidInput);
     }
-    let mut options = ConnectOptions::new(url);
-    // A memory database shares the lifetime of its single pooled connection.
-    options
+    let memory = is_memory_url(url);
+    let mut write_options = ConnectOptions::new(url);
+    // Keep a single writer connection; memory databases also share this connection for reads.
+    write_options
         .max_connections(1)
         .min_connections(1)
         .idle_timeout(None)
         .max_lifetime(None)
         .sqlx_logging(false)
-        .map_sqlx_sqlite_opts(|options| {
-            options
+        .map_sqlx_sqlite_opts(move |options| {
+            let options = options
                 .foreign_keys(true)
-                .busy_timeout(Duration::from_millis(250))
+                .busy_timeout(BUSY_TIMEOUT)
+                .pragma("cache_size", "-32768");
+            if memory {
+                options
+            } else {
+                options
+                    .journal_mode(SqliteJournalMode::Wal)
+                    .synchronous(SqliteSynchronous::Full)
+                    .pragma("wal_autocheckpoint", "1000")
+            }
         });
-    let db = Database::connect(options).await?;
-    write(&db, |transaction| {
+    let writer = Database::connect(write_options).await?;
+    write(&writer, |transaction| {
         Box::pin(async move {
             Migrator::up(transaction, None).await?;
             Ok(())
         })
     })
     .await?;
-    Ok(db)
+
+    let reader = if memory {
+        writer.clone()
+    } else {
+        let mut read_options = ConnectOptions::new(url);
+        read_options
+            .max_connections(READ_POOL_MAX_CONNECTIONS)
+            .min_connections(1)
+            .sqlx_logging(false)
+            .map_sqlx_sqlite_opts(move |options| {
+                options
+                    .read_only(true)
+                    .create_if_missing(false)
+                    .foreign_keys(true)
+                    .busy_timeout(BUSY_TIMEOUT)
+                    .pragma("cache_size", "-32768")
+            });
+        Database::connect(read_options).await?
+    };
+
+    Ok(Pools { writer, reader })
 }
 
 type TransactionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, DomainError>> + Send + 'a>>;
@@ -64,6 +122,28 @@ pub(crate) async fn write<T>(
     transaction(db, operation).await
 }
 
+pub(crate) async fn immediate_transaction<T>(
+    db: &DatabaseConnection,
+    operation: impl for<'a> FnOnce(&'a DatabaseTransaction) -> TransactionFuture<'a, T>,
+) -> Result<T, DomainError> {
+    let tx = db
+        .begin_with_options(TransactionOptions {
+            sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+            ..Default::default()
+        })
+        .await?;
+    match operation(&tx).await {
+        Ok(output) => {
+            tx.commit().await?;
+            Ok(output)
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
 pub(crate) async fn transaction<T>(
     db: &DatabaseConnection,
     operation: impl for<'a> FnOnce(&'a DatabaseTransaction) -> TransactionFuture<'a, T>,
@@ -82,27 +162,60 @@ pub(crate) async fn transaction<T>(
 }
 
 pub(crate) fn busy(error: &DomainError) -> bool {
+    if let DomainError::Storage { source } = error
+        && let Some(shared) = source.downcast_ref::<crate::SharedStorageError>()
+    {
+        return busy(&shared.0);
+    }
+    sqlite_error_code(error).is_some_and(|code| matches!(code & 0xff, 5 | 6))
+}
+
+pub(crate) fn storage_fault(error: &DomainError) -> bool {
     let DomainError::Storage { source } = error else {
         return false;
     };
-    let Some(
-        DbErr::Exec(RuntimeErr::SqlxError(error))
-        | DbErr::Query(RuntimeErr::SqlxError(error))
-        | DbErr::Conn(RuntimeErr::SqlxError(error)),
-    ) = source.downcast_ref::<DbErr>()
-    else {
+    if let Some(shared) = source.downcast_ref::<crate::SharedStorageError>() {
+        return storage_fault(&shared.0);
+    }
+    let Some(db_err) = source.downcast_ref::<DbErr>() else {
         return false;
+    };
+    let (DbErr::Exec(RuntimeErr::SqlxError(err))
+    | DbErr::Query(RuntimeErr::SqlxError(err))
+    | DbErr::Conn(RuntimeErr::SqlxError(err))) = db_err
+    else {
+        return matches!(db_err, DbErr::ConnectionAcquire(_));
+    };
+    match err.as_ref() {
+        sqlx::Error::Io(_) | sqlx::Error::PoolClosed => true,
+        sqlx::Error::Database(source) => source
+            .code()
+            .and_then(|code| code.parse::<u32>().ok())
+            .is_some_and(|code| matches!(code & 0xff, 8 | 10 | 11 | 13 | 14 | 26)),
+        _ => false,
+    }
+}
+
+fn sqlite_error_code(error: &DomainError) -> Option<u32> {
+    let DomainError::Storage { source } = error else {
+        return None;
+    };
+    let (DbErr::Exec(RuntimeErr::SqlxError(error))
+    | DbErr::Query(RuntimeErr::SqlxError(error))
+    | DbErr::Conn(RuntimeErr::SqlxError(error))) = source.downcast_ref::<DbErr>()?
+    else {
+        return None;
     };
     let sqlx::Error::Database(source) = error.as_ref() else {
-        return false;
+        return None;
     };
-    source
-        .code()
-        .and_then(|code| code.parse::<u32>().ok())
-        .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+    source.code()?.parse::<u32>().ok()
 }
 
 pub(crate) fn storage_diagnostic(source: &(dyn Error + 'static)) -> Cow<'static, str> {
+    if let Some(shared) = source.downcast_ref::<crate::SharedStorageError>() {
+        return shared.0.diagnostic();
+    }
     // Driver and conversion messages can quote database paths or stored values.
     if let Some(error) = source.downcast_ref::<DbErr>() {
         let (operation, runtime) = match error {
@@ -319,14 +432,20 @@ impl Runtime {
         Self::find(db, key).await?.ok_or(DomainError::NotFound)
     }
 
-    pub(crate) async fn connected(
+    pub(crate) async fn connected_generation(
         db: &impl ConnectionTrait,
         key: &StudentKey,
+        connection_id: Option<Uuid>,
     ) -> Result<Self, DomainError> {
         require_enrollment(db, key).await?;
         let runtime = Self::get(db, key).await?;
         if !runtime.connected {
             return Err(DomainError::NotEnrolled);
+        }
+        if let Some(expected) = connection_id
+            && runtime.connection_id.as_deref() != Some(&expected.to_string())
+        {
+            return Err(DomainError::Conflict);
         }
         Ok(runtime)
     }

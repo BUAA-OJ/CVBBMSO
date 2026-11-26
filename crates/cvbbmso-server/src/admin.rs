@@ -8,13 +8,15 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
-use cvbbmso_domain::{AdminOperation, AdminOutput, AdminService, DomainError};
+use cvbbmso_domain::{AdminOperation, AdminOutput, DomainError};
 use cvbbmso_protocol::admin::{
     CreateExam, CreatedExam, ErrorResponse, Event, ExamDetail, ImportParticipants,
     ImportedParticipants, Incident, IncidentFilter, RosterEntry, StudentStatus,
 };
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
+
+use crate::hub::Hub;
 
 const TOKEN_LENGTH: usize = 64;
 const ADMIN_ACTOR: &str = "control_panel";
@@ -56,7 +58,7 @@ impl Token {
     }
 }
 
-pub(crate) fn router(service: AdminService, token: Token) -> Router {
+pub(crate) fn router(hub: Hub, token: Token) -> Router {
     let api = Router::new()
         .route("/exams", get(exams).post(create_exam))
         .route("/exams/{exam_id}", get(exam))
@@ -74,7 +76,7 @@ pub(crate) fn router(service: AdminService, token: Token) -> Router {
         )
         .layer(DefaultBodyLimit::max(65_536))
         .route_layer(middleware::from_fn_with_state(token, authorize))
-        .with_state(service);
+        .with_state(hub);
 
     Router::new()
         .nest("/api/admin", api)
@@ -177,19 +179,16 @@ impl From<DomainError> for AdminError {
     }
 }
 
-async fn exams(State(service): State<AdminService>) -> Result<Response, AdminError> {
-    execute(&service, AdminOperation::ExamsList).await
+async fn exams(State(hub): State<Hub>) -> Result<Response, AdminError> {
+    execute(&hub, AdminOperation::ExamsList).await
 }
 
-async fn exam(
-    State(service): State<AdminService>,
-    Path(exam_id): Path<Uuid>,
-) -> Result<Response, AdminError> {
-    execute(&service, AdminOperation::ExamsShow { exam_id }).await
+async fn exam(State(hub): State<Hub>, Path(exam_id): Path<Uuid>) -> Result<Response, AdminError> {
+    execute(&hub, AdminOperation::ExamsShow { exam_id }).await
 }
 
 async fn create_exam(
-    State(service): State<AdminService>,
+    State(hub): State<Hub>,
     body: Result<Json<CreateExam>, JsonRejection>,
 ) -> Result<Response, AdminError> {
     let Json(body) = body.map_err(|error| AdminError::body(&error))?;
@@ -198,7 +197,7 @@ async fn create_exam(
         return Err(AdminError::INVALID);
     }
     execute(
-        &service,
+        &hub,
         AdminOperation::ExamsCreate {
             title: title.to_owned(),
             start_at: body.start_at,
@@ -210,7 +209,7 @@ async fn create_exam(
 }
 
 async fn import(
-    State(service): State<AdminService>,
+    State(hub): State<Hub>,
     Path(exam_id): Path<Uuid>,
     body: Result<Json<ImportParticipants>, JsonRejection>,
 ) -> Result<Response, AdminError> {
@@ -225,7 +224,7 @@ async fn import(
         .collect::<Result<_, _>>()
         .map_err(|_| AdminError::INVALID)?;
     execute(
-        &service,
+        &hub,
         AdminOperation::ParticipantsImport {
             exam_id,
             oj_user_ids,
@@ -235,11 +234,11 @@ async fn import(
 }
 
 async fn remove(
-    State(service): State<AdminService>,
+    State(hub): State<Hub>,
     Path((exam_id, oj_user_id)): Path<(Uuid, i64)>,
 ) -> Result<Response, AdminError> {
     execute(
-        &service,
+        &hub,
         AdminOperation::ParticipantsRemove {
             exam_id,
             oj_user_id,
@@ -249,12 +248,12 @@ async fn remove(
 }
 
 async fn incidents(
-    State(service): State<AdminService>,
+    State(hub): State<Hub>,
     Path(exam_id): Path<Uuid>,
     Query(filter): Query<IncidentFilter>,
 ) -> Result<Response, AdminError> {
     execute(
-        &service,
+        &hub,
         AdminOperation::IncidentsList {
             exam_id,
             oj_user_id: filter.oj_user_id,
@@ -267,11 +266,11 @@ async fn incidents(
 }
 
 async fn events(
-    State(service): State<AdminService>,
+    State(hub): State<Hub>,
     Path((exam_id, oj_user_id)): Path<(Uuid, i64)>,
 ) -> Result<Response, AdminError> {
     execute(
-        &service,
+        &hub,
         AdminOperation::EventsList {
             exam_id,
             oj_user_id,
@@ -281,11 +280,11 @@ async fn events(
 }
 
 async fn recording(
-    State(service): State<AdminService>,
+    State(hub): State<Hub>,
     Path((exam_id, oj_user_id)): Path<(Uuid, i64)>,
 ) -> Result<Response, AdminError> {
     execute(
-        &service,
+        &hub,
         AdminOperation::RecordingsShow {
             exam_id,
             oj_user_id,
@@ -295,11 +294,11 @@ async fn recording(
 }
 
 async fn roster(
-    State(service): State<AdminService>,
+    State(hub): State<Hub>,
     Path(exam_id): Path<Uuid>,
 ) -> Result<Json<Vec<RosterEntry>>, AdminError> {
-    let AdminOutput::Participants(participants) = service
-        .execute(
+    let AdminOutput::Participants(participants) = hub
+        .admin(
             ADMIN_ACTOR.into(),
             AdminOperation::ParticipantsList { exam_id },
         )
@@ -307,8 +306,8 @@ async fn roster(
     else {
         return Err(AdminError::INTERNAL);
     };
-    let AdminOutput::Students(students) = service
-        .execute(
+    let AdminOutput::Students(students) = hub
+        .admin(
             ADMIN_ACTOR.into(),
             AdminOperation::StudentsStatus { exam_id },
         )
@@ -344,11 +343,8 @@ async fn roster(
     Ok(Json(entries.into_values().collect()))
 }
 
-async fn execute(
-    service: &AdminService,
-    operation: AdminOperation,
-) -> Result<Response, AdminError> {
-    let output = service.execute(ADMIN_ACTOR.into(), operation).await?;
+async fn execute(hub: &Hub, operation: AdminOperation) -> Result<Response, AdminError> {
+    let output = hub.admin(ADMIN_ACTOR.into(), operation).await?;
     Ok(match output {
         AdminOutput::ExamCreated { exam_id } => {
             (StatusCode::CREATED, Json(CreatedExam { exam_id })).into_response()

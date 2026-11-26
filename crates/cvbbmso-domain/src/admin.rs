@@ -5,7 +5,9 @@ use cvbbmso_protocol::{
     admin::IncidentSource,
 };
 use sea_orm::{
-    ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QueryTrait, Set,
+    ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, EntityTrait, QueryFilter,
+    QueryOrder, QueryTrait, Set,
+    sea_query::{Expr, OnConflict, Query},
 };
 use serde::{Serialize, Serializer};
 use time::OffsetDateTime;
@@ -250,25 +252,26 @@ impl AdminService {
                 | AdminOperation::ParticipantsRemove { .. }
                 | AdminOperation::ParticipantsImport { .. }
         ) {
-            db::write(&self.0.database, |tx| {
+            db::write(&self.0.writer, |tx| {
                 let service = self.0.clone();
                 let actor = actor.clone();
                 let op = op.clone();
-                Box::pin(async move { mutate(tx, &service, &actor, &op).await })
+                Box::pin(async move { mutate(tx, &service, &actor, &op, None).await })
             })
             .await
         } else {
             let now = self.0.now();
-            db::transaction(&self.0.database, |tx| Box::pin(query(tx, op, now))).await
+            db::transaction(&self.0.reader, |tx| Box::pin(query(tx, op, now))).await
         }
     }
 }
 
-async fn mutate(
+pub(crate) async fn mutate(
     tx: &DatabaseTransaction,
     service: &Service,
     actor: &str,
     op: &AdminOperation,
+    last_seen_at: Option<OffsetDateTime>,
 ) -> Result<AdminOutput, DomainError> {
     let mut now = service.now();
     let output = match *op {
@@ -322,7 +325,14 @@ async fn mutate(
                 return Err(DomainError::NotFound);
             }
             if let Some(runtime) = Runtime::find(tx, &key).await? {
-                exam_service::disconnect(tx, &runtime, DisconnectReason::Closed, now).await?;
+                exam_service::disconnect_with_last_seen(
+                    tx,
+                    &runtime,
+                    DisconnectReason::Closed,
+                    now,
+                    last_seen_at,
+                )
+                .await?;
             }
             AdminOutput::ParticipantRemoved
         }
@@ -343,15 +353,30 @@ async fn import_participants(
     exam_id: Uuid,
     oj_user_ids: &[i64],
 ) -> Result<usize, DomainError> {
+    const IMPORT_CHUNK_SIZE: usize = 400;
     for &id in oj_user_ids {
         db::validate_user(id)?;
     }
     let users: BTreeSet<_> = oj_user_ids.iter().copied().collect();
     let exam = exam_id.to_string();
     db::exam(tx, &exam).await?;
-    let mut count = 0;
-    for user in users {
-        count += add_participant(tx, &exam, user).await?;
+    if users.is_empty() {
+        return Ok(0);
+    }
+    let users_vec: Vec<i64> = users.into_iter().collect();
+    let mut count = 0usize;
+    for chunk in users_vec.chunks(IMPORT_CHUNK_SIZE) {
+        let mut insert = Query::insert();
+        insert
+            .into_table(enrollment::Entity)
+            .columns([enrollment::Column::ExamId, enrollment::Column::OjUserId])
+            .on_conflict(OnConflict::new().do_nothing().to_owned());
+        for &user in chunk {
+            insert.values_panic([Expr::val(exam.as_str()), Expr::val(user)]);
+        }
+        let statement = DbBackend::Sqlite.build(&insert);
+        let result = tx.execute_raw(statement).await?;
+        count += usize::try_from(result.rows_affected()).map_err(DomainError::storage)?;
     }
     Ok(count)
 }
