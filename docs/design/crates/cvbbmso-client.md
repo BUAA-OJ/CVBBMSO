@@ -78,7 +78,7 @@ impl AppState {
 
 刚启动、等待批准与安装期间，Rust 拒绝打开 Accoding、读取会话、请求报名列表和进入考试。守卫返回已验证的句柄后，`admission_status` 才返回 `ready` 并开放这些操作。虚拟机预检通过后，若监考地址缺失，`list_exams` 仍返回 `monitor_unconfigured`。
 
-一次只运行一次准入检查。守卫由应用持有，每 30 秒复查。安装完成后另行复查系统代理与 TUN 或 VPN 默认路由，之后每 3 秒复查。检测到冲突或无法读取配置时，准入状态变为 `restricted`，暂停新入场并显示原因。现有考试保留会话和录像，守卫继续运行，配置恢复后自动恢复准入。运行期校验失败时，Rust 阻止新入场并结束活动考试，界面提示联系监考人员后重新启动客户端。关闭一场考试时守卫继续运行。退出客户端会先结束并封存考试，再等待已开始的守卫安装并清理其状态。守卫清理失败时，控制窗仍可关闭，并显示错误类别。准入状态为 `cleanup_failed`，其 `reason` 携带 `code` 和 `diagnostic_saved`。客户端尝试在应用数据目录写入最近一次失败的 `egress-cleanup.json`，只记录操作、时间、平台和错误类别。macOS 的目录为 `~/Library/Application Support/edu.buaa.accoding.cvbbmso/`，Windows 为 `%LOCALAPPDATA%\edu.buaa.accoding.cvbbmso\`。
+应用每 30 秒校验网络守卫。安装守卫后，独立任务检查系统代理与 TUN 或 VPN 默认路由，每次检查完成后间隔 3 秒。检测到冲突、无法读取配置或检查超过 3 秒时，准入状态变为 `restricted`，暂停新入场并显示原因。超时的系统调用返回后才开始下一次检查，新检查通过后自动恢复准入。期间现有考试保留会话和录像，守卫校验和退出清理照常进行。守卫校验失败时，Rust 阻止新入场并结束活动考试，界面提示联系监考人员后重新启动客户端。关闭一场考试时守卫继续运行。退出客户端会先结束并封存考试，再等待已开始的守卫安装并清理其状态。守卫清理失败时，控制窗仍可关闭，并显示错误类别。准入状态为 `cleanup_failed`，其 `reason` 携带 `code` 和 `diagnostic_saved`。客户端尝试在应用数据目录写入最近一次失败的 `egress-cleanup.json`，只记录操作、时间、平台和错误类别。macOS 的目录为 `~/Library/Application Support/edu.buaa.accoding.cvbbmso/`，Windows 为 `%LOCALAPPDATA%\edu.buaa.accoding.cvbbmso\`。
 
 Release 桌面冒烟使用替身检查权限顺序、并发重试、macOS 等待批准和 PF 阻断，以及运行期守卫失效。`--native-admission-exit` 覆盖安装尚未返回时退出。`--native-admission-cleanup-failure` 覆盖重复关闭、诊断和确认退出。签名 DMG、系统服务授权、真实 PF 与 WFP 在隔离环境中验收。
 
@@ -99,11 +99,11 @@ Windows 基于 WebView2 配置 `AreDevToolsEnabled=false`、`AreBrowserAccelerat
 
 ## Cookie 登录与考试连接
 
-报名列表隐藏服务端已标记为结束的考试，也会根据报名列表的时间自动隐藏到期的考试。成功入场后，本场报名卡片显示「已进入」。进行中的会话继续显示，直到用户在收尾确认后离开。当前会话仍在等待确认时，控制窗定期读取本地状态快照，以免遗漏结束通知。
+报名列表按服务端状态显示未开始和进行中的考试，隐藏已结束的考试。列表中有可参加的考试时，控制窗每 30 秒重新获取状态。成功入场后，本场报名卡片显示「已进入」。进行中的会话继续显示，直到用户在收尾确认后离开。当前会话仍在等待确认时，控制窗定期读取本地状态快照，以免遗漏结束通知。
 
 学生在 WebView 加载 `https://accoding.buaa.edu.cn/user/login`。浏览器完成 `GET /user/login`、带 `_csrf` 的表单 POST、跳转和 `Set-Cookie` 处理；Rust 原生代码从 WebView Cookie Store 取得 `connect.sid` 和可用的附加 Cookie，创建 `cvbbmso-accoding::AccodingCookies`。
 
-每次加载或刷新报名列表，`list_exams` 都从原生 Cookie Store 读取当前会话，并通过 [`cvbbmso-exam::Monitor`](cvbbmso-exam.md#公开-rust-api) 向构建时配置的 HTTPS Origin 发送 `GET /api/exams`。列表命令只把通过校验的 `items` 返回本地控制窗。HTTP 200 且列表为空表示用户已登录但未报名。HTTP 401 提示重新登录，HTTP 503 提示稍后重试。刷新时清空旧列表，响应超限、格式无效或请求失败时显示相应错误。
+每次加载或刷新报名列表，`list_exams` 都从原生 Cookie Store 读取当前会话，并通过 [`cvbbmso-exam::Monitor`](cvbbmso-exam.md#公开-rust-api) 向构建时配置的 HTTPS Origin 发送 `GET /api/exams`。列表命令只把通过校验的 `items` 返回本地控制窗。HTTP 200 且列表为空表示用户已登录但未报名。手动刷新时清空旧列表，并显示请求错误。HTTP 401 提示重新登录，HTTP 503 提示稍后重试。定时刷新失败时保留上次成功加载的列表。
 
 客户端在首次入场时将 `device_id` 持久化到应用数据根目录，后续入场读取同一标识。`instance_id` 在进程启动时生成，同一进程内的重连和重新入场都沿用它。准入通过后，Rust 读取原生 Cookie 并调用 `Exam::connect(config, exam_id, cookies)`，由运行时重新获取 `user` 并校验报名，再连接 `GET /api/exams/{exam_id}/ws`。
 

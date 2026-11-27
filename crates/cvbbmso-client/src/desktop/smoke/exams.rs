@@ -338,6 +338,8 @@ async fn open_enrolled_fixture(
     .await?;
     ui.eval(
         r"
+        window.originalExamClock = Date.now;
+        Date.now = () => window.originalExamClock() + 2 * 60 * 60 * 1000;
         window.examEvents = [];
         window.__TAURI__.event.listen('cvbbmso-status', ({ payload }) => window.examEvents.push(payload))
           .then(() => document.querySelector('#refresh-exams').click());
@@ -345,8 +347,8 @@ async fn open_enrolled_fixture(
     )?;
     wait_for(
         ui,
-        "document.querySelectorAll('.open-exam:enabled').length === 2 && !document.querySelector('#exams').textContent.includes('Ended fixture exam')",
-        "enrolled exams",
+        "document.querySelectorAll('.open-exam:enabled').length === 2 && document.querySelector('.exam-phase').textContent === '进行中' && !document.querySelector('#exams').textContent.includes('Ended fixture exam')",
+        "server-confirmed exam phases with a fast local clock",
     )
     .await?;
 
@@ -381,6 +383,7 @@ pub(super) async fn exercise(
         "initial sync marking only the joined exam in the desktop UI",
     )
     .await?;
+    ui.eval("Date.now = window.originalExamClock; delete window.originalExamClock;")?;
     assert_eq!(
         evaluate(
             ui,

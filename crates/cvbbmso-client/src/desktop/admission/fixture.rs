@@ -31,6 +31,10 @@ struct Counters {
     installs: AtomicUsize,
     shutdowns: AtomicUsize,
     verifies: AtomicUsize,
+    network_checks: AtomicUsize,
+    pause_network: AtomicBool,
+    network_paused: Notify,
+    resume_network: Notify,
     installing: Notify,
     resume: Notify,
 }
@@ -65,6 +69,22 @@ impl Admission {
 
     pub(in crate::desktop) fn set_runtime_proxy(&self, enabled: bool) {
         self.0.runtime_proxy.store(enabled, Ordering::Relaxed);
+    }
+
+    pub(in crate::desktop) fn pause_runtime_network(&self) {
+        self.0.pause_network.store(true, Ordering::Relaxed);
+    }
+
+    pub(in crate::desktop) async fn runtime_network_paused(&self) {
+        self.0.network_paused.notified().await;
+    }
+
+    pub(in crate::desktop) fn resume_runtime_network(&self) {
+        self.0.resume_network.notify_one();
+    }
+
+    pub(in crate::desktop) fn network_checks(&self) -> usize {
+        self.0.network_checks.load(Ordering::Relaxed)
     }
 
     pub(in crate::desktop) fn fail_shutdown(&self) {
@@ -146,10 +166,16 @@ impl Admission {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Guard(Arc<Counters>);
 
 impl Guard {
-    pub(super) fn check_network(&self) -> Result<(), Failure> {
+    pub(super) async fn check_network(&self) -> Result<(), Failure> {
+        self.0.network_checks.fetch_add(1, Ordering::Relaxed);
+        if self.0.pause_network.swap(false, Ordering::Relaxed) {
+            self.0.network_paused.notify_one();
+            self.0.resume_network.notified().await;
+        }
         if self.0.runtime_proxy.load(Ordering::Relaxed) {
             return Err(Failure::ProxyConfigured);
         }

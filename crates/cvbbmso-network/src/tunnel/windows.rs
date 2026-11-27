@@ -40,7 +40,13 @@ impl Drop for RouteTable {
     }
 }
 
-pub(super) fn inspect() -> Result<bool, NetworkError> {
+pub(super) async fn inspect() -> Result<bool, NetworkError> {
+    tokio::task::spawn_blocking(inspect_routes)
+        .await
+        .map_err(|_| NetworkError::Platform)?
+}
+
+fn inspect_routes() -> Result<bool, NetworkError> {
     let Some(table) = RouteTable::read()? else {
         return Ok(false);
     };
@@ -160,6 +166,6 @@ mod tests {
 
     #[test]
     fn reads_the_host_route_table() {
-        assert!(inspect().is_ok());
+        assert!(inspect_routes().is_ok());
     }
 }

@@ -76,7 +76,7 @@ impl EgressGuard {
 
 Windows 使用 WinINet、WinHTTP 与代理环境变量；macOS 使用 SystemConfiguration/CFNetwork 与代理环境变量。`Inspector` 读取当前用户环境。
 
-客户端运行时使用 `check_proxy` 复查代理。macOS 只读检查非接口限定的默认路由及常见拆分默认路由。Windows 通过 IP Helper 读取同类路由及对应适配器的运行状态，识别系统隧道、Wintun 和常见 VPN 适配器。仅有空闲隧道接口或私网路由时不会触发阻断。
+客户端运行时使用 `check_proxy` 复查代理。macOS 通过 `netstat -rn` 只读检查非接口限定的默认路由及常见拆分默认路由，读取超时 2 秒后终止子进程并返回 I/O 错误。Windows 通过 IP Helper 读取同类路由及对应适配器的运行状态，识别系统隧道、Wintun 和常见 VPN 适配器。仅有空闲隧道接口或私网路由时不会触发阻断。
 
 ## 启动预检
 

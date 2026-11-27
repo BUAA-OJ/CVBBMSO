@@ -76,8 +76,6 @@ impl Inspector {
     /// Returns an error when the routing table cannot be read.
     #[cfg(any(target_os = "macos", windows))]
     pub async fn tunnel_configured() -> Result<bool, NetworkError> {
-        tokio::task::spawn_blocking(crate::tunnel::inspect)
-            .await
-            .map_err(|_| NetworkError::Platform)?
+        crate::tunnel::inspect().await
     }
 }

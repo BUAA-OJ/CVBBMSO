@@ -190,6 +190,7 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
                     } else {
                         check_admission_retry(&ui, &admission).await?;
                         exercise(&app, &ui, &base, foreign, &hits, &mut decisions).await?;
+                        check_runtime_network_timeout(&ui, &admission).await?;
                     }
                     check_close_confirmation(&ui, &admission).await
                 }
@@ -353,6 +354,37 @@ async fn check_environment_gate(ui: &WebviewWindow) -> Result<(), Error> {
         "Rust rejecting direct IPC while admission is blocked",
     )
     .await
+}
+
+async fn check_runtime_network_timeout(
+    ui: &WebviewWindow,
+    admission: &FakeAdmission,
+) -> Result<(), Error> {
+    let restricted = "document.querySelector('#admission-status').textContent.includes('网络环境检查超时') && document.querySelector('#admitted-controls').hidden";
+    admission.pause_runtime_network();
+    timeout(DEADLINE, admission.runtime_network_paused()).await?;
+    wait_for(ui, restricted, "network check timeout").await?;
+    check_environment_gate(ui).await?;
+
+    let checks = admission.network_checks();
+    let verifies = admission.verifies();
+    sleep(Duration::from_secs(4)).await;
+    assert_eq!(admission.network_checks(), checks);
+    assert!(admission.verifies() > verifies);
+
+    admission.resume_runtime_network();
+    wait_for(
+        ui,
+        "document.querySelector('#admission-panel').hidden && !document.querySelector('#admitted-controls').hidden",
+        "fresh network check restoring admission",
+    )
+    .await?;
+    assert!(admission.network_checks() > checks);
+
+    admission.pause_runtime_network();
+    timeout(DEADLINE, admission.runtime_network_paused()).await?;
+    // The existing close-confirmation flow must clean up while this probe remains hung.
+    wait_for(ui, restricted, "restriction before exit with a hung check").await
 }
 
 async fn check_exit_during_install(
@@ -680,14 +712,28 @@ fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
     };
     let start_at = OffsetDateTime::now_utc() + time::Duration::minutes(5);
     let end_at = start_at + time::Duration::hours(1);
-    let summary = |id, title: &str| {
-        ExamSummary::new(id, title.into(), start_at, end_at, ExamPhase::Scheduled).unwrap()
+    let summary = |id, title: &str, phase| {
+        let start_at = if phase == ExamPhase::Running {
+            start_at - time::Duration::minutes(10)
+        } else {
+            start_at
+        };
+        ExamSummary::new(id, title.into(), start_at, end_at, phase).unwrap()
     };
     let mut items = vec![];
     if enrolled {
-        items.push(summary(exams::FIRST, EXAM_TITLE));
+        let phase = if include_second_exam {
+            ExamPhase::Running
+        } else {
+            ExamPhase::Scheduled
+        };
+        items.push(summary(exams::FIRST, EXAM_TITLE, phase));
         if include_second_exam {
-            items.push(summary(exams::SECOND, "Second fixture exam"));
+            items.push(summary(
+                exams::SECOND,
+                "Second fixture exam",
+                ExamPhase::Scheduled,
+            ));
             items.push(
                 ExamSummary::new(
                     Uuid::from_u128(0x30),

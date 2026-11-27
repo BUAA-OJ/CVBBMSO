@@ -1,6 +1,6 @@
 use std::{
     fs,
-    future::pending,
+    future::{Future, pending},
     io,
     path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -20,7 +20,7 @@ use tauri::{AppHandle, Emitter, EventTarget, Manager, async_runtime};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinHandle,
-    time::{Instant, sleep_until},
+    time::{Instant, sleep, sleep_until, timeout},
 };
 
 use super::{Desktop, UI, platform};
@@ -31,6 +31,7 @@ pub(super) mod fixture;
 
 const VERIFY_INTERVAL: Duration = Duration::from_secs(30);
 const NETWORK_CHECK_INTERVAL: Duration = Duration::from_secs(3);
+const NETWORK_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const STATUS_EVENT: &str = "admission-status";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -60,6 +61,7 @@ pub(super) enum Failure {
     ProxyUnknown,
     TunnelConfigured,
     TunnelUnknown,
+    NetworkCheckTimeout,
     MonitorUnreachable,
     GuardInstallFailed,
     GuardLost,
@@ -120,6 +122,7 @@ impl Failure {
             Self::ProxyUnknown => "无法确认系统代理状态，请联系考试管理员。",
             Self::TunnelConfigured => "检测到系统流量经 TUN 或 VPN 路由，请关闭后重试。",
             Self::TunnelUnknown => "无法确认 TUN 或 VPN 路由状态，请联系考试管理员。",
+            Self::NetworkCheckTimeout => "网络环境检查超时，请保持客户端运行。",
             Self::MonitorUnreachable => "无法连接监考服务，请检查网络后重试。",
             Self::GuardInstallFailed => "无法启用出站网络守卫，请联系考试管理员。",
             Self::GuardLost => "出站网络守卫校验失败，请联系监考人员后重新启动客户端。",
@@ -380,18 +383,17 @@ impl Guard {
         }
     }
 
-    async fn check_network(&self) -> Result<(), Failure> {
+    fn start_network_monitor(&self, app: AppHandle) -> JoinHandle<()> {
         match self {
-            Self::System(_) => {
-                check_proxy(
-                    Inspector::check_proxy()
-                        .await
-                        .map_err(|_| Failure::ProxyUnknown)?,
-                )?;
-                check_tunnel().await
-            }
+            Self::System(_) => tokio::spawn(monitor_network(app, check_system_network)),
             #[cfg(test)]
-            Self::Fixture(guard) => guard.check_network(),
+            Self::Fixture(guard) => {
+                let guard = guard.clone();
+                tokio::spawn(monitor_network(app, move || {
+                    let guard = guard.clone();
+                    async move { guard.check_network().await }
+                }))
+            }
         }
     }
 
@@ -401,6 +403,45 @@ impl Guard {
             #[cfg(test)]
             Self::Fixture(guard) => guard.shutdown(),
         }
+    }
+}
+
+async fn check_system_network() -> Result<(), Failure> {
+    check_proxy(
+        Inspector::check_proxy()
+            .await
+            .map_err(|_| Failure::ProxyUnknown)?,
+    )?;
+    check_tunnel().await
+}
+
+async fn monitor_network<Fut>(app: AppHandle, check: impl Fn() -> Fut)
+where
+    Fut: Future<Output = Result<(), Failure>>,
+{
+    let admission = app.state::<Admission>();
+    loop {
+        let probe = check();
+        tokio::pin!(probe);
+        let result = timeout(NETWORK_CHECK_TIMEOUT, &mut probe).await;
+        let next = match result {
+            Ok(Ok(())) => Status::Ready,
+            Ok(Err(reason)) => Status::Restricted(reason),
+            Err(_) => Status::Restricted(Failure::NetworkCheckTimeout),
+        };
+        admission.set(&app, next, |status| {
+            status != next
+                && matches!(
+                    status,
+                    Status::Checking | Status::Ready | Status::Restricted(_)
+                )
+        });
+        if result.is_err() {
+            // A blocking platform call can outlive a timeout. Keep one
+            // check in flight and use a fresh result to restore admission.
+            let _ = probe.await;
+        }
+        sleep(NETWORK_CHECK_INTERVAL).await;
     }
 }
 
@@ -449,15 +490,18 @@ async fn run(
     let mut guard = None;
     let mut work = None;
     let mut verify_at = None;
-    let mut network_at = None;
+    let mut network_monitor: Option<JoinHandle<()>> = None;
     loop {
         let checking = *changes.borrow_and_update() == Status::Checking;
-        if checking && work.is_none() {
+        if checking && work.is_none() && guard.is_none() {
             work = Some(Work::Preflight(tokio::spawn(prepare(app.clone()))));
         }
         tokio::select! {
             biased;
             reply = stop.recv() => {
+                if let Some(task) = network_monitor {
+                    task.abort();
+                }
                 // An in-flight system install can outlive its future. Keep
                 // waiting for its result so shutdown has the guard to remove.
                 match work {
@@ -485,21 +529,11 @@ async fn run(
                     if guard.verify().await {
                         verify_at = Some(Instant::now() + guard.interval());
                     } else {
-                        network_at = None;
                         admission.set(&app, Status::Blocked(Failure::GuardLost), |status| status != Status::Exiting);
+                        if let Some(task) = network_monitor.take() {
+                            task.abort();
+                        }
                     }
-                }
-            }
-            () = next_verify(network_at) => {
-                network_at = None;
-                if matches!(admission.status(), Status::Ready | Status::Restricted(_))
-                    && let Some(guard) = &guard
-                {
-                    let next = guard.check_network().await.map_or_else(Status::Restricted, |()| Status::Ready);
-                    admission.set(&app, next, |status| {
-                        status != next && matches!(status, Status::Ready | Status::Restricted(_))
-                    });
-                    network_at = Some(Instant::now() + NETWORK_CHECK_INTERVAL);
                 }
             }
             result = completed(work.as_mut()) => {
@@ -512,10 +546,8 @@ async fn run(
                     }
                     Completed::Install(Ok(installed)) => {
                         verify_at = Some(Instant::now() + installed.interval());
-                        let status = installed.check_network().await.map_or_else(Status::Restricted, |()| Status::Ready);
-                        network_at = Some(Instant::now() + NETWORK_CHECK_INTERVAL);
+                        network_monitor = Some(installed.start_network_monitor(app.clone()));
                         guard = Some(installed);
-                        admission.set(&app, status, |current| current == Status::Checking);
                     }
                     Completed::Preflight(Err(error)) | Completed::Install(Err(error)) => {
                         admission.set(&app, Status::Blocked(error), |status| status == Status::Checking);

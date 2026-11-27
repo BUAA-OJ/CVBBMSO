@@ -1,14 +1,19 @@
 //! Read-only macOS routing table inspection.
 
-use std::process::Command;
+use std::time::Duration;
+
+use tokio::{process::Command, time::timeout};
 
 use crate::NetworkError;
 
-pub(super) fn inspect() -> Result<bool, NetworkError> {
-    let output = Command::new("/usr/sbin/netstat")
-        .args(["-rn"])
-        .env("LC_ALL", "C")
-        .output()
+const ROUTE_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(super) async fn inspect() -> Result<bool, NetworkError> {
+    let mut netstat = Command::new("/usr/sbin/netstat");
+    netstat.args(["-rn"]).env("LC_ALL", "C").kill_on_drop(true);
+    let output = timeout(ROUTE_READ_TIMEOUT, netstat.output())
+        .await
+        .map_err(|_| NetworkError::Io)?
         .map_err(|_| NetworkError::Io)?;
     if !output.status.success() {
         return Err(NetworkError::Platform);

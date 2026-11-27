@@ -72,6 +72,7 @@ const admissionErrors = new Map([
   ["proxy_unknown", "无法确认系统代理状态，请联系考试管理员。"],
   ["tunnel_configured", "检测到 TUN 或 VPN 接管系统流量，请关闭后重试。"],
   ["tunnel_unknown", "无法确认 TUN 或 VPN 路由状态，请联系考试管理员。"],
+  ["network_check_timeout", "网络环境检查超时，请保持客户端运行。"],
   ["monitor_unreachable", "无法连接监考服务，请检查网络后重试。"],
   ["guard_install_failed", "无法启用出站网络守卫，请联系考试管理员。"],
   ["guard_lost", "出站网络守卫校验失败，客户端将结束当前考试。请联系监考人员后重新启动客户端。"],
@@ -198,6 +199,7 @@ const examAlert = document.querySelector("#exam-alert");
 const currentExamTitle = document.querySelector("#current-exam-title");
 const currentExamStatus = document.querySelector("#current-exam-status");
 const closeExam = document.querySelector("#close-exam");
+const examListRefreshMs = 30_000;
 let exams = [];
 let examListTimer;
 let examView = null;
@@ -263,13 +265,13 @@ function renderExamEntry(button) {
   button.disabled = !examEventsReady || examBusy || examView !== null;
 }
 
-function renderExam(exam, examPhase) {
+function renderExam(exam) {
   const item = document.createElement("li");
   const title = document.createElement("h3");
   title.textContent = exam.title;
   const phase = document.createElement("span");
   phase.className = "exam-phase";
-  phase.textContent = examPhases.get(examPhase);
+  phase.textContent = examPhases.get(exam.phase);
   const times = document.createElement("p");
   times.append(renderTime(exam.start_at), " 至 ", renderTime(exam.end_at));
   const enter = document.createElement("button");
@@ -283,26 +285,16 @@ function renderExam(exam, examPhase) {
 }
 
 function renderExamList() {
-  clearTimeout(examListTimer);
-  const now = Date.now();
   const rows = document.createDocumentFragment();
-  let nextChange = Infinity;
   let count = 0;
   for (const exam of exams) {
-    const start = Date.parse(exam.start_at);
-    const end = Date.parse(exam.end_at);
-    if (exam.phase === "ended" || end <= now) continue;
-    const scheduled = exam.phase === "scheduled" && start > now;
-    rows.append(renderExam(exam, scheduled ? "scheduled" : "running"));
-    nextChange = Math.min(nextChange, scheduled ? start : end);
+    if (exam.phase === "ended") continue;
+    rows.append(renderExam(exam));
     count++;
   }
   examList.replaceChildren(rows);
   examStatus.textContent = count > 0 ? `已加载 ${count} 场考试。`
     : exams.length > 0 ? "暂无可参加的考试。" : "已登录，暂无报名考试。";
-  if (Number.isFinite(nextChange)) {
-    examListTimer = setTimeout(renderExamList, Math.min(nextChange - now, 2_147_483_647));
-  }
 }
 
 function renderExamSession() {
@@ -372,7 +364,7 @@ async function refreshExamSession() {
 
 async function changeExamSession(exam) {
   if (examBusy || (exam && examView) || (!exam && !examView)) return;
-  if (exam && (exam.phase === "ended" || Date.parse(exam.end_at) <= Date.now())) {
+  if (exam?.phase === "ended") {
     renderExamList();
     examFeedback.textContent = "这场考试已结束。";
     return;
@@ -402,24 +394,31 @@ async function changeExamSession(exam) {
 
 closeExam.addEventListener("click", () => changeExamSession(null));
 
-refreshExams.addEventListener("click", async () => {
+async function refreshExamList(manual) {
+  if (refreshExams.disabled) return;
   refreshExams.disabled = true;
   clearTimeout(examListTimer);
-  exams = [];
-  examList.replaceChildren();
-  examList.setAttribute("aria-busy", "true");
-  examStatus.textContent = "正在加载报名列表…";
+  if (manual) {
+    exams = [];
+    examList.replaceChildren();
+    examList.setAttribute("aria-busy", "true");
+    examStatus.textContent = "正在加载报名列表…";
+  }
   try {
     exams = await core.invoke("list_exams");
     renderExamList();
   } catch (error) {
-    examStatus.textContent = examErrors.get(error) ?? "获取报名列表失败，请重试。";
+    if (manual) examStatus.textContent = examErrors.get(error) ?? "获取报名列表失败，请重试。";
   } finally {
     examList.removeAttribute("aria-busy");
     refreshExams.textContent = "刷新列表";
     refreshExams.disabled = false;
+    if (exams.some((exam) => exam.phase !== "ended")) {
+      examListTimer = setTimeout(() => refreshExamList(false), examListRefreshMs);
+    }
   }
-});
+}
+refreshExams.addEventListener("click", () => refreshExamList(true));
 refreshExams.disabled = false;
 void checkDevice(false);
 
