@@ -6,7 +6,7 @@
 
 主窗口顶部在监考连接断开或录像失败时显示独立的高对比警示，滚动页面时保持可见。恢复连接或结束后更新并清除不再适用的连接警示；录像最终失败时保留警示。原始状态文字继续保留。
 
-客户端在 Windows 和 macOS 启动本地控制窗。Windows 使用安装后的程序，macOS 正式启动要求 macOS 14 或更新版本。先从 DMG 将已签名的 CVBBMSO.app 拖到「应用程序」，再以当前登录用户在 Finder 中双击打开。准入通过后，可以从控制窗打开独立的 Accoding 窗口。关闭控制窗或点击「退出客户端」时先显示退出确认，取消或按 Escape 后继续运行；入场后直至服务端确认本场结束回执，禁止主动关闭客户端或退出当前考试；计算录像 SHA-256、封存合并、可靠事件补报及等待最终 ACK 均在保护范围内。收尾完成后提示「考试结束后，请等待监考老师指示后再关闭客户端。」确定退出后清理网络守卫并关闭 Accoding 窗口。`inspect_session` 将 Cookie 是否可用定向通知本地 UI。加载报名列表时由监考服务复验 Accoding 身份。
+客户端在 Windows 和 macOS 启动本地控制窗。Windows 使用安装后的程序，macOS 正式启动要求 macOS 14 或更新版本。先从 DMG 将已签名的 CVBBMSO.app 拖到「应用程序」，再以当前登录用户在 Finder 中双击打开。准入通过后，可以从控制窗打开独立的 Accoding 窗口。关闭控制窗或点击「退出客户端」时先显示退出确认，取消或按 Escape 后继续运行；入场后直至服务端确认本场结束回执，禁止主动关闭客户端或退出当前考试。点击「退出当前考试」会说明暂不能退出的原因。收尾期间显示结束和确认进度，收到最终 ACK 后明确显示「考试已结束」及录像结果，再允许离开当前考试。确定退出后清理网络守卫并关闭 Accoding 窗口。`inspect_session` 将 Cookie 是否可用定向通知本地 UI。加载报名列表时由监考服务复验 Accoding 身份。
 
 部署时可在编译环境中设置 `CVBBMSO_SERVER_ORIGIN`，例如 `https://monitor.example.org`。该值须为 HTTPS Origin，可含端口。显式配置无效地址（含空字符串）会导致启动失败。未设置该变量时，控制窗可照常启动，加载报名列表会提示未配置监考服务地址。远程页面和前端命令均无法设置请求目的地。应用数据根目录通过 Tauri 的 `app_local_data_dir()` 取得。Windows 的 Accoding WebView 用该目录下的 `accoding/` 保存浏览器配置，macOS 使用系统管理的应用 WebKit 数据存储。
 
@@ -78,7 +78,7 @@ impl AppState {
 
 刚启动、等待批准与安装期间，Rust 拒绝打开 Accoding、读取会话、请求报名列表和进入考试。守卫返回已验证的句柄后，`admission_status` 才返回 `ready` 并开放这些操作。虚拟机预检通过后，若监考地址缺失，`list_exams` 仍返回 `monitor_unconfigured`。
 
-一次只运行一次准入检查。守卫由应用持有，每 30 秒复查。运行期校验失败时，Rust 阻止新入场并结束活动考试，界面提示联系监考人员后重新启动客户端。关闭一场考试时守卫继续运行。退出客户端会先结束并封存考试，再等待已开始的守卫安装并清理其状态。守卫清理失败时，控制窗仍可关闭，并显示错误类别。准入状态为 `cleanup_failed`，其 `reason` 携带 `code` 和 `diagnostic_saved`。客户端尝试在应用数据目录写入最近一次失败的 `egress-cleanup.json`，只记录操作、时间、平台和错误类别。macOS 的目录为 `~/Library/Application Support/edu.buaa.accoding.cvbbmso/`，Windows 为 `%LOCALAPPDATA%\edu.buaa.accoding.cvbbmso\`。
+一次只运行一次准入检查。守卫由应用持有，每 30 秒复查。安装完成后另行复查系统代理与 TUN 或 VPN 默认路由，之后每 3 秒复查。检测到冲突或无法读取配置时，准入状态变为 `restricted`，暂停新入场并显示原因。现有考试保留会话和录像，守卫继续运行，配置恢复后自动恢复准入。运行期校验失败时，Rust 阻止新入场并结束活动考试，界面提示联系监考人员后重新启动客户端。关闭一场考试时守卫继续运行。退出客户端会先结束并封存考试，再等待已开始的守卫安装并清理其状态。守卫清理失败时，控制窗仍可关闭，并显示错误类别。准入状态为 `cleanup_failed`，其 `reason` 携带 `code` 和 `diagnostic_saved`。客户端尝试在应用数据目录写入最近一次失败的 `egress-cleanup.json`，只记录操作、时间、平台和错误类别。macOS 的目录为 `~/Library/Application Support/edu.buaa.accoding.cvbbmso/`，Windows 为 `%LOCALAPPDATA%\edu.buaa.accoding.cvbbmso\`。
 
 Release 桌面冒烟使用替身检查权限顺序、并发重试、macOS 等待批准和 PF 阻断，以及运行期守卫失效。`--native-admission-exit` 覆盖安装尚未返回时退出。`--native-admission-cleanup-failure` 覆盖重复关闭、诊断和确认退出。签名 DMG、系统服务授权、真实 PF 与 WFP 在隔离环境中验收。
 
@@ -99,7 +99,7 @@ Windows 基于 WebView2 配置 `AreDevToolsEnabled=false`、`AreBrowserAccelerat
 
 ## Cookie 登录与考试连接
 
-报名列表中 `phase == ended` 的考试保持显示，但禁止进入。初次渲染和考试会话状态刷新均保持其「进入考试」按钮禁用，入场操作也拒绝该阶段，避免新会话停留在无法收到结束指令的等待状态。
+报名列表隐藏服务端已标记为结束的考试，也会根据报名列表的时间自动隐藏到期的考试。成功入场后，本场报名卡片显示「已进入」。进行中的会话继续显示，直到用户在收尾确认后离开。当前会话仍在等待确认时，控制窗定期读取本地状态快照，以免遗漏结束通知。
 
 学生在 WebView 加载 `https://accoding.buaa.edu.cn/user/login`。浏览器完成 `GET /user/login`、带 `_csrf` 的表单 POST、跳转和 `Set-Cookie` 处理；Rust 原生代码从 WebView Cookie Store 取得 `connect.sid` 和可用的附加 Cookie，创建 `cvbbmso-accoding::AccodingCookies`。
 
@@ -107,7 +107,7 @@ Windows 基于 WebView2 配置 `AreDevToolsEnabled=false`、`AreBrowserAccelerat
 
 客户端在首次入场时将 `device_id` 持久化到应用数据根目录，后续入场读取同一标识。`instance_id` 在进程启动时生成，同一进程内的重连和重新入场都沿用它。准入通过后，Rust 读取原生 Cookie 并调用 `Exam::connect(config, exam_id, cookies)`，由运行时重新获取 `user` 并校验报名，再连接 `GET /api/exams/{exam_id}/ws`。
 
-活动考试期间，Rust 间隔两秒读取原生 Cookie Store，通过 `UiNotice::CookiesUpdated` 提交有效的变化。读取失败或暂时没有会话时保留上次结果，自动采样只在 Cookie 变化时触发复验。监考服务短时无法复验时，学生可点击「检查会话」，用浏览器里的当前 Cookie 重试。运行时核对考生身份，采用同一考生的新 Cookie 后恢复连接。控制窗根据 `ClientView` 提示重连，在 `ACCODING_AUTH_EXPIRED` 时提供重新登录入口。学生点击后，控制窗在受控 Accoding 窗口打开登录页。
+活动考试期间，Rust 间隔两秒读取原生 Cookie Store，通过 `UiNotice::CookiesUpdated` 提交有效的变化。读取失败或暂时没有会话时保留上次结果，自动采样只在 Cookie 变化时触发复验。监考服务短时无法复验时，学生可点击「检查会话」，用浏览器里的当前 Cookie 重试。运行时核对考生身份，采用同一考生的新 Cookie 后恢复连接。控制窗根据 `ClientView` 提示重连，在 `ACCODING_AUTH_EXPIRED` 时提供重新登录入口。最终录像保存在应用数据目录内的 `exams/<考试 ID>/<Accoding 用户 ID>/recording/final.mp4`，试用版的应用标识为 `edu.buaa.accoding.cvbbmso.trial`。学生点击后，控制窗在受控 Accoding 窗口打开登录页。
 
 受控窗口拒绝跨源导航或弹窗时，向活动运行时非阻塞地提交 `UiNotice::NavigationDenied`。通知只携带可解析的目标 Origin。关闭或结束考试会丢弃该场考试待提交的浏览器通知，后续考试使用自己的通知队列。
 

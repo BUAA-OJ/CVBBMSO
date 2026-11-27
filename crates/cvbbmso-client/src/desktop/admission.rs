@@ -30,6 +30,7 @@ use crate::preflight::Preflight;
 pub(super) mod fixture;
 
 const VERIFY_INTERVAL: Duration = Duration::from_secs(30);
+const NETWORK_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 const STATUS_EVENT: &str = "admission-status";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -57,6 +58,8 @@ pub(super) enum Failure {
     InspectionFailed,
     ProxyConfigured,
     ProxyUnknown,
+    TunnelConfigured,
+    TunnelUnknown,
     MonitorUnreachable,
     GuardInstallFailed,
     GuardLost,
@@ -115,6 +118,8 @@ impl Failure {
             Self::InspectionFailed => "无法完成网络预检，请重试。",
             Self::ProxyConfigured => "检测到系统代理，请关闭代理后重试。",
             Self::ProxyUnknown => "无法确认系统代理状态，请联系考试管理员。",
+            Self::TunnelConfigured => "检测到系统流量经 TUN 或 VPN 路由，请关闭后重试。",
+            Self::TunnelUnknown => "无法确认 TUN 或 VPN 路由状态，请联系考试管理员。",
             Self::MonitorUnreachable => "无法连接监考服务，请检查网络后重试。",
             Self::GuardInstallFailed => "无法启用出站网络守卫，请联系考试管理员。",
             Self::GuardLost => "出站网络守卫校验失败，请联系监考人员后重新启动客户端。",
@@ -133,6 +138,7 @@ pub(super) enum Status {
     Checking,
     Ready,
     Blocked(Failure),
+    Restricted(Failure),
     Exiting,
     CleanupFailed(CleanupReport),
 }
@@ -249,7 +255,7 @@ impl Admission {
     pub(super) fn require_ready(&self) -> Result<(), &'static str> {
         match self.status() {
             Status::Ready => Ok(()),
-            Status::Blocked(reason) => Err(reason.message()),
+            Status::Blocked(reason) | Status::Restricted(reason) => Err(reason.message()),
             _ => Err("考试环境检查尚未完成。"),
         }
     }
@@ -374,6 +380,21 @@ impl Guard {
         }
     }
 
+    async fn check_network(&self) -> Result<(), Failure> {
+        match self {
+            Self::System(_) => {
+                check_proxy(
+                    Inspector::check_proxy()
+                        .await
+                        .map_err(|_| Failure::ProxyUnknown)?,
+                )?;
+                check_tunnel().await
+            }
+            #[cfg(test)]
+            Self::Fixture(guard) => guard.check_network(),
+        }
+    }
+
     async fn shutdown(self) -> Result<(), NetworkError> {
         match self {
             Self::System(guard) => guard.shutdown().await,
@@ -428,6 +449,7 @@ async fn run(
     let mut guard = None;
     let mut work = None;
     let mut verify_at = None;
+    let mut network_at = None;
     loop {
         let checking = *changes.borrow_and_update() == Status::Checking;
         if checking && work.is_none() {
@@ -463,8 +485,21 @@ async fn run(
                     if guard.verify().await {
                         verify_at = Some(Instant::now() + guard.interval());
                     } else {
+                        network_at = None;
                         admission.set(&app, Status::Blocked(Failure::GuardLost), |status| status != Status::Exiting);
                     }
+                }
+            }
+            () = next_verify(network_at) => {
+                network_at = None;
+                if matches!(admission.status(), Status::Ready | Status::Restricted(_))
+                    && let Some(guard) = &guard
+                {
+                    let next = guard.check_network().await.map_or_else(Status::Restricted, |()| Status::Ready);
+                    admission.set(&app, next, |status| {
+                        status != next && matches!(status, Status::Ready | Status::Restricted(_))
+                    });
+                    network_at = Some(Instant::now() + NETWORK_CHECK_INTERVAL);
                 }
             }
             result = completed(work.as_mut()) => {
@@ -477,8 +512,10 @@ async fn run(
                     }
                     Completed::Install(Ok(installed)) => {
                         verify_at = Some(Instant::now() + installed.interval());
+                        let status = installed.check_network().await.map_or_else(Status::Restricted, |()| Status::Ready);
+                        network_at = Some(Instant::now() + NETWORK_CHECK_INTERVAL);
                         guard = Some(installed);
-                        admission.set(&app, Status::Ready, |status| status == Status::Checking);
+                        admission.set(&app, status, |current| current == Status::Checking);
                     }
                     Completed::Preflight(Err(error)) | Completed::Install(Err(error)) => {
                         admission.set(&app, Status::Blocked(error), |status| status == Status::Checking);
@@ -528,11 +565,8 @@ async fn prepare(app: AppHandle) -> Result<Prepared, Failure> {
         .check()
         .await
         .map_err(|_| Failure::InspectionFailed)?;
-    match report.proxy {
-        ProxyState::Clear => {}
-        ProxyState::Configured => return Err(Failure::ProxyConfigured),
-        ProxyState::Unknown => return Err(Failure::ProxyUnknown),
-    }
+    check_proxy(report.proxy)?;
+    check_tunnel().await?;
     if report.endpoint != EndpointState::Reachable {
         return Err(Failure::MonitorUnreachable);
     }
@@ -548,6 +582,24 @@ async fn prepare(app: AppHandle) -> Result<Prepared, Failure> {
     #[cfg(target_os = "macos")]
     check_screen(&app).await?;
     Ok(Prepared::System(policy))
+}
+
+fn check_proxy(state: ProxyState) -> Result<(), Failure> {
+    match state {
+        ProxyState::Clear => Ok(()),
+        ProxyState::Configured => Err(Failure::ProxyConfigured),
+        ProxyState::Unknown => Err(Failure::ProxyUnknown),
+    }
+}
+
+async fn check_tunnel() -> Result<(), Failure> {
+    if Inspector::tunnel_configured()
+        .await
+        .map_err(|_| Failure::TunnelUnknown)?
+    {
+        return Err(Failure::TunnelConfigured);
+    }
+    Ok(())
 }
 
 async fn install(app: AppHandle, prepared: Prepared) -> Result<Guard, Failure> {

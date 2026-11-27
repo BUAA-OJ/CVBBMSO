@@ -345,7 +345,7 @@ async fn open_enrolled_fixture(
     )?;
     wait_for(
         ui,
-        "document.querySelectorAll('.open-exam').length === 3 && document.querySelectorAll('.open-exam:enabled').length === 2 && document.querySelector('#exams li:last-child .open-exam').disabled",
+        "document.querySelectorAll('.open-exam:enabled').length === 2 && !document.querySelector('#exams').textContent.includes('Ended fixture exam')",
         "enrolled exams",
     )
     .await?;
@@ -377,8 +377,8 @@ pub(super) async fn exercise(
     first.outgoing.send(sync()).await?;
     wait_for(
         ui,
-        "document.querySelector('#current-exam-status').textContent.includes('已连接监考服务')",
-        "initial sync in the desktop UI",
+        "document.querySelector('#current-exam-status').textContent.includes('已连接监考服务') && [...document.querySelectorAll('.open-exam:disabled')].map(button => button.textContent).join(',') === '已进入,进入考试'",
+        "initial sync marking only the joined exam in the desktop UI",
     )
     .await?;
     assert_eq!(
@@ -393,7 +393,7 @@ pub(super) async fn exercise(
     let previous = check_status_updates(ui, &mut first).await?;
 
     ui.eval("document.querySelector('#close-exam').click()")?;
-    wait_for(ui, "document.querySelector('#current-exam').hidden && !document.querySelector('.open-exam').disabled", "the closed exam UI").await?;
+    wait_for(ui, "document.querySelector('#current-exam').hidden && [...document.querySelectorAll('.open-exam:enabled')].every(button => button.textContent === '进入考试') && document.querySelectorAll('.open-exam:enabled').length === 2", "the closed exam UI restoring the entry buttons").await?;
     timeout(DEADLINE, first.closed).await??;
     probe(
         ui,
@@ -408,11 +408,11 @@ pub(super) async fn exercise(
     assert_eq!(
         evaluate(
             ui,
-            "document.querySelector('#exams li:last-child .open-exam').disabled"
+            "!document.querySelector('#exams').textContent.includes('Ended fixture exam')"
         )
         .await?,
         true,
-        "Refreshing session state must not enable an ended exam"
+        "Refreshing session state must keep ended exams hidden"
     );
 
     probe(
@@ -429,7 +429,7 @@ pub(super) async fn exercise(
     );
     wait_for(
         ui,
-        "document.querySelector('#current-exam-title').textContent === 'Second fixture exam'",
+        "document.querySelector('#current-exam-title').textContent === 'Second fixture exam' && [...document.querySelectorAll('.open-exam:disabled')].map(button => button.textContent).join(',') === '进入考试,已进入'",
         "a second exam after close",
     )
     .await?;
@@ -632,11 +632,13 @@ async fn check_status_updates(ui: &WebviewWindow, first: &mut Connection) -> Res
         .outgoing
         .send(ServerMessage::CommandAck { command_id })
         .await?;
-    wait_for(ui, "document.querySelector('#current-exam-status').textContent.includes('请等待监考老师指示') && !document.querySelector('#close-exam').disabled", "final ACK releasing the close restriction").await?;
+    wait_for(ui, "document.querySelector('#current-exam-status').textContent.includes('考试已结束') && document.querySelector('#current-exam-status').textContent.includes('录像收尾失败') && document.querySelector('#exam-session-feedback').textContent === '' && !document.querySelector('#close-exam').disabled", "final ACK updating the visible finish status and releasing the close restriction").await?;
     Ok(previous)
 }
 
 async fn check_pending_close(ui: &WebviewWindow) -> Result<(), Error> {
+    ui.eval("document.querySelector('#close-exam').click()")?;
+    wait_for(ui, "document.querySelector('#exam-session-feedback').textContent.includes('监考服务确认收尾后再退出') && !document.querySelector('#current-exam').hidden && !document.querySelector('#close-exam').disabled", "the exit button explaining why the exam remains open").await?;
     probe(
         ui,
         "Promise.allSettled([window.__TAURI__.core.invoke('close_exam'), window.__TAURI__.core.invoke('confirm_exit')])",

@@ -446,6 +446,13 @@ async fn check_guard_loss(
     peer: oneshot::Receiver<()>,
 ) -> Result<(), Error> {
     assert!(admission.verifies() > 0);
+    admission.set_runtime_proxy(true);
+    wait_for(ui, "document.querySelector('#admission-status').textContent.includes('检测到系统代理') && document.querySelector('#admitted-controls').hidden && !document.querySelector('#current-exam').hidden && document.querySelector('#admission-retry').hidden", "runtime proxy restriction retaining the active exam").await?;
+    check_environment_gate(ui).await?;
+    admission.set_runtime_proxy(false);
+    wait_for(ui, "document.querySelector('#admission-panel').hidden && !document.querySelector('#admitted-controls').hidden && !document.querySelector('#current-exam').hidden", "automatic recovery after clearing the system proxy").await?;
+    assert_eq!(admission.installs(), 1);
+    assert_eq!(admission.shutdowns(), 0);
     admission.lose_guard();
     wait_for(ui, "document.querySelector('#admission-status').textContent.includes('联系监考人员') && document.querySelector('#admitted-controls').hidden", "terminal guard loss").await?;
     check_environment_gate(ui).await?;
@@ -671,8 +678,8 @@ fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
         }
         _ => return StatusCode::UNAUTHORIZED.into_response(),
     };
-    let start_at = OffsetDateTime::from_unix_timestamp(1_797_729_600).unwrap();
-    let end_at = OffsetDateTime::from_unix_timestamp(1_797_733_200).unwrap();
+    let start_at = OffsetDateTime::now_utc() + time::Duration::minutes(5);
+    let end_at = start_at + time::Duration::hours(1);
     let summary = |id, title: &str| {
         ExamSummary::new(id, title.into(), start_at, end_at, ExamPhase::Scheduled).unwrap()
     };

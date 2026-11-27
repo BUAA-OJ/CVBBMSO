@@ -14,6 +14,7 @@ pub(in crate::desktop) struct Admission(Arc<Counters>);
 #[derive(Default)]
 struct Counters {
     proxy_once: AtomicBool,
+    runtime_proxy: AtomicBool,
     #[cfg(target_os = "macos")]
     screen_once: AtomicBool,
     #[cfg(target_os = "macos")]
@@ -60,6 +61,10 @@ impl Admission {
 
     pub(in crate::desktop) fn lose_guard(&self) {
         self.0.fail_verify.store(true, Ordering::Relaxed);
+    }
+
+    pub(in crate::desktop) fn set_runtime_proxy(&self, enabled: bool) {
+        self.0.runtime_proxy.store(enabled, Ordering::Relaxed);
     }
 
     pub(in crate::desktop) fn fail_shutdown(&self) {
@@ -144,6 +149,13 @@ impl Admission {
 pub(super) struct Guard(Arc<Counters>);
 
 impl Guard {
+    pub(super) fn check_network(&self) -> Result<(), Failure> {
+        if self.0.runtime_proxy.load(Ordering::Relaxed) {
+            return Err(Failure::ProxyConfigured);
+        }
+        Ok(())
+    }
+
     pub(super) fn verify(&self) -> bool {
         self.0.verifies.fetch_add(1, Ordering::Relaxed);
         !self.0.fail_verify.load(Ordering::Relaxed)
