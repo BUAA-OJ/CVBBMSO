@@ -37,7 +37,6 @@ fi
 revision=$(git rev-parse HEAD)
 target=aarch64-apple-darwin
 app_id=edu.buaa.accoding.cvbbmso.trial
-launcher=/Library/PrivilegedHelperTools/cvbbmso-pf-trial.sh
 
 export CVBBMSO_SERVER_ORIGIN="$origin"
 export TAURI_CONFIG='{"productName":"CVBBMSO Trial","identifier":"edu.buaa.accoding.cvbbmso.trial","bundle":{"macOS":{"minimumSystemVersion":"14.0"}}}'
@@ -66,9 +65,10 @@ work=$(/usr/bin/mktemp -d "$artifact_dir/CVBBMSO-Trial-${revision:0:12}.XXXXXXXX
 trap '/bin/rm -rf -- "$work"' EXIT
 trap 'exit 1' HUP INT TERM
 stage="$work/CVBBMSO Trial"
-app="$stage/CVBBMSO Trial.app"
+payload="$work/payload"
+app="$payload/CVBBMSO Trial.app"
 contents="$app/Contents"
-/bin/mkdir -p "$contents/MacOS" "$contents/Resources" "$stage/admin"
+/bin/mkdir -p "$contents/MacOS" "$contents/Resources" "$stage"
 /usr/bin/install -m 0755 "$artifact_dir/cvbbmso-client" "$contents/MacOS/cvbbmso-client"
 /usr/bin/install -m 0644 "$root/crates/cvbbmso-client/icons/icon.icns" "$contents/Resources/icon.icns"
 /usr/bin/install -m 0644 "$deployment/Info.plist" "$contents/Info.plist"
@@ -81,12 +81,15 @@ contents="$app/Contents"
 /usr/bin/codesign --force --sign - --identifier "$app_id" "$app"
 /usr/bin/codesign --verify --strict --all-architectures "$app"
 
-/usr/bin/install -m 0755 "$artifact_dir/cvbbmso-pf-trial" "$stage/admin/cvbbmso-pf-trial"
-/usr/bin/install -m 0755 "$deployment/pf-trial.sh" "$stage/admin/pf-trial.sh"
-/usr/bin/sed -e "s|@CVBBMSO_TRIAL_ORIGIN@|$origin|" -e "s|@CVBBMSO_TRIAL_LAUNCHER@|$launcher|" \
+/usr/bin/install -m 0755 "$artifact_dir/cvbbmso-pf-trial" "$payload/cvbbmso-pf-trial"
+/usr/bin/install -m 0755 "$deployment/pf-trial.sh" "$payload/pf-trial.sh"
+/usr/bin/ditto -c -k --sequesterRsrc "$payload" "$stage/Payload.zip"
+checksum=$(/usr/bin/shasum -a 256 < "$stage/Payload.zip")
+/usr/bin/sed -e "s|@CVBBMSO_TRIAL_ORIGIN@|$origin|" -e "s|@CVBBMSO_TRIAL_PAYLOAD_SHA256@|${checksum%% *}|" \
     "$deployment/start-trial.command" > "$stage/Start CVBBMSO Trial.command"
 /bin/chmod 0755 "$stage/Start CVBBMSO Trial.command"
 /bin/bash -n "$stage/Start CVBBMSO Trial.command"
+/bin/rm -r -- "$payload"
 /usr/bin/install -m 0644 "$root/docs/deployment/macos-pf-trial.md" "$stage/README.md"
 printf 'source_revision=%s\nmonitor_origin=%s\n' "$revision" "$origin" > "$stage/BUILD.txt"
 
