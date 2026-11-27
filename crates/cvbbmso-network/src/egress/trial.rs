@@ -520,7 +520,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_slow_health_check_leaves_time_for_verify_and_shutdown_acknowledgements() {
-        let slow = OPERATION - Duration::from_secs(1);
+        let slow = OPERATION.checked_sub(Duration::from_secs(1)).unwrap();
         for operation in [VERIFY, SHUTDOWN] {
             let (client, root) = UnixStream::pair().unwrap();
             let (sender, requests) = mpsc::channel(1);
