@@ -62,6 +62,17 @@ pub struct StudentEnrollment {
     pub enrolled: bool,
 }
 
+/// Staff-only display metadata for a student with evidence in an exam.
+#[derive(Debug, Serialize)]
+pub struct StudentIdentity {
+    /// Decimal Accoding user ID used to join with evidence records.
+    pub oj_user_id: String,
+    /// Decimal school student number, if known.
+    pub student_number: Option<String>,
+    /// The account display name supplied by Accoding, if known.
+    pub nickname: Option<String>,
+}
+
 /// Result of importing participants.
 #[derive(Debug, Serialize)]
 pub struct ImportedParticipants {

@@ -17,7 +17,7 @@ use crate::{
     DisconnectReason, DomainError, Service,
     db::{self, Runtime, StudentKey},
     entity::{audit as stored_audit, enrollment, event, exam, incident, runtime},
-    events as stored_events, exam as exam_service, student_registration,
+    events as stored_events, exam as exam_service, student_profiles, student_registration,
 };
 
 /// A management operation to perform against the shared exam database.
@@ -87,6 +87,11 @@ pub enum AdminOperation {
     },
     /// Lists the school registrations and their binding state.
     StudentEnrollmentsList {
+        /// The ID of the exam.
+        exam_id: Uuid,
+    },
+    /// Lists display identities for students with recorded activity in an exam.
+    StudentIdentitiesList {
         /// The ID of the exam.
         exam_id: Uuid,
     },
@@ -167,6 +172,8 @@ pub enum AdminOutput {
     Participants(Vec<ParticipantRecord>),
     /// School student numbers and their verified Accoding IDs, if bound.
     StudentEnrollments(Vec<student_registration::StudentEnrollment>),
+    /// Display identities used to label exam evidence.
+    StudentIdentities(Vec<student_profiles::StudentIdentity>),
     /// All known runtimes for the exam.
     Students(Vec<StudentRuntime>),
     /// A student's current persisted runtime.
@@ -487,6 +494,9 @@ async fn query(
         AdminOperation::ParticipantsList { exam_id } => participants(tx, exam_id).await,
         AdminOperation::StudentEnrollmentsList { exam_id } => Ok(AdminOutput::StudentEnrollments(
             student_registration::list(tx, exam_id).await?,
+        )),
+        AdminOperation::StudentIdentitiesList { exam_id } => Ok(AdminOutput::StudentIdentities(
+            student_profiles::list(tx, exam_id).await?,
         )),
         AdminOperation::StudentsStatus { exam_id } => students(tx, exam_id).await,
         AdminOperation::StudentsShow {

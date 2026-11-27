@@ -14,7 +14,7 @@ use crate::{
     AdminOperation, AdminOutput, AdminService, DomainError, Service, admin, commands,
     db::{self, Runtime, StudentKey},
     entity::{enrollment, exam as exam_table, runtime},
-    events, student_registration,
+    events, student_profiles, student_registration,
 };
 
 /// A committed connection snapshot and the commands due on that connection.
@@ -304,6 +304,19 @@ impl ExamService {
         .into_iter()
         .map(|exam| exam.summary(now))
         .collect()
+    }
+
+    /// Updates display metadata for a verified account with current eligibility or saved exam activity.
+    /// This does not create an enrollment, a binding, or a runtime.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid account ID or failed storage operation.
+    pub async fn remember_verified_profile(
+        &self,
+        user: &AccodingUser,
+        has_current_eligibility: bool,
+    ) -> Result<(), DomainError> {
+        student_profiles::remember(&self.0, user, has_current_eligibility).await
     }
 
     /// Checks an authenticated account's eligibility without binding an invitation.

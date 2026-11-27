@@ -6,8 +6,8 @@ use axum::{
 };
 use cvbbmso_domain::{DisconnectReason, ExamService};
 use cvbbmso_protocol::{
-    ClientHello, ClientIncident, ClientMessage, ClientState, ExamEvent, ExecutionState,
-    IncidentCode, Platform, RecordingState,
+    AccodingUser, ClientHello, ClientIncident, ClientMessage, ClientState, ExamEvent,
+    ExecutionState, IncidentCode, Platform, RecordingState,
 };
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -241,6 +241,59 @@ async fn school_roster_import_deduplicates_and_preserves_leading_zeros() {
     let (_, roster) = fixture.request(Method::GET, &path, None).await;
     assert_eq!(roster[0]["enrolled"], false);
     assert_eq!(roster[1]["enrolled"], true);
+}
+
+#[tokio::test]
+async fn labels_historical_evidence_only_on_the_authenticated_identity_route() {
+    let fixture = Fixture::new().await;
+    let exam_id = fixture.create().await;
+    let base = format!("/exams/{exam_id}");
+    let identities = format!("{base}/student-identities");
+    let id = LARGE_ID.to_string();
+    let (status, _) = fixture
+        .request(
+            Method::POST,
+            &format!("{base}/participants"),
+            Some(json!({"oj_user_ids": [id]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    fixture.connect(exam_id, LARGE_ID).await;
+    let (status, _) = fixture
+        .request(Method::DELETE, &format!("{base}/participants/{id}"), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        fixture.request(Method::GET, &identities, None).await,
+        (
+            StatusCode::OK,
+            json!([{"oj_user_id": id, "student_number": null, "nickname": null}])
+        )
+    );
+    let user = AccodingUser::new(LARGE_ID, "0007@buaa.edu.cn".into(), " 示例考生 ".into()).unwrap();
+    fixture
+        .exam
+        .remember_verified_profile(&user, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.request(Method::GET, &identities, None).await,
+        (
+            StatusCode::OK,
+            json!([{"oj_user_id": id, "student_number": "0007", "nickname": "示例考生"}])
+        )
+    );
+    let anonymous = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/admin{identities}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

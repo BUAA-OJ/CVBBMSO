@@ -230,6 +230,18 @@ impl Fixture {
             .await
             .unwrap()
     }
+
+    async fn student_identities(&self) -> Vec<cvbbmso_domain::StudentIdentity> {
+        let AdminOutput::StudentIdentities(rows) = self
+            .admin(AdminOperation::StudentIdentitiesList {
+                exam_id: self.exam_id,
+            })
+            .await
+        else {
+            panic!("expected exam identities");
+        };
+        rows
+    }
 }
 
 impl Drop for Fixture {
@@ -559,6 +571,7 @@ async fn school_roster_checks_identity_and_binds_only_after_a_valid_hello() {
     let mut first = fixture.upgrade(&path, SCHOOL_COOKIE).await.unwrap();
     let mut second = fixture.upgrade(&path, OTHER_SCHOOL_COOKIE).await.unwrap();
     assert_eq!(invitation().await, (true, None));
+    assert!(fixture.student_identities().await.is_empty());
     fixture
         .admin(AdminOperation::StudentEnrollmentRemove {
             exam_id: fixture.exam_id,
@@ -580,6 +593,11 @@ async fn school_roster_checks_identity_and_binds_only_after_a_valid_hello() {
     assert_eq!(invitation().await, (true, Some(SCHOOL_STUDENT)));
     send(&mut second, &state).await;
     socket_error(&mut second, error_code::NOT_ENROLLED).await;
+    let rows = fixture.student_identities().await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].oj_user_id, SCHOOL_STUDENT);
+    assert_eq!(rows[0].student_number.as_deref(), Some(SCHOOL_NUMBER));
+    assert_eq!(rows[0].nickname.as_deref(), Some("Student"));
     assert!(matches!(
         fixture
             .state

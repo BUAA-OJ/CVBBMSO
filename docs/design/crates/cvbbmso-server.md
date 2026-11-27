@@ -75,6 +75,7 @@ cargo run --locked -p cvbbmso-server -- --listen-addr 127.0.0.1:8080 --database-
 | `POST` | `/exams` | `201 CreatedExam`，请求为 `CreateExam` |
 | `GET` | `/exams/{exam_id}` | `200 ExamDetail` |
 | `GET` | `/exams/{exam_id}/roster` | `200 RosterEntry[]`，按用户 ID 升序 |
+| `GET` | `/exams/{exam_id}/student-identities` | `200 StudentIdentity[]`，有运行记录的考生显示身份 |
 | `POST` | `/exams/{exam_id}/participants` | `200 ImportedParticipants`，请求为 `ImportParticipants` |
 | `DELETE` | `/exams/{exam_id}/participants/{oj_user_id}` | `204`，只允许在开考前撤销 |
 | `GET` | `/exams/{exam_id}/student-enrollments` | `200 StudentEnrollment[]`，包含学号、绑定的用户 ID 和报名状态 |
@@ -89,6 +90,8 @@ cargo run --locked -p cvbbmso-server -- --listen-addr 127.0.0.1:8080 --database-
 学号在管理员查看名单后刚好完成绑定时，按学号撤销会返回 `409 CONFLICT`。面板立即刷新，管理员可再次撤销，更新后的操作按绑定的用户 ID 走现有的 Hub 撤销流程。未绑定学号和单独的数字 ID 报名分别撤销。同一账号绑定学号后共用一条有效报名，撤销用户 ID 会同时停用学号报名，已保存的绑定和考试历史仍可查询。
 
 名单合并当前报名和运行记录；`runtime: null` 代表从未连接，`runtime.connected: false` 代表有历史记录但当前离线，`enrolled: false` 代表报名已撤销但仍有运行记录。面板可见时每 5 秒轮询考生状态，异常与事件按需查询。首版历史查询未分页，不提供录像上传、下载或播放。
+
+异常记录和可靠事件按 Accoding ID 关联考生，界面显示学号和 Accoding 的 `nickname`。学号优先使用该场考试已有的绑定，缺少绑定时使用复验返回的校园登录名推导的学号。已验证账号请求报名列表或通过 WebSocket 升级前的资格检查时，服务端尽力刷新显示资料。旧记录在同一账号再次通过会话验证后补齐昵称。昵称是 Accoding 的显示名称。显示资料的保存不创建报名、绑定或运行记录。
 
 管理业务错误返回 `{"code":"..."}`：`401 ADMIN_AUTH_REQUIRED`、`400 INVALID_INPUT`、`404 NOT_FOUND`、`409 CONFLICT`、`413 BODY_TOO_LARGE`、`415 JSON_REQUIRED`、`503 STORAGE_BUSY`、`500 INTERNAL_ERROR`。路径或查询参数无法解析时由 Axum 拒绝；考生端错误格式保持不变。
 

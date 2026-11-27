@@ -1076,7 +1076,7 @@ async fn migrations_create_the_final_tables() {
             .await
             .unwrap()
             .len(),
-        3
+        4
     );
     let tables = database
         .query_all_raw(Statement::from_string(
@@ -1097,6 +1097,7 @@ async fn migrations_create_the_final_tables() {
         "incidents",
         "seaql_migrations",
         "student_enrollments",
+        "student_profiles",
         "student_runtimes",
     ]));
 }
@@ -1113,7 +1114,7 @@ async fn student_enrollment_migration_preserves_numeric_enrollments_and_runtime(
     let fixture = Fixture::open(&url).await;
     let exam_id = fixture.exam;
     let admin = fixture.service.admin();
-    Migrator::down(&admin.0.writer, Some(1)).await.unwrap();
+    Migrator::down(&admin.0.writer, Some(2)).await.unwrap();
     fixture.connect(ready()).await;
     fixture.service.close().await.unwrap();
 

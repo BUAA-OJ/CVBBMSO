@@ -111,6 +111,20 @@ impl AppState {
         Span::current().record("oj_user_id", user.id);
         Ok(user)
     }
+
+    async fn remember_profile(&self, user: &AccodingUser, has_current_eligibility: bool) {
+        if !matches!(
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                self.exam
+                    .remember_verified_profile(user, has_current_eligibility),
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
+            tracing::debug!("Accoding display metadata was not saved");
+        }
+    }
 }
 
 pub(crate) fn router(state: AppState) -> Router {
@@ -155,6 +169,7 @@ async fn exams(
         .list_for_verified(&user)
         .await
         .map_err(|error| HttpError::domain(&error))?;
+    state.remember_profile(&user, !items.is_empty()).await;
     Ok(Json(ExamListResponse { user, items }))
 }
 
@@ -175,6 +190,7 @@ async fn upgrade(
         .check_verified_enrollment(exam_id, &user)
         .await
         .map_err(|error| HttpError::domain(&error))?;
+    state.remember_profile(&user, true).await;
     let key = StudentKey {
         exam_id,
         oj_user_id: user.id,

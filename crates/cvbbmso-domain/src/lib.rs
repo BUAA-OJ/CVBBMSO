@@ -10,8 +10,10 @@ mod db;
 mod entity;
 mod events;
 mod exam;
+mod student_profiles;
 mod student_registration;
 
+pub use student_profiles::StudentIdentity;
 pub use student_registration::StudentEnrollment;
 
 pub use admin::{

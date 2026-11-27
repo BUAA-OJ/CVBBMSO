@@ -12,7 +12,7 @@ use cvbbmso_domain::{AdminOperation, AdminOutput, DomainError};
 use cvbbmso_protocol::admin::{
     CreateExam, CreatedExam, ErrorResponse, Event, ExamDetail, ImportParticipants,
     ImportStudentEnrollments, ImportedParticipants, Incident, IncidentFilter, RosterEntry,
-    StudentEnrollment, StudentStatus,
+    StudentEnrollment, StudentIdentity, StudentStatus,
 };
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
@@ -64,6 +64,10 @@ pub(crate) fn router(hub: Hub, token: Token) -> Router {
         .route("/exams", get(exams).post(create_exam))
         .route("/exams/{exam_id}", get(exam))
         .route("/exams/{exam_id}/roster", get(roster))
+        .route(
+            "/exams/{exam_id}/student-identities",
+            get(student_identities),
+        )
         .route(
             "/exams/{exam_id}/student-enrollments",
             get(student_enrollments).post(import_student_enrollments),
@@ -263,6 +267,13 @@ async fn student_enrollments(
     execute(&hub, AdminOperation::StudentEnrollmentsList { exam_id }).await
 }
 
+async fn student_identities(
+    State(hub): State<Hub>,
+    Path(exam_id): Path<Uuid>,
+) -> Result<Response, AdminError> {
+    execute(&hub, AdminOperation::StudentIdentitiesList { exam_id }).await
+}
+
 async fn import_student_enrollments(
     State(hub): State<Hub>,
     Path(exam_id): Path<Uuid>,
@@ -410,6 +421,17 @@ async fn execute(hub: &Hub, operation: AdminOperation) -> Result<Response, Admin
                     student_number: entry.student_number,
                     oj_user_id: entry.oj_user_id.map(|id| id.to_string()),
                     enrolled: entry.enrolled,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        AdminOutput::StudentIdentities(items) => Json(
+            items
+                .into_iter()
+                .map(|item| StudentIdentity {
+                    oj_user_id: item.oj_user_id.to_string(),
+                    student_number: item.student_number,
+                    nickname: item.nickname,
                 })
                 .collect::<Vec<_>>(),
         )

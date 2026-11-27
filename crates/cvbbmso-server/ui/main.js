@@ -241,6 +241,12 @@ function clearEvidence(message) {
   element("recording").textContent = message;
 }
 
+function evidenceIdentity(id, identities) {
+  const identity = identities.get(id);
+  const number = identity?.student_number ?? `账号 ${id}（学号未登记）`;
+  return `${number} · ${identity?.nickname ?? "昵称待同步"}`;
+}
+
 async function loadEvidence() {
   const current = selection;
   const marker = {};
@@ -251,17 +257,19 @@ async function loadEvidence() {
   const studentPath = `/exams/${current.id}/students/${id}`;
   clearEvidence("正在加载…");
   try {
-    const [incidents, events, recording] = await Promise.all([
+    const [incidents, events, recording, students] = await Promise.all([
       request(`/exams/${current.id}/incidents${query}`),
       id ? request(`${studentPath}/events`) : [],
       id ? request(`${studentPath}/recording`, { allowMissing: true }) : null,
+      request(`/exams/${current.id}/student-identities`),
     ]);
     if (current !== selection || marker !== evidenceRequest) return;
+    const identities = new Map(students.map((student) => [student.oj_user_id, student]));
     element("incidents").replaceChildren(...(incidents.length ? incidents.map((item) => node("li",
-      `${formatTime(item.occurred_at)} · ${item.oj_user_id} · ${item.source === "server" ? "服务端" : "客户端"} · ${item.kind}${item.detail ? ` · ${item.detail}` : ""}`
+      `${formatTime(item.occurred_at)} · ${evidenceIdentity(item.oj_user_id, identities)} · ${item.source === "server" ? "服务端" : "客户端"} · ${item.kind}${item.detail ? ` · ${item.detail}` : ""}`
     )) : [node("li", "暂无异常记录")]));
     element("events").replaceChildren(...(events.length ? events.map((item) => {
-      const entry = node("li", `#${item.seq} · ${formatTime(item.received_at)}`);
+      const entry = node("li", `#${item.seq} · ${formatTime(item.received_at)} · ${evidenceIdentity(id, identities)}`);
       const details = node("details");
       details.append(node("summary", item.event.kind), node("pre", JSON.stringify(item.event, null, 2)));
       entry.append(details);
