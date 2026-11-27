@@ -10,7 +10,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, oneshot};
@@ -125,7 +125,10 @@ impl MacosTrialGuard {
     }
 }
 
-async fn client_worker(mut socket: UnixStream, mut requests: mpsc::Receiver<Request>) {
+async fn client_worker(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
+    mut requests: mpsc::Receiver<Request>,
+) {
     while let Some(Request {
         operation,
         deadline,
@@ -136,11 +139,11 @@ async fn client_worker(mut socket: UnixStream, mut requests: mpsc::Receiver<Requ
             break;
         }
         let answer = timeout_at(deadline, async {
-            socket
+            stream
                 .write_u8(operation)
                 .await
                 .map_err(|_| unavailable())?;
-            match socket.read_u8().await.map_err(|_| unavailable())? {
+            match stream.read_u8().await.map_err(|_| unavailable())? {
                 OK => Ok(()),
                 ERROR => Err(NetworkError::Platform),
                 _ => Err(unavailable()),
@@ -322,25 +325,25 @@ async fn serve(
     .await
 }
 
-async fn serve_session(
-    mut socket: UnixStream,
+async fn serve_session<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     verify: impl AsyncFn() -> Result<(), NetworkError>,
-) -> Result<Option<UnixStream>, NetworkError> {
+) -> Result<Option<S>, NetworkError> {
     loop {
         // Schedule a new check after the previous operation completes. A
         // slow check never leaves overdue ticks to process ahead of the App.
         let next_check = Instant::now() + HEALTH;
         tokio::select! {
             biased;
-            command = socket.read_u8() => match command {
+            command = stream.read_u8() => match command {
                 Ok(VERIFY) => {
                     let verified = bounded(OPERATION, verify()).await;
                     let status = if verified.is_ok() { OK } else { ERROR };
-                    let reply = timeout(REPLY_WRITE, socket.write_u8(status)).await;
+                    let reply = timeout(REPLY_WRITE, stream.write_u8(status)).await;
                     verified?;
                     reply.map_err(|_| unavailable())?.map_err(|_| unavailable())?;
                 }
-                Ok(SHUTDOWN) => return Ok(Some(socket)),
+                Ok(SHUTDOWN) => return Ok(Some(stream)),
                 Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(None),
                 _ => return Err(unavailable()),
             },
@@ -359,13 +362,13 @@ fn verify_console(uid: libc::uid_t) -> Result<(), NetworkError> {
 }
 
 async fn finish(
-    mut outcome: Result<Option<UnixStream>, NetworkError>,
+    mut outcome: Result<Option<impl AsyncWrite + Unpin>, NetworkError>,
     cleanup: impl Future<Output = Result<(), NetworkError>>,
 ) -> Result<(), NetworkError> {
     let result = bounded(OPERATION, cleanup).await;
-    if let Ok(Some(socket)) = outcome.as_mut() {
+    if let Ok(Some(stream)) = outcome.as_mut() {
         let status = if result.is_ok() { OK } else { ERROR };
-        let _ = timeout(REPLY_WRITE, socket.write_u8(status)).await;
+        let _ = timeout(REPLY_WRITE, stream.write_u8(status)).await;
     }
     result?;
     outcome.map(drop)
@@ -522,7 +525,10 @@ mod tests {
     async fn a_slow_health_check_leaves_time_for_verify_and_shutdown_acknowledgements() {
         let slow = OPERATION.checked_sub(Duration::from_secs(1)).unwrap();
         for operation in [VERIFY, SHUTDOWN] {
-            let (client, root) = UnixStream::pair().unwrap();
+            // With a paused clock, the runtime can advance to the next health
+            // check while waiting for the kernel to report socket EOF. Keep
+            // this timing test on a stream that wakes its peer on close.
+            let (client, root) = tokio::io::duplex(1);
             let (sender, requests) = mpsc::channel(1);
             tokio::spawn(client_worker(client, requests));
             let guard = MacosTrialGuard(sender);
