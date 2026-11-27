@@ -118,6 +118,14 @@ pub fn run() -> tauri::Result<()> {
     }
     #[cfg(not(test))]
     {
+        #[cfg(all(target_os = "macos", feature = "macos-pf-trial"))]
+        if platform::is_root() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "CVBBMSO Trial must run as the current console user",
+            )
+            .into());
+        }
         let app = builder()
             .setup(|app| {
                 let data_dir = app.path().app_local_data_dir()?;

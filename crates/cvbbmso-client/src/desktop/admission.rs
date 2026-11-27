@@ -8,8 +8,10 @@ use std::{
 
 #[cfg(windows)]
 use cvbbmso_network::EgressGuard as SystemGuard;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "macos-pf-trial")))]
 use cvbbmso_network::MacosEgressGuard as SystemGuard;
+#[cfg(all(target_os = "macos", feature = "macos-pf-trial"))]
+use cvbbmso_network::MacosTrialGuard as SystemGuard;
 use cvbbmso_network::{EgressPolicy, EndpointState, Inspector, NetworkError, ProxyState};
 use serde::Serialize;
 #[cfg(target_os = "macos")]
@@ -41,6 +43,8 @@ pub(super) enum Failure {
     MacosUnsupported,
     #[cfg(target_os = "macos")]
     MacosUntrustedInstallation,
+    #[cfg(all(target_os = "macos", feature = "macos-pf-trial"))]
+    MacosTrialLauncherRequired,
     #[cfg(target_os = "macos")]
     MacosApprovalRequired,
     #[cfg(target_os = "macos")]
@@ -73,6 +77,8 @@ impl Failure {
             | Self::MacosLoginRequired
             | Self::MacosUnsupported
             | Self::MacosUntrustedInstallation => false,
+            #[cfg(all(target_os = "macos", feature = "macos-pf-trial"))]
+            Self::MacosTrialLauncherRequired => false,
             _ => true,
         }
     }
@@ -88,6 +94,10 @@ impl Failure {
             #[cfg(target_os = "macos")]
             Self::MacosUntrustedInstallation => {
                 "请使用监考方提供的安装包，将 CVBBMSO.app 从磁盘映像拖到「应用程序」，再双击打开。"
+            }
+            #[cfg(all(target_os = "macos", feature = "macos-pf-trial"))]
+            Self::MacosTrialLauncherRequired => {
+                "未能确认试用版网络守卫。请退出客户端，再从管理员提供的启动脚本打开试用版。"
             }
             #[cfg(target_os = "macos")]
             Self::MacosApprovalRequired => {
@@ -327,7 +337,11 @@ pub(super) async fn open_helper_approval_settings(
                 let _ = reply.send(Ok(()));
                 return;
             }
-            SystemGuard::open_approval_settings().map_err(|_| OPEN_FAILED)
+            #[cfg(not(feature = "macos-pf-trial"))]
+            let opened = SystemGuard::open_approval_settings().map_err(|_| OPEN_FAILED);
+            #[cfg(feature = "macos-pf-trial")]
+            let opened = Err(UNAVAILABLE);
+            opened
         } else {
             Err(UNAVAILABLE)
         };
@@ -495,6 +509,11 @@ async fn prepare(app: AppHandle) -> Result<Prepared, Failure> {
         if platform::is_root() {
             return Err(Failure::MacosLoginRequired);
         }
+        #[cfg(feature = "macos-pf-trial")]
+        if !platform::is_in_trial_bundle() {
+            return Err(Failure::MacosTrialLauncherRequired);
+        }
+        #[cfg(not(feature = "macos-pf-trial"))]
         if !platform::is_in_applications() {
             return Err(Failure::MacosUntrustedInstallation);
         }
@@ -536,10 +555,13 @@ async fn install(app: AppHandle, prepared: Prepared) -> Result<Guard, Failure> {
         return Err(Failure::GuardInstallFailed);
     }
     match prepared {
-        Prepared::System(policy) => SystemGuard::install(policy)
-            .await
-            .map(Guard::System)
-            .map_err(install_failure),
+        Prepared::System(policy) => {
+            #[cfg(all(target_os = "macos", feature = "macos-pf-trial"))]
+            let result = SystemGuard::connect(policy).await;
+            #[cfg(not(all(target_os = "macos", feature = "macos-pf-trial")))]
+            let result = SystemGuard::install(policy).await;
+            result.map(Guard::System).map_err(install_failure)
+        }
         #[cfg(test)]
         Prepared::Fixture(fake) => {
             #[cfg(target_os = "macos")]
@@ -556,6 +578,15 @@ fn install_failure(_: NetworkError) -> Failure {
 
 #[cfg(target_os = "macos")]
 fn install_failure(error: NetworkError) -> Failure {
+    #[cfg(feature = "macos-pf-trial")]
+    if !matches!(
+        error,
+        NetworkError::MacosUnsupported
+            | NetworkError::MacosUnsupportedPfConfiguration
+            | NetworkError::MacosBusy
+    ) {
+        return Failure::MacosTrialLauncherRequired;
+    }
     match error {
         NetworkError::MacosUnsupported => Failure::MacosUnsupported,
         NetworkError::MacosUntrustedInstallation => Failure::MacosUntrustedInstallation,

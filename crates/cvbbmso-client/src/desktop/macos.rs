@@ -18,6 +18,7 @@ pub(super) fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+#[cfg(not(feature = "macos-pf-trial"))]
 pub(super) fn is_in_applications() -> bool {
     let Ok(applications) = Path::new("/Applications").canonicalize() else {
         return false;
@@ -25,6 +26,17 @@ pub(super) fn is_in_applications() -> bool {
     std::env::current_exe()
         .and_then(|path| path.canonicalize())
         .is_ok_and(|path| path.starts_with(applications))
+}
+
+#[cfg(feature = "macos-pf-trial")]
+pub(super) fn is_in_trial_bundle() -> bool {
+    const INSTALLED: &str = "/Library/Application Support/com.cvbbmso-trial/CVBBMSO Trial.app/Contents/MacOS/cvbbmso-client";
+    let Ok(installed) = Path::new(INSTALLED).canonicalize() else {
+        return false;
+    };
+    std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .is_ok_and(|path| path == installed)
 }
 
 pub(super) fn screen_permission() -> Result<(), Failure> {
