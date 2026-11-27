@@ -130,15 +130,8 @@ enum ServerError {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    if let Err(error) = tracing_subscriber::fmt().json().try_init() {
-        eprintln!(
-            "{}",
-            serde_json::json!({
-                "category": "config",
-                "error": "failed to initialize JSON logging",
-                "source": error.to_string(),
-            })
-        );
+    if let Err(error) = tracing_subscriber::fmt().try_init() {
+        eprintln!("failed to initialize logging: {error}");
         return ExitCode::FAILURE;
     }
     let config = match ServerConfig::try_parse() {
