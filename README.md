@@ -1,4 +1,4 @@
-# CVBBMSO
+# CVBBMSO: Centralized Verification and Browser-Based Monitoring System for Online-exams
 
 CVBBMSO 是配合 [Accoding](https://accoding.buaa.edu.cn) 使用的程序设计考试系统，包含 Windows / macOS 桌面考试客户端与监考服务端。
 
