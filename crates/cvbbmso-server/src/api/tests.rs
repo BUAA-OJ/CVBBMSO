@@ -301,10 +301,7 @@ fn capture_logs() {
     // logs emitted on the thread of the current-thread Tokio test.
     SUBSCRIBER.call_once(|| {
         tracing::subscriber::set_global_default(
-            tracing_subscriber::fmt()
-                .json()
-                .with_writer(|| LogWriter)
-                .finish(),
+            tracing_subscriber::fmt().with_writer(|| LogWriter).finish(),
         )
         .unwrap();
     });
@@ -353,25 +350,20 @@ async fn rejection_logs_retain_diagnostics_without_disclosing_source_text() {
     );
 
     let output = captured_logs();
-    let entries: Vec<_> = output
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .collect();
     assert!(
-        entries.iter().any(|entry| {
-            let fields = &entry["fields"];
-            fields["code"] == error_code::ACCODING_UNAVAILABLE
-                && fields["reason"] == "invalid Accoding JSON response (Data)"
+        output.lines().any(|line| {
+            line.contains("request rejected")
+                && line.contains(r#"code="ACCODING_UNAVAILABLE""#)
+                && line.contains("reason=invalid Accoding JSON response (Data)")
         }),
         "{output}"
     );
     assert!(
-        entries.iter().any(|entry| {
-            let fields = &entry["fields"];
-            fields["code"] == error_code::INTERNAL_ERROR
-                && fields["reason"].as_str().is_some_and(|reason| {
-                    reason.starts_with("SQLite ") && reason.contains("code 1811")
-                })
+        output.lines().any(|line| {
+            line.contains("WebSocket message rejected")
+                && line.contains(r#"code="INTERNAL_ERROR""#)
+                && line.contains("reason=SQLite execution failed")
+                && line.contains("(code 1811)")
         }),
         "{output}"
     );
@@ -1653,11 +1645,13 @@ async fn request_logs_include_metadata_and_keep_cookie_values_private() {
     assert!(!output.contains("connect.sid"));
     assert!(!output.contains("s%3Aexample"));
     assert!(output.lines().any(|line| {
-        let log: serde_json::Value = serde_json::from_str(line).unwrap();
-        log["fields"]["status"] == 200
-            && log["span"]["route"] == "/api/exams"
-            && log["span"]["oj_user_id"] == STUDENT
-            && log["span"]["request_id"].as_str().is_some()
+        line.contains("http_request{")
+            && line.contains("route=/api/exams")
+            && line.contains("request_id=")
+            && line.contains("method=GET")
+            && line.contains(&format!("oj_user_id={STUDENT}"))
+            && line.contains("request completed")
+            && line.contains("status=200")
     }));
 }
 

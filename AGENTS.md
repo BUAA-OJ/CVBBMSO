@@ -56,7 +56,7 @@ this file and explaining why.
 | Migrations | `sea-orm-migration` | Prefer the default `sea-orm-cli` layout described in the domain crate document. |
 | CLI parsing | `clap` (derive) | |
 | Configuration | `clap` flags + environment variables | No configuration files for the server. |
-| Logging | `tracing` + `tracing-subscriber` | JSON logs for the server, human-readable for the client. |
+| Logging | `tracing` + `tracing-subscriber` | Human-readable logs for the server and client. |
 | Desktop shell | Tauri 2 | Controlled WebView only; no extra browser plugins. |
 | CSV import | `csv` | CLI-side parsing only. |
 | Test helpers | `proptest`, `wiremock`, `insta`, `tempfile` | See Testing. |
