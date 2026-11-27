@@ -32,6 +32,13 @@ mod egress;
 mod endpoint;
 mod inspector;
 mod proxy;
+#[cfg(any(target_os = "macos", windows))]
+#[cfg_attr(windows, path = "tunnel/windows.rs")]
+#[cfg_attr(
+    windows,
+    allow(unsafe_code, reason = "the adapter reads Windows IP Helper tables")
+)]
+mod tunnel;
 
 #[cfg(target_os = "macos")]
 pub use self::egress::managed::MacosEgressGuard;

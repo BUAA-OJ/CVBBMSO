@@ -38,6 +38,13 @@ impl Inspector {
 
     /// 获取系统代理配置和监考服务器可达性快照。
     pub async fn check(&self) -> Result<NetworkReport, NetworkError>;
+
+    /// 只读取系统代理配置，不探测服务端。
+    pub async fn check_proxy() -> Result<ProxyState, NetworkError>;
+
+    /// 检查默认路由或常见拆分默认路由是否关联 TUN 或 VPN。
+    #[cfg(any(target_os = "macos", windows))]
+    pub async fn tunnel_configured() -> Result<bool, NetworkError>;
 }
 
 impl EgressGuard {
@@ -68,6 +75,8 @@ impl EgressGuard {
 | `endpoint` | `unreachable` | 监考服务端探测失败 |
 
 Windows 使用 WinINet、WinHTTP 与代理环境变量；macOS 使用 SystemConfiguration/CFNetwork 与代理环境变量。`Inspector` 读取当前用户环境。
+
+客户端运行时使用 `check_proxy` 复查代理。macOS 只读检查非接口限定的默认路由及常见拆分默认路由。Windows 通过 IP Helper 读取同类路由及对应适配器的运行状态，识别系统隧道、Wintun 和常见 VPN 适配器。仅有空闲隧道接口或私网路由时不会触发阻断。
 
 ## 启动预检
 
