@@ -165,7 +165,9 @@ async fn admin_routes_require_bearer_before_reading_or_mutating() {
             .contains("frame-ancestors 'none'")
     );
     let html = to_bytes(page.into_body(), 16_384).await.unwrap();
-    assert!(!String::from_utf8_lossy(&html).contains(TEST_ADMIN_TOKEN));
+    let html = String::from_utf8_lossy(&html);
+    assert!(html.contains("id=\"refresh-dashboard\""));
+    assert!(!html.contains(TEST_ADMIN_TOKEN));
 }
 
 #[tokio::test]

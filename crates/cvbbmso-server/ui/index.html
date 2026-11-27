@@ -22,7 +22,10 @@
     <div id="dashboard" hidden>
       <div class="heading">
         <div><h1>考试管理</h1><p id="exam-summary">请选择一场考试</p></div>
-        <label>当前考试<select id="exam-select" aria-label="当前考试"></select></label>
+        <div class="heading-controls">
+          <label>当前考试<select id="exam-select" aria-label="当前考试"></select></label>
+          <button type="button" id="refresh-dashboard">刷新</button>
+        </div>
       </div>
       <nav aria-label="控制面板栏目">
         <button type="button" data-view="exams" aria-pressed="true">考试与名单</button>

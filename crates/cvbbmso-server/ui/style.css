@@ -15,6 +15,7 @@ h3 { margin-top: 1.25rem; font-size: 1rem; }
 p { margin: .5rem 0 1rem; }
 .muted, #exam-summary { color: #52647c; }
 .heading, .section-heading { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; justify-content: space-between; }
+.heading-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: .75rem; }
 .heading select { min-width: min(17rem, 85vw); }
 nav { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1rem 0; }
 nav button { color: #163f76; background: #e6effe; }

@@ -44,6 +44,8 @@ function resetSession() {
   element("import-form").reset();
   element("exam-select").replaceChildren();
   element("exam-summary").textContent = "请选择一场考试";
+  element("refresh-dashboard").disabled = false;
+  element("refresh-dashboard").textContent = "刷新";
   renderRoster([], null);
   clearEvidence("请选择考试");
   element("dashboard").hidden = true;
@@ -93,7 +95,7 @@ function showExams(exams, preferred) {
   picker.replaceChildren(...exams.map((exam) => option(exam.id, `${exam.title} · ${phases[exam.phase] ?? exam.phase}`)));
   if (exams.some((exam) => exam.id === retained)) picker.value = retained;
   if (!exams.length) picker.append(option("", "暂无考试"));
-  chooseExam();
+  if (picker.value !== selection?.id) chooseExam();
 }
 
 function chooseExam() {
@@ -116,6 +118,33 @@ function selectView(name) {
     const active = button.dataset.view === name;
     button.setAttribute("aria-pressed", active);
     element(button.dataset.view).hidden = !active;
+  }
+}
+
+async function refreshDashboard() {
+  const active = session;
+  const button = element("refresh-dashboard");
+  if (!active || button.disabled) return;
+  button.disabled = true;
+  button.textContent = "刷新中…";
+  try {
+    const exams = await request("/exams");
+    if (active !== session) return;
+    const current = selection;
+    showExams(exams);
+    if (current && selection === current) {
+      await Promise.all([
+        refreshRoster(true),
+        view === "evidence" ? loadEvidence() : null,
+      ]);
+    }
+  } catch (error) {
+    if (active === session) report(error);
+  } finally {
+    if (active === session) {
+      button.disabled = false;
+      button.textContent = "刷新";
+    }
   }
 }
 
@@ -333,7 +362,7 @@ handleForm("create-form", async (fields, form) => {
     showExams(await request("/exams"), result.exam_id);
   } catch (error) {
     if (session && error.name !== "AbortError") {
-      notice("考试已创建，但列表未能刷新；请重新登录后查看。", true);
+      notice("考试已创建。列表刷新失败，请点击页面上的「刷新」重试。", true);
     }
   }
 });
@@ -355,6 +384,7 @@ handleForm("import-form", async (fields, form) => {
 });
 
 element("logout").addEventListener("click", resetSession);
+element("refresh-dashboard").addEventListener("click", refreshDashboard);
 element("exam-select").addEventListener("change", chooseExam);
 element("student-select").addEventListener("change", loadEvidence);
 element("refresh-evidence").addEventListener("click", loadEvidence);
