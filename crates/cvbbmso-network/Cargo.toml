@@ -14,6 +14,14 @@ path = "src/lib.rs"
 name = "cvbbmso-egress-watchdog"
 path = "src/bin/cvbbmso-egress-watchdog.rs"
 
+[[bin]]
+name = "cvbbmso-pf-trial"
+path = "src/bin/cvbbmso-pf-trial.rs"
+required-features = ["macos-pf-trial"]
+
+[features]
+macos-pf-trial = ["tokio/io-util", "tokio/process", "tokio/signal", "tokio/sync"]
+
 [dependencies]
 reqwest.workspace = true
 serde.workspace = true

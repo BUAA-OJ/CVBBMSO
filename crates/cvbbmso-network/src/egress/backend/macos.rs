@@ -49,6 +49,16 @@ pub(crate) fn install_managed(plan: &Plan) -> Result<InstallResult, NetworkError
     Prepared::managed()?.install(plan)
 }
 
+#[cfg(feature = "macos-pf-trial")]
+pub(crate) fn prepare_trial() -> Result<(), NetworkError> {
+    Prepared::clean_before_trial().map(drop)
+}
+
+#[cfg(feature = "macos-pf-trial")]
+pub(crate) fn install_trial(plan: &Plan) -> Result<InstallResult, NetworkError> {
+    Prepared::trial()?.install(plan)
+}
+
 struct PfGuard {
     expected: Mutex<Expected>,
     watchdog: Mutex<Option<lifecycle::Watchdog>>,

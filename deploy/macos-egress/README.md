@@ -55,3 +55,31 @@ sudo ./deploy/macos-egress/deploy.sh remove "$SHA256"
 ## 开发验收
 
 在 macOS 以普通用户执行 `./deploy/macos-egress/test-deploy.sh`。测试用临时目录执行文件操作，用替身查询 PF 和 launchd，并对样例及无效规则运行真实 `pfctl -n`。可传入已构建的 watchdog 绝对路径，验证实际产物的原生 Mach-O 架构。真实部署、规则激活、考试流量与崩溃恢复须在隔离环境验收。
+
+## 管理员启动的 PF 试用
+
+试用支持 Apple Silicon 和 macOS 14 或更新版本。构建客户端和 helper 时使用同一个 `CVBBMSO_SERVER_ORIGIN`，填写带可信 TLS 证书的 HTTPS Origin。Network helper 的构建入口如下。
+
+```sh
+CVBBMSO_SERVER_ORIGIN=https://monitor.example.edu/ cargo build --locked --release \
+  -p cvbbmso-network --features macos-pf-trial --bin cvbbmso-pf-trial
+```
+
+管理员先从已核对的试用交付物登记下列固定文件。复制完成后校验安装副本，脚本、helper、App 及其上级目录须由 root 所有，普通用户和组无写权限。App 内部文件也须随整包安装。保留这些受保护副本，目录中的下载版或构建版脚本只作为安装材料。
+
+| 交付物 | 受保护的安装位置 |
+| --- | --- |
+| `pf-trial.sh` | `/Library/PrivilegedHelperTools/cvbbmso-pf-trial.sh` |
+| `cvbbmso-pf-trial` | `/Library/PrivilegedHelperTools/com.cvbbmso.pf-trial` |
+| `CVBBMSO Trial.app` | `/Library/Application Support/com.cvbbmso-trial/CVBBMSO Trial.app` |
+
+App 的可执行文件为包内的 `Contents/MacOS/cvbbmso-client`。从目标用户当前登录的桌面终端运行已安装的脚本。
+
+```sh
+sudo /Library/PrivilegedHelperTools/cvbbmso-pf-trial.sh status
+sudo /Library/PrivilegedHelperTools/cvbbmso-pf-trial.sh run
+```
+
+`status` 检查安装路径、系统版本、控制台会话和编译时 Origin。`run` 在前台持有网络守卫。安装 PF 后，helper 以当前控制台用户身份启动 App，并等待最多 45 秒完成附着和首次校验。连接成功后守卫随该 App 进程运行。App 退出、断连、切换控制台用户或终端收到中止信号时，helper 清理当场 PF 状态。需要在系统设置中授予录屏权限并重启 App 时，结束本次试用后重新运行脚本。实时 PF 校验失败会结束会话。
+
+如果终端报清理失败，先保留已安装的 helper 和恢复记录。看门狗和临时 launchd 任务会继续尝试恢复。确认原试用会话已结束后，也可经同一脚本运行 `recover` 检查遗留状态。恢复完成前保留安装副本。

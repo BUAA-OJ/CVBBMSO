@@ -35,7 +35,17 @@ mod proxy;
 
 #[cfg(target_os = "macos")]
 pub use self::egress::managed::MacosEgressGuard;
+#[cfg(all(target_os = "macos", feature = "macos-pf-trial"))]
+pub use self::egress::trial::MacosTrialGuard;
 pub use self::egress::{EgressGuard, EgressPolicy};
+
+/// Entry point of the administrator-launched macOS trial helper.
+#[cfg(all(target_os = "macos", feature = "macos-pf-trial"))]
+#[doc(hidden)]
+#[must_use]
+pub fn macos_pf_trial_main() -> std::process::ExitCode {
+    egress::trial::main()
+}
 
 /// Entry point for the signed macOS `LaunchDaemon` and its recovery subprocess.
 #[cfg(target_os = "macos")]

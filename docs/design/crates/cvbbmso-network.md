@@ -135,6 +135,8 @@ PF 启用前保存引用快照。子进程必须先将 PID 和行末换行符完
 
 macOS 14 及以上的正式 DMG 提供 `MacosEgressGuard::install(policy).await`。普通用户会话完成前置检查后调用，运行特权操作的是应用内经过系统授权的 LaunchDaemon。两个 HTTPS 来源随签名版本固定，XPC 只接受固定操作。安装成功意味着守卫已校验内核规则。句柄的 `verify(&self).await` 和 `shutdown(self).await` 只对本连接的守卫生效。系统需要批准时返回 `NetworkError::MacosApprovalRequired`，客户端可在明确的用户操作后调用 `MacosEgressGuard::open_approval_settings()`，获批后重试。[macOS DMG 部署](../../deployment/macos-client.md)
 
+Apple Silicon 的管理员试用构建提供 `MacosTrialGuard::connect(policy).await`。管理员通过已安装的受保护脚本启动 helper。helper 持有实际 PF 守卫，并以当前控制台用户身份启动受保护目录内的试用 App。Unix socket 使用内核凭据核对 helper 的 root 身份，以及 App 的 UID、启动进程和可执行文件。两端策略随构建固定，首次 live PF 校验通过后客户端才获得守卫句柄。未附着有 45 秒期限，已附着的 App 通过定期校验维持现有租约。非正常退出仍由看门狗和临时 launchd 任务恢复。 [管理员试用部署](../../../deploy/macos-egress/README.md#管理员启动的-pf-试用)
+
 以下固定 helper 与宿主预部署方式用于直接调用 `EgressGuard` 的现有部署，仍可用于预先激活宿主管理的 PF 入口。
 
 部署方须在 PF 主过滤规则的第一条配置并加载这个入口。anchor 由守卫独占，初始为空，规则由守卫在安装时加载。

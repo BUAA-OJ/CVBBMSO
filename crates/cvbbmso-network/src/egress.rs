@@ -19,6 +19,8 @@ mod resolver;
 mod services;
 #[cfg(target_os = "macos")]
 mod state;
+#[cfg(all(target_os = "macos", feature = "macos-pf-trial"))]
+pub(crate) mod trial;
 
 use std::future::{Future, poll_fn};
 use std::net::{IpAddr, SocketAddr};

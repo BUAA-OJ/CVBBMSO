@@ -141,7 +141,7 @@ fn trusted_team() -> Result<CString, NetworkError> {
     CString::new(value).map_err(|_| NetworkError::MacosUntrustedInstallation)
 }
 
-fn build_policy() -> Result<EgressPolicy, NetworkError> {
+pub(super) fn build_policy() -> Result<EgressPolicy, NetworkError> {
     let origin = |value: &str| {
         let url = url::Url::parse(value).map_err(|_| NetworkError::Policy)?;
         if url.scheme() != "https"

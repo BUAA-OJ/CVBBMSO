@@ -26,6 +26,7 @@ pub(crate) struct Prepared {
     lock: File,
     helper: &'static str,
     versioned_helper: bool,
+    managed: bool,
 }
 
 impl Prepared {
@@ -54,6 +55,7 @@ impl Prepared {
             lock,
             helper: HELPER,
             versioned_helper,
+            managed: false,
         })
     }
 
@@ -63,7 +65,24 @@ impl Prepared {
             lock,
             helper: managed::RECOVERY_SERVICE,
             versioned_helper: true,
+            managed: true,
         })
+    }
+
+    #[cfg(feature = "macos-pf-trial")]
+    pub(crate) fn trial() -> Result<Self, NetworkError> {
+        let lock = prepare_trial(true)?;
+        Ok(Self {
+            lock,
+            helper: crate::egress::trial::HELPER,
+            versioned_helper: true,
+            managed: true,
+        })
+    }
+
+    #[cfg(feature = "macos-pf-trial")]
+    pub(crate) fn clean_before_trial() -> Result<File, NetworkError> {
+        prepare_trial(false)
     }
 
     pub(crate) fn clean_before_resolution() -> Result<(), NetworkError> {
@@ -79,7 +98,7 @@ impl Prepared {
         let mut guard_state = GuardState::new(std::process::id(), generation.clone());
         let job = Job::new(generation);
         state::write(&commands, &guard_state)?;
-        let managed = self.helper == managed::RECOVERY_SERVICE;
+        let managed = self.managed;
         let mut watchdog = match Watchdog::start(job.clone(), self.helper) {
             Ok(watchdog) => watchdog,
             Err(error) => {
@@ -113,6 +132,24 @@ impl Prepared {
 }
 
 fn prepare_managed(installing: bool) -> Result<File, NetworkError> {
+    prepare_root_policy(installing, |commands| {
+        managed::stage_recovery()?;
+        require_managed_helper(commands, managed::RECOVERY_SERVICE)
+    })
+}
+
+#[cfg(feature = "macos-pf-trial")]
+fn prepare_trial(installing: bool) -> Result<File, NetworkError> {
+    prepare_root_policy(installing, |commands| {
+        crate::egress::trial::check_helper()?;
+        require_managed_helper(commands, crate::egress::trial::HELPER)
+    })
+}
+
+fn prepare_root_policy(
+    installing: bool,
+    ensure_helper: impl FnOnce(&SystemCommands<'_>) -> Result<(), NetworkError>,
+) -> Result<File, NetworkError> {
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         return Err(NetworkError::PermissionDenied);
@@ -131,8 +168,7 @@ fn prepare_managed(installing: bool) -> Result<File, NetworkError> {
         || has_guard_records(&commands)?
         || managed_pf::has_journal(&commands)?;
     if installing || needs_recovery {
-        managed::stage_recovery()?;
-        require_managed_helper(&commands)?;
+        ensure_helper(&commands)?;
     }
     if needs_recovery {
         recover(&commands, true)?;
@@ -140,8 +176,8 @@ fn prepare_managed(installing: bool) -> Result<File, NetworkError> {
     Ok(lock)
 }
 
-fn require_managed_helper(commands: &dyn Commands) -> Result<(), NetworkError> {
-    if supports_versioned_leases(commands, managed::RECOVERY_SERVICE)? {
+fn require_managed_helper(commands: &dyn Commands, helper: &str) -> Result<(), NetworkError> {
+    if supports_versioned_leases(commands, helper)? {
         Ok(())
     } else {
         Err(NetworkError::Platform)
@@ -451,11 +487,14 @@ mod tests {
         let recorder = Recorder::default();
         recorder.rejected(&[CAPABILITIES], &NetworkError::Policy.to_string());
         assert_eq!(
-            require_managed_helper(&recorder),
+            require_managed_helper(&recorder, managed::RECOVERY_SERVICE),
             Err(NetworkError::Platform)
         );
         recorder.reply(&[CAPABILITIES], Ok(LEASE_CAPABILITY));
-        assert_eq!(require_managed_helper(&recorder), Ok(()));
+        assert_eq!(
+            require_managed_helper(&recorder, managed::RECOVERY_SERVICE),
+            Ok(())
+        );
         assert_eq!(
             recorder.calls(),
             vec![
