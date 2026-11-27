@@ -20,7 +20,7 @@ time.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite.workspace = true
 tracing.workspace = true
-tracing-subscriber = { workspace = true, features = ["fmt"] }
+tracing-subscriber = { workspace = true, features = ["ansi", "fmt"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
