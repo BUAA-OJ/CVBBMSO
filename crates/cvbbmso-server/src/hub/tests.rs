@@ -250,7 +250,10 @@ async fn connect_test_student(
         close: close_tx,
         admitted: admitted_tx,
     };
-    assert!(hub.connect(connection, hello, peer).await);
+    assert!(
+        hub.connect(connection, hello, "test@example.test".into(), peer)
+            .await
+    );
     (connection, frames_rx, close_rx, admitted_rx)
 }
 
@@ -413,6 +416,7 @@ async fn idle_storage_fault_recovers_on_schedule_tick_and_admits_next_connect() 
                 request_id: Uuid::new_v4(),
             },
             hello(),
+            "test@example.test".into(),
             Peer {
                 frames: frames_tx,
                 close: close_tx,
@@ -441,6 +445,7 @@ async fn idle_storage_fault_recovers_on_schedule_tick_and_admits_next_connect() 
                 request_id: Uuid::new_v4(),
             },
             hello(),
+            "test@example.test".into(),
             Peer {
                 frames: frames_tx,
                 close: close_tx,

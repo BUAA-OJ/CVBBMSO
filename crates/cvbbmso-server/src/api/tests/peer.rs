@@ -43,6 +43,7 @@ impl TestPeer {
                 .connect(
                     connection,
                     hello,
+                    "test@example.test".into(),
                     Peer {
                         frames,
                         close,

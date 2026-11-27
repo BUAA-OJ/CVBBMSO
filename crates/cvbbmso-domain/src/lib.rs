@@ -10,6 +10,9 @@ mod db;
 mod entity;
 mod events;
 mod exam;
+mod student_registration;
+
+pub use student_registration::StudentEnrollment;
 
 pub use admin::{
     AdminOperation, AdminOutput, AdminService, EventRecord, IncidentRecord, ParticipantRecord,

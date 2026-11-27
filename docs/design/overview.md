@@ -12,6 +12,7 @@
 | --- | --- |
 | `exam_id` | 考试 UUID，由管理员创建考试时生成 |
 | `oj_user_id` | Accoding `/api/users/me` 返回的正整数用户 ID |
+| `student_number` | 教务名单中的学号字符串，由已验证的校园 Accoding 登录名确认 |
 | `(exam_id, oj_user_id)` | 考生参加某场考试的唯一业务标识 |
 | `phase` | 考试阶段 `scheduled` / `running` / `ended`，由服务端时钟和固定考试时间推导 |
 | command | 服务端下发的 `start_exam` / `end_exam` 指令，每次下发有唯一 `command_id` |

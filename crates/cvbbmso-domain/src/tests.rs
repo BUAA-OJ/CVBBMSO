@@ -1076,7 +1076,7 @@ async fn migrations_create_the_final_tables() {
             .await
             .unwrap()
             .len(),
-        2
+        3
     );
     let tables = database
         .query_all_raw(Statement::from_string(
@@ -1096,8 +1096,50 @@ async fn migrations_create_the_final_tables() {
         "exams",
         "incidents",
         "seaql_migrations",
+        "student_enrollments",
         "student_runtimes",
     ]));
+}
+
+#[tokio::test]
+async fn student_enrollment_migration_preserves_numeric_enrollments_and_runtime() {
+    use migration::{Migrator, MigratorTrait};
+
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("old.sqlite").display()
+    );
+    let fixture = Fixture::open(&url).await;
+    let exam_id = fixture.exam;
+    let admin = fixture.service.admin();
+    Migrator::down(&admin.0.writer, Some(1)).await.unwrap();
+    fixture.connect(ready()).await;
+    fixture.service.close().await.unwrap();
+
+    let upgraded = ExamService::open_with_clock(&url, || time(START - 1))
+        .await
+        .unwrap();
+    assert_eq!(upgraded.list_for(USER).await.unwrap()[0].id, exam_id);
+    assert!(matches!(
+        upgraded
+            .admin()
+            .execute(
+                "tester".into(),
+                AdminOperation::StudentsShow {
+                    exam_id,
+                    oj_user_id: USER,
+                }
+            )
+            .await,
+        Ok(AdminOutput::Student(_))
+    ));
+    assert!(matches!(
+        upgraded.admin().execute("tester".into(), AdminOperation::StudentEnrollmentsList {
+            exam_id,
+        }).await,
+        Ok(AdminOutput::StudentEnrollments(rows)) if rows.is_empty()
+    ));
 }
 
 #[tokio::test]

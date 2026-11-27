@@ -44,6 +44,24 @@ pub struct ImportParticipants {
     pub oj_user_ids: Vec<String>,
 }
 
+/// Request to enroll students by their school student numbers.
+#[derive(Debug, Deserialize)]
+pub struct ImportStudentEnrollments {
+    /// Student numbers as decimal strings, including any leading zeros.
+    pub student_numbers: Vec<String>,
+}
+
+/// A school roster invitation and its verified account binding.
+#[derive(Debug, Serialize)]
+pub struct StudentEnrollment {
+    /// Decimal school student number.
+    pub student_number: String,
+    /// Decimal Accoding user ID, or null before the student enters.
+    pub oj_user_id: Option<String>,
+    /// Whether the invitation is active.
+    pub enrolled: bool,
+}
+
 /// Result of importing participants.
 #[derive(Debug, Serialize)]
 pub struct ImportedParticipants {

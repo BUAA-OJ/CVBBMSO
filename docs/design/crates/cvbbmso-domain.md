@@ -175,6 +175,8 @@ impl AdminService {
 
 `ExamService::connect` 验证报名资格，并在相同 `(exam_id, oj_user_id)` 上恢复既有状态。服务端根据 `hello.state` 决定是否生成命令。`hello` 上报 `finished` 时，服务端核对已持久化的完成状态和对应的 `end_exam` 终态回执。
 
+`list_for_verified` 和 `check_verified_enrollment` 使用已验证账号只读查询报名。Hub 收到 `hello` 时使用 `BatchWrite::ConnectVerified`，在同一个写入保存点内重查学号、绑定内部 ID 并启动或恢复运行记录。撤销先完成时，入场返回 `NotEnrolled`。入场先完成时，按学号撤销返回 `Conflict`，绑定后的撤销复用按 ID 的断开流程。重新导入同一学号时沿用原绑定。
+
 `connect` 记录异常的条件：
 
 - `hello.instance_id` 与上次不同，且上次状态为 `recording` 或 `finalizing` 时，写入 `process_restarted`。
@@ -283,6 +285,7 @@ pub struct IncidentRecord {
 | --- | --- |
 | 考试记录 | `exam_id`、标题、固定起止时间、录像策略 |
 | 报名关系 | `(exam_id, oj_user_id)` 是否允许参加 |
+| 学号名单 | `(exam_id, student_number)` 记录报名状态及首次入场时绑定的内部 ID |
 | 考生运行状态 | 当前设备/进程、连接状态、执行状态、最后心跳、事件确认位置 |
 | 指令记录 | 客户端实际回报的开始/结束命令终态、唯一 `command_id` 和对应失败码 |
 | 可靠事件 | 客户端上报的 `seq`、事件内容和接收时间 |

@@ -5,3 +5,4 @@ pub(crate) mod event;
 pub(crate) mod exam;
 pub(crate) mod incident;
 pub(crate) mod runtime;
+pub(crate) mod student_enrollment;

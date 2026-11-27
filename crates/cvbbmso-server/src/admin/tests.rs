@@ -187,6 +187,63 @@ async fn trailing_slash_redirects_to_the_dashboard() {
 }
 
 #[tokio::test]
+async fn school_roster_import_deduplicates_and_preserves_leading_zeros() {
+    let fixture = Fixture::new().await;
+    let exam_id = fixture.create().await;
+    let path = format!("/exams/{exam_id}/student-enrollments");
+    assert_eq!(
+        fixture
+            .request(
+                Method::POST,
+                &path,
+                Some(json!({"student_numbers": ["0007", "7", "0007"]}))
+            )
+            .await,
+        (StatusCode::OK, json!({"count": 2}))
+    );
+    assert_eq!(
+        fixture
+            .request(
+                Method::POST,
+                &path,
+                Some(json!({"student_numbers": ["0007"]}))
+            )
+            .await,
+        (StatusCode::OK, json!({"count": 0}))
+    );
+    for bad in [
+        json!([17]),
+        json!(["17@buaa.edu.cn"]),
+        json!(["１２"]),
+        json!([]),
+    ] {
+        let (status, _) = fixture
+            .request(Method::POST, &path, Some(json!({"student_numbers": bad})))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(
+        fixture.request(Method::GET, &path, None).await,
+        (
+            StatusCode::OK,
+            json!([
+                {"student_number":"0007","oj_user_id":null,"enrolled":true},
+                {"student_number":"7","oj_user_id":null,"enrolled":true}
+            ])
+        )
+    );
+    assert_eq!(
+        fixture
+            .request(Method::DELETE, &format!("{path}/0007"), None)
+            .await,
+        (StatusCode::NO_CONTENT, Value::Null)
+    );
+    let (_, roster) = fixture.request(Method::GET, &path, None).await;
+    assert_eq!(roster[0]["enrolled"], false);
+    assert_eq!(roster[1]["enrolled"], true);
+}
+
+#[tokio::test]
 async fn exam_roster_keeps_never_connected_offline_and_revoked_students_distinct() {
     let fixture = Fixture::new().await;
     let exam_id = fixture.create().await;

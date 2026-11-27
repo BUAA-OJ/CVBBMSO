@@ -98,6 +98,7 @@ enum Request {
     Connect {
         connection: Connection,
         hello: ClientHello,
+        username: String,
         peer: Peer,
     },
     Reliable {
@@ -145,12 +146,14 @@ impl Hub {
         &self,
         connection: Connection,
         hello: ClientHello,
+        username: String,
         peer: Peer,
     ) -> bool {
         self.requests
             .send(Request::Connect {
                 connection,
                 hello,
+                username,
                 peer,
             })
             .await
@@ -460,6 +463,7 @@ enum PendingOp {
     Connect {
         connection: Connection,
         hello: ClientHello,
+        username: String,
         peer: Peer,
         observed_at: OffsetDateTime,
     },
@@ -770,8 +774,9 @@ impl Manager {
             Request::Connect {
                 connection,
                 hello,
+                username,
                 peer,
-            } => self.handle_connect(connection, hello, peer),
+            } => self.handle_connect(connection, hello, username, peer),
             Request::Reliable {
                 connection,
                 message,
@@ -879,7 +884,13 @@ impl Manager {
         let _ = msg.ack.send(SessionAck::Deadline(deadline));
     }
 
-    fn handle_connect(&mut self, connection: Connection, hello: ClientHello, peer: Peer) {
+    fn handle_connect(
+        &mut self,
+        connection: Connection,
+        hello: ClientHello,
+        username: String,
+        peer: Peer,
+    ) {
         if self.shutting_down || self.storage != StorageHealth::Healthy {
             let _ = peer.close.send(Some(SocketError::INTERNAL_ERROR));
             return;
@@ -892,6 +903,7 @@ impl Manager {
         slot.pending.push_back(PendingOp::Connect {
             connection,
             hello,
+            username,
             peer,
             observed_at: self.exam.now(),
         });
@@ -1169,6 +1181,8 @@ impl Manager {
             AdminOperation::ExamsCreate { .. }
                 | AdminOperation::ParticipantsAdd { .. }
                 | AdminOperation::ParticipantsImport { .. }
+                | AdminOperation::StudentEnrollmentsImport { .. }
+                | AdminOperation::StudentEnrollmentRemove { .. }
         ) {
             if self.shutting_down {
                 let _ = reply.send(Err(DomainError::InvalidInput));
@@ -1506,13 +1520,15 @@ impl Manager {
             PendingOp::Connect {
                 connection,
                 hello,
+                username,
                 peer,
                 observed_at,
             } => {
                 let requested_state = hello.state;
-                let write = BatchWrite::Connect {
+                let write = BatchWrite::ConnectVerified {
                     exam_id: student.exam_id,
                     oj_user_id: student.oj_user_id,
+                    username,
                     connection_id: connection.id,
                     hello,
                     observed_at,
@@ -1741,8 +1757,11 @@ impl Manager {
         };
         let pending = match (batch, kind) {
             (
-                BatchWrite::Connect {
-                    hello, observed_at, ..
+                BatchWrite::ConnectVerified {
+                    hello,
+                    username,
+                    observed_at,
+                    ..
                 },
                 InFlightKind::Connect {
                     connection, peer, ..
@@ -1750,6 +1769,7 @@ impl Manager {
             ) => PendingOp::Connect {
                 connection,
                 hello,
+                username,
                 peer,
                 observed_at,
             },

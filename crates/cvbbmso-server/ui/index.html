@@ -47,9 +47,9 @@
         </section>
         <section class="card">
           <h2>管理报名名单</h2>
-          <p>输入 Accoding 用户 ID，以空格、逗号或换行分隔，每次最多 1,000 个。</p>
+          <p>粘贴教务名单中的学号，以空格、逗号或换行分隔，每次最多 1,000 个。考生用校园 Accoding 账号登录后即可看到已报名的考试。</p>
           <form id="import-form">
-            <label>用户 ID<textarea name="ids" rows="4" maxlength="24000" required placeholder="12345&#10;12346"></textarea></label>
+            <label>学号<textarea name="student_numbers" rows="4" maxlength="24000" required placeholder="00001234&#10;00001235"></textarea></label>
             <button>添加到名单</button>
           </form>
           <ul id="enrollments" class="enrollments"></ul>
@@ -58,7 +58,7 @@
       <section id="students" class="card" hidden>
         <div class="section-heading"><h2>考生状态</h2><span id="poll-status" class="muted">每 5 秒刷新</span></div>
         <div class="table-scroll"><table>
-          <thead><tr><th>用户 ID</th><th>报名</th><th>连接</th><th>执行阶段</th><th>最近心跳</th><th>查看</th></tr></thead>
+          <thead><tr><th>学号 / 用户 ID</th><th>报名</th><th>连接</th><th>执行阶段</th><th>最近心跳</th><th>查看</th></tr></thead>
           <tbody id="student-rows"></tbody>
         </table></div>
       </section>

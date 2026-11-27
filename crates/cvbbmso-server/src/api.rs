@@ -152,7 +152,7 @@ async fn exams(
     let user = state.authenticate(&headers).await?;
     let items = state
         .exam
-        .list_for(user.id)
+        .list_for_verified(&user)
         .await
         .map_err(|error| HttpError::domain(&error))?;
     Ok(Json(ExamListResponse { user, items }))
@@ -172,7 +172,7 @@ async fn upgrade(
     let user = state.authenticate(&headers).await?;
     state
         .exam
-        .check_enrollment(exam_id, user.id)
+        .check_verified_enrollment(exam_id, &user)
         .await
         .map_err(|error| HttpError::domain(&error))?;
     let key = StudentKey {
@@ -188,7 +188,8 @@ async fn upgrade(
             failure_span.in_scope(|| tracing::warn!("WebSocket upgrade failed"));
         })
         .on_upgrade(move |ws| {
-            socket::run(ws, state.hub, key, request_id, state.timeout).instrument(request_span)
+            socket::run(ws, state.hub, key, user.username, request_id, state.timeout)
+                .instrument(request_span)
         }))
 }
 
