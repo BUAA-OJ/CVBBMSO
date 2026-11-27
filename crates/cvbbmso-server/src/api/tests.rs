@@ -301,7 +301,10 @@ fn capture_logs() {
     // logs emitted on the thread of the current-thread Tokio test.
     SUBSCRIBER.call_once(|| {
         tracing::subscriber::set_global_default(
-            tracing_subscriber::fmt().with_writer(|| LogWriter).finish(),
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(|| LogWriter)
+                .finish(),
         )
         .unwrap();
     });
