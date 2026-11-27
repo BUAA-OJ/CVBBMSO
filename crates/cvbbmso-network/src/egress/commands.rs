@@ -88,7 +88,7 @@ pub(crate) struct SystemCommands<'a> {
 }
 
 const COMMAND_TIMEOUT_SECONDS: u32 = 5;
-const REAP_TIMEOUT: Duration = Duration::from_secs(1);
+pub(super) const REAP_TIMEOUT: Duration = Duration::from_secs(1);
 const CHECK_INTERVAL: Duration = Duration::from_millis(15);
 
 impl<'a> SystemCommands<'a> {
@@ -293,7 +293,7 @@ fn observe_exit(pid: u32) -> std::io::Result<Option<()>> {
     }
 }
 
-fn poll_until<T>(
+pub(super) fn poll_until<T>(
     timeout: Duration,
     mut observe: impl FnMut() -> std::io::Result<Option<T>>,
 ) -> std::io::Result<Option<T>> {

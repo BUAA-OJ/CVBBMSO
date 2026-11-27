@@ -17,6 +17,7 @@ use tokio::net::UnixStream;
 use tokio::process::Child;
 
 use crate::NetworkError;
+use crate::egress::commands::{REAP_TIMEOUT, poll_until};
 use crate::egress::state;
 
 use super::HELPER;
@@ -149,7 +150,34 @@ pub(super) async fn spawn(uid: libc::uid_t) -> Result<(Child, Process), NetworkE
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|_| NetworkError::MacosServiceUnavailable)?;
-    let mut output = child.stdout.take().ok_or(NetworkError::Platform)?;
+    let identity = read_launch_identity(&mut child).await?;
+    Ok((child, identity))
+}
+
+struct PendingLaunch<'a>(Option<&'a mut Child>);
+
+impl Drop for PendingLaunch<'_> {
+    fn drop(&mut self) {
+        let Some(child) = self.0.take() else {
+            return;
+        };
+        if let Some(group) = child.id().and_then(|id| libc::pid_t::try_from(id).ok()) {
+            // SAFETY: process_group(0) made this unreaped child the leader of
+            // its own process group. Signal it while the PID is still reserved.
+            if unsafe { libc::killpg(group, libc::SIGKILL) } != 0 {
+                let _ = child.start_kill();
+            }
+        }
+        // Reap promptly even when the runtime is about to exit. If the child
+        // is stuck in the kernel, Tokio can still reap it as an orphan later.
+        let _ = poll_until(REAP_TIMEOUT, || child.try_wait());
+    }
+}
+
+async fn read_launch_identity(child: &mut Child) -> Result<Process, NetworkError> {
+    let output = child.stdout.take();
+    let mut pending = PendingLaunch(Some(child));
+    let mut output = output.ok_or(NetworkError::Platform)?;
     let identity = Process {
         pid: output
             .read_i32()
@@ -167,7 +195,10 @@ pub(super) async fn spawn(uid: libc::uid_t) -> Result<(Child, Process), NetworkE
     if identity.pid <= 1 || identity.started == 0 {
         return Err(NetworkError::MacosServiceUnavailable);
     }
-    Ok((child, identity))
+    // The protected launch command reports only after dropping privileges.
+    // The GUI process may now be waiting for recording permission.
+    pending.0 = None;
+    Ok(identity)
 }
 
 pub(super) fn exec_app(expected_uid: libc::uid_t) -> Result<(), NetworkError> {
@@ -184,16 +215,8 @@ pub(super) fn exec_app(expected_uid: libc::uid_t) -> Result<(), NetworkError> {
     }
     let gid = account.pw_gid;
     let base_group = i32::try_from(gid).map_err(|_| NetworkError::PermissionDenied)?;
-    let mut output = std::io::stdout().lock();
     let pid = i32::try_from(std::process::id()).map_err(|_| NetworkError::Platform)?;
     let identity = Process::inspect(pid)?;
-    output
-        .write_all(&identity.pid.to_be_bytes())
-        .and_then(|()| output.write_all(&identity.started.to_be_bytes()))
-        .and_then(|()| output.write_all(&identity.micros.to_be_bytes()))
-        .and_then(|()| output.flush())
-        .map_err(|_| NetworkError::Io)?;
-    drop(output);
     // SAFETY: the account name is NUL-terminated and comes from the system
     // account database. Drop supplementary groups and root before exec.
     if unsafe { libc::initgroups(account.pw_name, base_group) } != 0
@@ -204,6 +227,14 @@ pub(super) fn exec_app(expected_uid: libc::uid_t) -> Result<(), NetworkError> {
     {
         return Err(NetworkError::PermissionDenied);
     }
+    let mut output = std::io::stdout().lock();
+    output
+        .write_all(&identity.pid.to_be_bytes())
+        .and_then(|()| output.write_all(&identity.started.to_be_bytes()))
+        .and_then(|()| output.write_all(&identity.micros.to_be_bytes()))
+        .and_then(|()| output.flush())
+        .map_err(|_| NetworkError::Io)?;
+    drop(output);
     let error = Command::new(APP)
         .env_clear()
         .current_dir("/")
@@ -217,6 +248,9 @@ pub(super) fn exec_app(expected_uid: libc::uid_t) -> Result<(), NetworkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::time::timeout;
 
     #[tokio::test]
     async fn the_connecting_uid_and_pid_do_not_make_an_unrelated_executable_the_trial_app() {
@@ -225,5 +259,48 @@ mod tests {
         let pid = i32::try_from(std::process::id()).unwrap();
         let process = Process::inspect(pid).unwrap();
         assert!(!process.matches_peer(&socket, uid));
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_identity_terminates_the_group_and_reaps_the_launcher() {
+        // SAFETY: geteuid has no preconditions. The shell and its child are
+        // stand-ins and must run only under an ordinary user.
+        assert_ne!(unsafe { libc::geteuid() }, 0);
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "/bin/sleep 30 & printf 'started\\n' >&2; wait"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = libc::pid_t::try_from(child.id().unwrap()).unwrap();
+        let mut stderr = BufReader::new(child.stderr.take().unwrap());
+        let mut marker = String::new();
+        tokio::select! {
+            biased;
+            report = read_launch_identity(&mut child) => panic!("unexpected report: {report:?}"),
+            ready = timeout(Duration::from_secs(5), stderr.read_line(&mut marker)) => {
+                ready.unwrap().unwrap();
+            }
+        }
+        assert_eq!(marker, "started\n");
+        // SAFETY: test owns the spawned PID. No status output is needed.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        // The background stand-in also inherited stderr. EOF confirms it
+        // was stopped with the launcher, rather than left running.
+        assert_eq!(
+            timeout(Duration::from_secs(5), stderr.read_line(&mut marker))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
     }
 }

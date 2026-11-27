@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Instant, interval_at, timeout};
+use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
 use super::{
     EgressGuard, EgressPolicy,
@@ -31,6 +31,11 @@ const LOCK: &str = "/Library/Application Support/com.cvbbmso-trial/session.lock"
 const STARTUP: Duration = Duration::from_secs(120);
 const ADMISSION: Duration = Duration::from_secs(45);
 const OPERATION: Duration = Duration::from_secs(60);
+const REPLY_WRITE: Duration = Duration::from_secs(2);
+// A request can arrive just after a health check starts. Allow time for
+// that check, the requested operation, and the reply.
+const ROUND_TRIP: Duration =
+    Duration::from_secs(2 * OPERATION.as_secs() + REPLY_WRITE.as_secs() + 3);
 const HEALTH: Duration = Duration::from_secs(15);
 const VERIFY: u8 = b'V';
 const SHUTDOWN: u8 = b'S';
@@ -44,6 +49,7 @@ pub struct MacosTrialGuard(mpsc::Sender<Request>);
 
 struct Request {
     operation: u8,
+    deadline: Instant,
     result: oneshot::Sender<Result<(), NetworkError>>,
 }
 
@@ -102,20 +108,34 @@ impl MacosTrialGuard {
 
     async fn request(&self, operation: u8) -> Result<(), NetworkError> {
         let (result, reply) = oneshot::channel();
-        bounded(OPERATION + Duration::from_secs(5), async {
+        let deadline = Instant::now() + ROUND_TRIP;
+        timeout_at(deadline, async {
             self.0
-                .send(Request { operation, result })
+                .send(Request {
+                    operation,
+                    deadline,
+                    result,
+                })
                 .await
                 .map_err(|_| unavailable())?;
             reply.await.map_err(|_| unavailable())?
         })
         .await
+        .map_err(|_| unavailable())?
     }
 }
 
 async fn client_worker(mut socket: UnixStream, mut requests: mpsc::Receiver<Request>) {
-    while let Some(Request { operation, result }) = requests.recv().await {
-        let answer = bounded(OPERATION + Duration::from_secs(2), async {
+    while let Some(Request {
+        operation,
+        deadline,
+        result,
+    }) = requests.recv().await
+    {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let answer = timeout_at(deadline, async {
             socket
                 .write_u8(operation)
                 .await
@@ -126,7 +146,8 @@ async fn client_worker(mut socket: UnixStream, mut requests: mpsc::Receiver<Requ
                 _ => Err(unavailable()),
             }
         })
-        .await;
+        .await
+        .unwrap_or_else(|_| Err(unavailable()));
         let finished = operation == SHUTDOWN || answer.is_err();
         let _ = result.send(answer);
         if finished {
@@ -281,7 +302,7 @@ async fn serve(
     uid: libc::uid_t,
     message: &[u8],
 ) -> Result<Option<UnixStream>, NetworkError> {
-    let mut socket = bounded(ADMISSION, async {
+    let socket = bounded(ADMISSION, async {
         let (mut child, launched) = console::spawn(uid).await?;
         let mut socket = tokio::select! {
             result = accept_peer(listener, |peer| {
@@ -294,25 +315,37 @@ async fn serve(
     })
     .await?;
     println!("PF verified. The trial App is connected.");
-    let mut checks = interval_at(Instant::now() + HEALTH, HEALTH);
+    serve_session(socket, async || {
+        verify_console(uid)?;
+        guard.verify().await
+    })
+    .await
+}
+
+async fn serve_session(
+    mut socket: UnixStream,
+    verify: impl AsyncFn() -> Result<(), NetworkError>,
+) -> Result<Option<UnixStream>, NetworkError> {
     loop {
+        // Schedule a new check after the previous operation completes. A
+        // slow check never leaves overdue ticks to process ahead of the App.
+        let next_check = Instant::now() + HEALTH;
         tokio::select! {
+            biased;
             command = socket.read_u8() => match command {
                 Ok(VERIFY) => {
-                    verify_console(uid)?;
-                    if let Err(error) = bounded(OPERATION, guard.verify()).await {
-                        let _ = socket.write_u8(ERROR).await;
-                        return Err(error);
-                    }
-                    socket.write_u8(OK).await.map_err(|_| unavailable())?;
+                    let verified = bounded(OPERATION, verify()).await;
+                    let status = if verified.is_ok() { OK } else { ERROR };
+                    let reply = timeout(REPLY_WRITE, socket.write_u8(status)).await;
+                    verified?;
+                    reply.map_err(|_| unavailable())?.map_err(|_| unavailable())?;
                 }
                 Ok(SHUTDOWN) => return Ok(Some(socket)),
                 Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(None),
                 _ => return Err(unavailable()),
             },
-            _ = checks.tick() => {
-                verify_console(uid)?;
-                bounded(OPERATION, guard.verify()).await?;
+            () = sleep_until(next_check) => {
+                bounded(OPERATION, verify()).await?;
             }
         }
     }
@@ -332,7 +365,7 @@ async fn finish(
     let result = bounded(OPERATION, cleanup).await;
     if let Ok(Some(socket)) = outcome.as_mut() {
         let status = if result.is_ok() { OK } else { ERROR };
-        let _ = timeout(Duration::from_secs(2), socket.write_u8(status)).await;
+        let _ = timeout(REPLY_WRITE, socket.write_u8(status)).await;
     }
     result?;
     outcome.map(drop)
@@ -415,6 +448,9 @@ pub(crate) fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use tokio::sync::Notify;
+    use tokio::time::sleep;
 
     #[tokio::test]
     async fn helper_credentials_are_read_from_the_socket() {
@@ -479,6 +515,53 @@ mod tests {
                 client.read_u8().await.unwrap(),
                 if cleanup.is_ok() { OK } else { ERROR }
             );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_health_check_leaves_time_for_verify_and_shutdown_acknowledgements() {
+        let slow = OPERATION - Duration::from_secs(1);
+        for operation in [VERIFY, SHUTDOWN] {
+            let (client, root) = UnixStream::pair().unwrap();
+            let (sender, requests) = mpsc::channel(1);
+            tokio::spawn(client_worker(client, requests));
+            let guard = MacosTrialGuard(sender);
+            let checking = Notify::new();
+            let checks = Cell::new(0);
+            let cleaned = Cell::new(false);
+            let helper = async {
+                let outcome = serve_session(root, async || {
+                    checks.set(checks.get() + 1);
+                    checking.notify_one();
+                    sleep(slow).await;
+                    Ok(())
+                })
+                .await;
+                finish(outcome, async {
+                    if operation == SHUTDOWN {
+                        sleep(slow).await;
+                    }
+                    cleaned.set(true);
+                    Ok(())
+                })
+                .await
+            };
+            let app = async {
+                checking.notified().await;
+                let requested = Instant::now();
+                if operation == VERIFY {
+                    assert_eq!(guard.verify().await, Ok(()));
+                } else {
+                    assert_eq!(guard.shutdown().await, Ok(()));
+                    assert!(cleaned.get());
+                }
+                assert!(requested.elapsed() >= slow * 2);
+                assert!(requested.elapsed() < ROUND_TRIP);
+            };
+            let (outcome, ()) = tokio::join!(helper, app);
+            assert_eq!(outcome, Ok(()));
+            assert!(cleaned.get());
+            assert_eq!(checks.get(), if operation == VERIFY { 2 } else { 1 });
         }
     }
 }
