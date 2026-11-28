@@ -2,7 +2,7 @@ name: macOS DMG candidate
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, feat/client]
     paths:
       - '.github/workflows/macos-dmg.yml'
       - 'Cargo.toml'
