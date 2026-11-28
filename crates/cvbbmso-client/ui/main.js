@@ -62,6 +62,7 @@ const admissionErrors = new Map([
   ["macos_unsupported", "CVBBMSO 需要 macOS 14 或更新版本，请联系考试管理员。"],
   ["macos_untrusted_installation", "请将监考方提供的 CVBBMSO.app 拖入「应用程序」，再从那里打开。"],
   ["macos_service_unavailable", "未能连接考试网络守卫。请退出客户端，再从「应用程序」打开 CVBBMSO。"],
+  ["macos_network_restart_required", "网络预检未通过。请检查网络连接和代理设置，退出客户端后从「应用程序」重新打开 CVBBMSO。"],
   ["macos_authorization_required", "需要管理员授权才能部署考试网络守卫。"],
   ["macos_authorization_cancelled", "管理员授权已取消，可以重试。"],
   ["macos_authorization_failed", "无法部署或启动考试网络守卫，请重试或联系监考管理员。"],
@@ -86,7 +87,7 @@ const runtimeNetworkErrors = new Map([
 ]);
 const restartRequired = new Set([
   "elevation_required", "monitor_unconfigured", "guard_lost", "screen_restart_required",
-  "macos_unsupported", "macos_untrusted_installation", "macos_service_unavailable",
+  "macos_unsupported", "macos_untrusted_installation", "macos_service_unavailable", "macos_network_restart_required",
 ]);
 const authorizationReasons = new Set([
   "macos_authorization_required", "macos_authorization_cancelled", "macos_authorization_failed",
@@ -117,7 +118,8 @@ async function refreshAdmission(retry = false) {
     admissionAuthorize.hidden = !needsAuthorization;
     admissionRetry.hidden = result.status !== "blocked" || needsAuthorization || restartRequired.has(result.reason);
     const cleanupFailed = result.status === "cleanup_failed";
-    admissionExit.hidden = !cleanupFailed;
+    admissionExit.hidden = !cleanupFailed
+      && !(result.status === "blocked" && result.reason === "macos_network_restart_required");
     if (cleanupFailed) {
       preflight.hidden = true;
       studentControls.hidden = false;

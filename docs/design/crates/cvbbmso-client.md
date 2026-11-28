@@ -69,7 +69,7 @@ impl AppState {
 
 ## 启动预检、出站守卫与屏幕权限
 
-启动时先在 Rust 中执行虚拟机预检。其余准入步骤只在 `NotDetected` 后运行。两端都调用 `cvbbmso-network::Inspector::check` 检查系统代理和监考地址。代理状态须为 `clear`，监考状态须为 `reachable`。检查失败时，界面给出原因并等待重试。
+启动时先在 Rust 中执行虚拟机预检。其余准入步骤只在 `NotDetected` 后运行。两端都调用 `cvbbmso-network::Inspector::check` 检查系统代理和监考地址。代理状态须为 `clear`，监考状态须为 `reachable`。Windows 和 macOS 引导窗口可在网络预检失败后原地重试。macOS 受保护副本若在连接守卫前遇到可重试的网络预检错误，返回 `blocked / macos_network_restart_required`。控制窗提示检查网络并从「应用程序」重开，`admission_status` 的 `retry` 在此状态下无效。
 
 - **macOS** 从「应用程序」打开的 App 通过设备、代理和监考 HTTPS 检查后，自动请求一次系统管理员授权。引导状态为 `blocked / macos_authorization_required`，在途状态为 `authorizing`。取消或失败后返回 `blocked`，原因为 `macos_authorization_cancelled` 或 `macos_authorization_failed`，控制窗提供手动重试。授权过程安装或更新受保护的 App，helper 启用并核验 PF，随后以当前控制台用户启动受保护的 App。引导窗口收到可信启动结果后退出。受保护的 App 通过 `EgressGuard::install` 连接已验证的守卫，然后检查录屏权限。等待录屏授权期间继续校验守卫，考试入口保持关闭。录屏授权要求重启时，退出客户端后从「应用程序」重开。详见 [macOS 部署](../../deployment/macos-client.md)。
 - **Windows** 进程先检查管理员权限，再做网络预检并调用 `EgressGuard::install`。Windows 视为具备录屏权限。

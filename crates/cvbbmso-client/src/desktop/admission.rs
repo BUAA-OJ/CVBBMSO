@@ -42,6 +42,8 @@ pub(super) enum Failure {
     #[cfg(target_os = "macos")]
     MacosServiceUnavailable,
     #[cfg(target_os = "macos")]
+    MacosNetworkRestartRequired,
+    #[cfg(target_os = "macos")]
     MacosAuthorizationRequired,
     #[cfg(target_os = "macos")]
     MacosAuthorizationCancelled,
@@ -77,11 +79,21 @@ impl Failure {
             Self::ScreenRestartRequired
             | Self::MacosUnsupported
             | Self::MacosServiceUnavailable
+            | Self::MacosNetworkRestartRequired
             | Self::MacosAuthorizationRequired
             | Self::MacosAuthorizationCancelled
             | Self::MacosAuthorizationFailed
             | Self::MacosUntrustedInstallation => false,
             _ => true,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn before_guard(self, installed: bool) -> Self {
+        if installed && self.retryable() {
+            Self::MacosNetworkRestartRequired
+        } else {
+            self
         }
     }
 
@@ -98,6 +110,10 @@ impl Failure {
             #[cfg(target_os = "macos")]
             Self::MacosServiceUnavailable => {
                 "未能连接考试网络守卫。请退出客户端，再从「应用程序」打开 CVBBMSO。"
+            }
+            #[cfg(target_os = "macos")]
+            Self::MacosNetworkRestartRequired => {
+                "网络预检未通过。请检查网络连接和代理设置，退出客户端后从「应用程序」重新打开 CVBBMSO。"
             }
             #[cfg(target_os = "macos")]
             Self::MacosAuthorizationRequired => "需要管理员授权才能部署考试网络守卫。",
@@ -145,6 +161,21 @@ pub(super) enum Status {
     Restricted(Failure),
     Exiting,
     CleanupFailed(CleanupReport),
+}
+
+impl Status {
+    fn can_start(self, retry: bool) -> bool {
+        self == Self::Pending
+            || (retry && matches!(self, Self::Blocked(reason) if reason.retryable()))
+    }
+
+    fn require_ready(self) -> Result<(), &'static str> {
+        match self {
+            Self::Ready => Ok(()),
+            Self::Blocked(reason) | Self::Restricted(reason) => Err(reason.message()),
+            _ => Err("考试环境检查尚未完成。"),
+        }
+    }
 }
 
 pub(super) const CLEANUP_DIAGNOSTIC: &str = "egress-cleanup.json";
@@ -237,10 +268,7 @@ impl Admission {
         if !app.state::<Preflight>().is_admitted() {
             return;
         }
-        self.set(app, Status::Checking, |status| {
-            status == Status::Pending
-                || (retry && matches!(status, Status::Blocked(reason) if reason.retryable()))
-        });
+        self.set(app, Status::Checking, |status| status.can_start(retry));
     }
 
     pub(super) fn is_ready(&self) -> bool {
@@ -248,11 +276,7 @@ impl Admission {
     }
 
     pub(super) fn require_ready(&self) -> Result<(), &'static str> {
-        match self.status() {
-            Status::Ready => Ok(()),
-            Status::Blocked(reason) | Status::Restricted(reason) => Err(reason.message()),
-            _ => Err("考试环境检查尚未完成。"),
-        }
+        self.status().require_ready()
     }
 
     pub(super) fn subscribe(&self) -> watch::Receiver<Status> {
@@ -621,20 +645,28 @@ async fn prepare(app: AppHandle) -> Result<Prepared, Failure> {
         return Err(Failure::MacosUntrustedInstallation);
     }
     let desktop = app.state::<Desktop>();
-    let monitor = desktop.monitor.as_ref().map_err(|error| match error {
-        crate::monitor::MonitorError::Configuration => Failure::MonitorUnconfigured,
-        _ => Failure::InspectionFailed,
-    })?;
-    let server_origin = monitor.server_base().clone();
-    let report = Inspector::new(server_origin.clone())
-        .check()
-        .await
-        .map_err(|_| Failure::InspectionFailed)?;
-    check_proxy(report.proxy)?;
-    check_tunnel().await?;
-    if report.endpoint != EndpointState::Reachable {
-        return Err(Failure::MonitorUnreachable);
+    let network = async {
+        let monitor = desktop.monitor.as_ref().map_err(|error| match error {
+            crate::monitor::MonitorError::Configuration => Failure::MonitorUnconfigured,
+            _ => Failure::InspectionFailed,
+        })?;
+        let server_origin = monitor.server_base().clone();
+        let report = Inspector::new(server_origin.clone())
+            .check()
+            .await
+            .map_err(|_| Failure::InspectionFailed)?;
+        check_proxy(report.proxy)?;
+        check_tunnel().await?;
+        if report.endpoint != EndpointState::Reachable {
+            return Err(Failure::MonitorUnreachable);
+        }
+        Ok(server_origin)
     }
+    .await;
+    #[cfg(target_os = "macos")]
+    // The helper is already waiting for this App and may expire before another check.
+    let network = network.map_err(|error| error.before_guard(installed));
+    let server_origin = network?;
     let policy = EgressPolicy {
         accoding_origin: desktop
             .login

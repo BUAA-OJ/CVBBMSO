@@ -90,7 +90,7 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET=14.0 cargo check --locked \
             -p cvbbmso-client -p cvbbmso-network \
             --bin cvbbmso-client --bin cvbbmso-pf
-          cargo test --locked -p cvbbmso-client --test macos_authorization
+          cargo test --locked -p cvbbmso-client --bin cvbbmso-client --test macos_authorization
 
   desktop-smoke:
     name: Desktop Release smoke (${{ matrix.os }})

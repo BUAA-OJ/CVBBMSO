@@ -7,6 +7,45 @@ use cvbbmso_network::NetworkError;
 use tokio::sync::Notify;
 
 use super::Failure;
+#[cfg(target_os = "macos")]
+use super::Status;
+
+#[cfg(target_os = "macos")]
+pub(in crate::desktop) fn check_startup_network_recovery() {
+    for failure in [
+        Failure::InspectionFailed,
+        Failure::ProxyConfigured,
+        Failure::ProxyUnknown,
+        Failure::TunnelConfigured,
+        Failure::TunnelUnknown,
+        Failure::MonitorUnreachable,
+    ] {
+        let bootstrap = Status::Blocked(failure.before_guard(false));
+        assert_eq!(bootstrap, Status::Blocked(failure));
+        assert!(!bootstrap.can_start(false));
+        assert!(bootstrap.can_start(true));
+        assert!(bootstrap.require_ready().is_err());
+
+        let installed = Status::Blocked(failure.before_guard(true));
+        assert_eq!(
+            installed,
+            Status::Blocked(Failure::MacosNetworkRestartRequired)
+        );
+        assert!(!installed.can_start(false));
+        assert!(!installed.can_start(true));
+        assert!(
+            installed
+                .require_ready()
+                .unwrap_err()
+                .contains("从「应用程序」重新打开")
+        );
+    }
+    assert_eq!(
+        Failure::MonitorUnconfigured.before_guard(true),
+        Failure::MonitorUnconfigured
+    );
+    println!("macOS startup network recovery checks passed.");
+}
 
 #[derive(Clone, Default)]
 pub(in crate::desktop) struct Admission(Arc<Counters>);

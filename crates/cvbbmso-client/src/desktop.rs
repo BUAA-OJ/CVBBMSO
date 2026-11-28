@@ -76,6 +76,8 @@ impl Desktop {
 pub fn run() -> tauri::Result<()> {
     #[cfg(test)]
     {
+        #[cfg(target_os = "macos")]
+        admission::fixture::check_startup_network_recovery();
         match std::env::args().nth(1).as_deref() {
             Some("--native-smoke") => return smoke::run(smoke::Case::Desktop, None),
             Some("--native-smoke-detected") => return smoke::run(smoke::Case::Detected, None),
