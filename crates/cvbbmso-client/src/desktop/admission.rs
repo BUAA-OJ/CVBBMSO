@@ -6,13 +6,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(windows)]
-use cvbbmso_network::EgressGuard as SystemGuard;
-#[cfg(all(target_os = "macos", not(feature = "macos-pf-trial")))]
-use cvbbmso_network::MacosEgressGuard as SystemGuard;
-#[cfg(all(target_os = "macos", feature = "macos-pf-trial"))]
-use cvbbmso_network::MacosTrialGuard as SystemGuard;
-use cvbbmso_network::{EgressPolicy, EndpointState, Inspector, NetworkError, ProxyState};
+use cvbbmso_network::{
+    EgressGuard, EgressPolicy, EndpointState, Inspector, NetworkError, ProxyState,
+};
 use serde::Serialize;
 #[cfg(target_os = "macos")]
 use tauri::WebviewWindow;
@@ -40,17 +36,17 @@ pub(super) enum Failure {
     #[cfg(windows)]
     ElevationRequired,
     #[cfg(target_os = "macos")]
-    MacosLoginRequired,
-    #[cfg(target_os = "macos")]
     MacosUnsupported,
     #[cfg(target_os = "macos")]
     MacosUntrustedInstallation,
-    #[cfg(all(target_os = "macos", feature = "macos-pf-trial"))]
-    MacosTrialLauncherRequired,
-    #[cfg(target_os = "macos")]
-    MacosApprovalRequired,
     #[cfg(target_os = "macos")]
     MacosServiceUnavailable,
+    #[cfg(target_os = "macos")]
+    MacosAuthorizationRequired,
+    #[cfg(target_os = "macos")]
+    MacosAuthorizationCancelled,
+    #[cfg(target_os = "macos")]
+    MacosAuthorizationFailed,
     #[cfg(target_os = "macos")]
     MacosUnsupportedPfConfiguration,
     #[cfg(target_os = "macos")]
@@ -79,11 +75,12 @@ impl Failure {
             Self::ElevationRequired => false,
             #[cfg(target_os = "macos")]
             Self::ScreenRestartRequired
-            | Self::MacosLoginRequired
             | Self::MacosUnsupported
+            | Self::MacosServiceUnavailable
+            | Self::MacosAuthorizationRequired
+            | Self::MacosAuthorizationCancelled
+            | Self::MacosAuthorizationFailed
             | Self::MacosUntrustedInstallation => false,
-            #[cfg(all(target_os = "macos", feature = "macos-pf-trial"))]
-            Self::MacosTrialLauncherRequired => false,
             _ => true,
         }
     }
@@ -93,23 +90,23 @@ impl Failure {
             #[cfg(windows)]
             Self::ElevationRequired => "请以管理员身份启动客户端。",
             #[cfg(target_os = "macos")]
-            Self::MacosLoginRequired => "请以当前登录用户在 Finder 的「应用程序」中打开 CVBBMSO。",
-            #[cfg(target_os = "macos")]
-            Self::MacosUnsupported => "当前 macOS 版本不支持考试后台服务，请联系考试管理员。",
+            Self::MacosUnsupported => "CVBBMSO 需要 macOS 14 或更新版本，请联系考试管理员。",
             #[cfg(target_os = "macos")]
             Self::MacosUntrustedInstallation => {
-                "请使用监考方提供的安装包，将 CVBBMSO.app 从磁盘映像拖到「应用程序」，再双击打开。"
-            }
-            #[cfg(all(target_os = "macos", feature = "macos-pf-trial"))]
-            Self::MacosTrialLauncherRequired => {
-                "未能确认试用版网络守卫。请退出客户端，再从管理员提供的启动脚本打开试用版。"
+                "请将监考方提供的 CVBBMSO.app 拖入「应用程序」，再从那里打开。"
             }
             #[cfg(target_os = "macos")]
-            Self::MacosApprovalRequired => {
-                "请在系统设置的「登录项与扩展」中允许 CVBBMSO 后台服务，然后返回客户端。"
+            Self::MacosServiceUnavailable => {
+                "未能连接考试网络守卫。请退出客户端，再从「应用程序」打开 CVBBMSO。"
             }
             #[cfg(target_os = "macos")]
-            Self::MacosServiceUnavailable => "考试后台服务尚未就绪，请重试。",
+            Self::MacosAuthorizationRequired => "需要管理员授权才能部署考试网络守卫。",
+            #[cfg(target_os = "macos")]
+            Self::MacosAuthorizationCancelled => "管理员授权已取消，可以重试。",
+            #[cfg(target_os = "macos")]
+            Self::MacosAuthorizationFailed => {
+                "无法部署或启动考试网络守卫，请重试或联系监考管理员。"
+            }
             #[cfg(target_os = "macos")]
             Self::MacosUnsupportedPfConfiguration => {
                 "当前 PF 配置无法启用考试网络限制，请联系考试管理员后重试。"
@@ -129,7 +126,9 @@ impl Failure {
             #[cfg(target_os = "macos")]
             Self::ScreenPermission => "请在系统设置中允许客户端录制屏幕，再重试。",
             #[cfg(target_os = "macos")]
-            Self::ScreenRestartRequired => "屏幕录制权限已设置，请重新启动客户端。",
+            Self::ScreenRestartRequired => {
+                "屏幕录制权限已设置。请退出客户端，再从「应用程序」重新打开 CVBBMSO。"
+            }
         }
     }
 }
@@ -139,6 +138,8 @@ impl Failure {
 pub(super) enum Status {
     Pending,
     Checking,
+    #[cfg(target_os = "macos")]
+    Authorizing,
     Ready,
     Blocked(Failure),
     Restricted(Failure),
@@ -175,8 +176,6 @@ impl CleanupError {
             Self::Guard(NetworkError::MacosUnsupported) => "macos_unsupported",
             #[cfg(target_os = "macos")]
             Self::Guard(NetworkError::MacosUntrustedInstallation) => "macos_untrusted_installation",
-            #[cfg(target_os = "macos")]
-            Self::Guard(NetworkError::MacosApprovalRequired) => "macos_approval_required",
             #[cfg(target_os = "macos")]
             Self::Guard(NetworkError::MacosServiceUnavailable) => "macos_service_unavailable",
             #[cfg(target_os = "macos")]
@@ -244,13 +243,6 @@ impl Admission {
         });
     }
 
-    #[cfg(target_os = "macos")]
-    pub(super) fn recheck_approval(&self, app: &AppHandle) {
-        self.set(app, Status::Checking, |status| {
-            status == Status::Blocked(Failure::MacosApprovalRequired)
-        });
-    }
-
     pub(super) fn is_ready(&self) -> bool {
         self.status() == Status::Ready
     }
@@ -269,6 +261,16 @@ impl Admission {
 
     pub(super) fn begin_exit(&self, app: &AppHandle) {
         self.set(app, Status::Exiting, |status| status != Status::Exiting);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn is_authorizing(&self) -> bool {
+        self.status() == Status::Authorizing
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn request_exit(&self, app: &AppHandle) -> bool {
+        self.set(app, Status::Exiting, |status| status != Status::Authorizing)
     }
 
     pub(super) async fn shutdown(&self) -> Result<(), CleanupError> {
@@ -292,7 +294,7 @@ impl Admission {
         *self.state.borrow()
     }
 
-    fn set(&self, app: &AppHandle, next: Status, allows: impl FnOnce(Status) -> bool) {
+    fn set(&self, app: &AppHandle, next: Status, allows: impl FnOnce(Status) -> bool) -> bool {
         let changed = self.state.send_if_modified(|status| {
             if !allows(*status) {
                 return false;
@@ -303,6 +305,7 @@ impl Admission {
         if changed {
             let _ = app.emit_to(EventTarget::webview(UI), STATUS_EVENT, next);
         }
+        changed
     }
 }
 
@@ -321,47 +324,54 @@ pub(super) fn admission_status(app: AppHandle, retry: bool) -> Status {
 
 #[cfg(target_os = "macos")]
 #[tauri::command]
-pub(super) async fn open_helper_approval_settings(
-    window: WebviewWindow,
-) -> Result<(), &'static str> {
-    const UNAVAILABLE: &str = "当前无需批准考试后台服务。";
-    const OPEN_FAILED: &str = "无法打开系统设置。请手动打开「登录项与扩展」。";
+pub(super) async fn authorize_macos_egress(window: WebviewWindow) -> Result<(), &'static str> {
     if window.label() != UI {
-        return Err(UNAVAILABLE);
+        return Err("authorization_unavailable");
     }
     let app = window.app_handle();
-    if app.state::<Admission>().status() != Status::Blocked(Failure::MacosApprovalRequired) {
-        return Err(UNAVAILABLE);
+    let admission = app.state::<Admission>();
+    if !app.state::<Preflight>().is_admitted()
+        || !admission.set(app, Status::Authorizing, |status| {
+            matches!(
+                status,
+                Status::Blocked(
+                    Failure::MacosAuthorizationRequired
+                        | Failure::MacosAuthorizationCancelled
+                        | Failure::MacosAuthorizationFailed
+                )
+            )
+        })
+    {
+        return Err("authorization_unavailable");
     }
 
-    let (reply, result) = oneshot::channel();
-    let current = app.clone();
-    app.run_on_main_thread(move || {
-        let opened = if current.state::<Admission>().status()
-            == Status::Blocked(Failure::MacosApprovalRequired)
-        {
-            #[cfg(test)]
-            if let Some(fake) = current.try_state::<fixture::Admission>() {
-                fake.open_approval_settings();
-                let _ = reply.send(Ok(()));
-                return;
-            }
-            #[cfg(not(feature = "macos-pf-trial"))]
-            let opened = SystemGuard::open_approval_settings().map_err(|_| OPEN_FAILED);
-            #[cfg(feature = "macos-pf-trial")]
-            let opened = Err(UNAVAILABLE);
-            opened
-        } else {
-            Err(UNAVAILABLE)
-        };
-        let _ = reply.send(opened);
-    })
-    .map_err(|_| OPEN_FAILED)?;
-    result.await.map_err(|_| OPEN_FAILED)?
+    // The replacement App provides its own admission; a successful handoff
+    // never admits the process that opened the authorization prompt.
+    match platform::authorization::launch().await {
+        Ok(()) => {
+            admission.begin_exit(app);
+            app.exit(0);
+        }
+        Err(error) => {
+            let failure = match error {
+                platform::authorization::AuthorizationError::Cancelled => {
+                    Failure::MacosAuthorizationCancelled
+                }
+                platform::authorization::AuthorizationError::Bundle => {
+                    Failure::MacosUntrustedInstallation
+                }
+                _ => Failure::MacosAuthorizationFailed,
+            };
+            admission.set(app, Status::Blocked(failure), |status| {
+                status == Status::Authorizing
+            });
+        }
+    }
+    Ok(())
 }
 
 enum Guard {
-    System(SystemGuard),
+    System(EgressGuard),
     #[cfg(test)]
     Fixture(fixture::Guard),
 }
@@ -454,11 +464,15 @@ enum Prepared {
 enum Work {
     Preflight(JoinHandle<Result<Prepared, Failure>>),
     Install(JoinHandle<Result<Guard, Failure>>),
+    #[cfg(target_os = "macos")]
+    Screen(JoinHandle<Result<(), Failure>>),
 }
 
 enum Completed {
     Preflight(Result<Prepared, Failure>),
     Install(Result<Guard, Failure>),
+    #[cfg(target_os = "macos")]
+    Screen(Result<(), Failure>),
 }
 
 async fn completed(work: Option<&mut Work>) -> Completed {
@@ -468,6 +482,10 @@ async fn completed(work: Option<&mut Work>) -> Completed {
         }
         Some(Work::Install(work)) => {
             Completed::Install(work.await.unwrap_or(Err(Failure::InspectionFailed)))
+        }
+        #[cfg(target_os = "macos")]
+        Some(Work::Screen(work)) => {
+            Completed::Screen(work.await.unwrap_or(Err(Failure::InspectionFailed)))
         }
         None => pending().await,
     }
@@ -496,6 +514,13 @@ async fn run(
         if checking && work.is_none() && guard.is_none() {
             work = Some(Work::Preflight(tokio::spawn(prepare(app.clone()))));
         }
+        #[cfg(target_os = "macos")]
+        if checking && work.is_none() && guard.is_some() && network_monitor.is_none() {
+            let app = app.clone();
+            work = Some(Work::Screen(tokio::spawn(async move {
+                check_screen(&app).await
+            })));
+        }
         tokio::select! {
             biased;
             reply = stop.recv() => {
@@ -511,6 +536,8 @@ async fn run(
                         }
                     }
                     Some(Work::Preflight(task)) => task.abort(),
+                    #[cfg(target_os = "macos")]
+                    Some(Work::Screen(task)) => task.abort(),
                     None => {}
                 }
                 let result = match guard {
@@ -546,11 +573,27 @@ async fn run(
                     }
                     Completed::Install(Ok(installed)) => {
                         verify_at = Some(Instant::now() + installed.interval());
-                        network_monitor = Some(installed.start_network_monitor(app.clone()));
+                        #[cfg(windows)]
+                        {
+                            network_monitor = Some(installed.start_network_monitor(app.clone()));
+                        }
                         guard = Some(installed);
                     }
                     Completed::Preflight(Err(error)) | Completed::Install(Err(error)) => {
                         admission.set(&app, Status::Blocked(error), |status| status == Status::Checking);
+                    }
+                    #[cfg(target_os = "macos")]
+                    Completed::Screen(result) => {
+                        if admission.status() == Status::Checking {
+                            match result {
+                                Ok(()) => {
+                                    network_monitor = guard.as_ref().map(|guard| guard.start_network_monitor(app.clone()));
+                                }
+                                Err(error) => {
+                                    admission.set(&app, Status::Blocked(error), |status| status == Status::Checking);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -565,8 +608,6 @@ async fn prepare(app: AppHandle) -> Result<Prepared, Failure> {
     #[cfg(test)]
     if let Some(fake) = app.try_state::<fixture::Admission>() {
         fake.check_network()?;
-        #[cfg(target_os = "macos")]
-        fake.screen()?;
         return Ok(Prepared::Fixture(fake.inner().clone()));
     }
     #[cfg(windows)]
@@ -574,18 +615,10 @@ async fn prepare(app: AppHandle) -> Result<Prepared, Failure> {
         return Err(Failure::ElevationRequired);
     }
     #[cfg(target_os = "macos")]
-    {
-        if platform::is_root() {
-            return Err(Failure::MacosLoginRequired);
-        }
-        #[cfg(feature = "macos-pf-trial")]
-        if !platform::is_in_trial_bundle() {
-            return Err(Failure::MacosTrialLauncherRequired);
-        }
-        #[cfg(not(feature = "macos-pf-trial"))]
-        if !platform::is_in_applications() {
-            return Err(Failure::MacosUntrustedInstallation);
-        }
+    let installed = platform::is_in_installed_bundle();
+    #[cfg(target_os = "macos")]
+    if !installed && !platform::is_in_applications() {
+        return Err(Failure::MacosUntrustedInstallation);
     }
     let desktop = app.state::<Desktop>();
     let monitor = desktop.monitor.as_ref().map_err(|error| match error {
@@ -612,7 +645,9 @@ async fn prepare(app: AppHandle) -> Result<Prepared, Failure> {
         server_origin,
     };
     #[cfg(target_os = "macos")]
-    check_screen(&app).await?;
+    if !installed {
+        return Err(Failure::MacosAuthorizationRequired);
+    }
     Ok(Prepared::System(policy))
 }
 
@@ -639,13 +674,10 @@ async fn install(app: AppHandle, prepared: Prepared) -> Result<Guard, Failure> {
         return Err(Failure::GuardInstallFailed);
     }
     match prepared {
-        Prepared::System(policy) => {
-            #[cfg(all(target_os = "macos", feature = "macos-pf-trial"))]
-            let result = SystemGuard::connect(policy).await;
-            #[cfg(not(all(target_os = "macos", feature = "macos-pf-trial")))]
-            let result = SystemGuard::install(policy).await;
-            result.map(Guard::System).map_err(install_failure)
-        }
+        Prepared::System(policy) => EgressGuard::install(policy)
+            .await
+            .map(Guard::System)
+            .map_err(install_failure),
         #[cfg(test)]
         Prepared::Fixture(fake) => {
             #[cfg(target_os = "macos")]
@@ -662,19 +694,9 @@ fn install_failure(_: NetworkError) -> Failure {
 
 #[cfg(target_os = "macos")]
 fn install_failure(error: NetworkError) -> Failure {
-    #[cfg(feature = "macos-pf-trial")]
-    if !matches!(
-        error,
-        NetworkError::MacosUnsupported
-            | NetworkError::MacosUnsupportedPfConfiguration
-            | NetworkError::MacosBusy
-    ) {
-        return Failure::MacosTrialLauncherRequired;
-    }
     match error {
         NetworkError::MacosUnsupported => Failure::MacosUnsupported,
         NetworkError::MacosUntrustedInstallation => Failure::MacosUntrustedInstallation,
-        NetworkError::MacosApprovalRequired => Failure::MacosApprovalRequired,
         NetworkError::MacosServiceUnavailable => Failure::MacosServiceUnavailable,
         NetworkError::MacosUnsupportedPfConfiguration => Failure::MacosUnsupportedPfConfiguration,
         NetworkError::MacosBusy => Failure::MacosBusy,
@@ -684,6 +706,10 @@ fn install_failure(error: NetworkError) -> Failure {
 
 #[cfg(target_os = "macos")]
 async fn check_screen(app: &AppHandle) -> Result<(), Failure> {
+    #[cfg(test)]
+    if let Some(fake) = app.try_state::<fixture::Admission>() {
+        return fake.screen();
+    }
     let (reply, result) = oneshot::channel();
     let current = app.clone();
     app.run_on_main_thread(move || {

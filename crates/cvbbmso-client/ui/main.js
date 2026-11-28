@@ -51,19 +51,20 @@ const studentControls = document.querySelector("#student-controls");
 const admissionPanel = document.querySelector("#admission-panel");
 const admissionStatus = document.querySelector("#admission-status");
 const admissionRetry = document.querySelector("#admission-retry");
-const admissionSettings = document.querySelector("#admission-settings");
+const admissionAuthorize = document.querySelector("#admission-authorize");
 const admissionExit = document.querySelector("#admission-exit");
 const admittedControls = document.querySelector("#admitted-controls");
 let admissionRevision = 0;
+let authorizationRequested = false;
 
 const admissionErrors = new Map([
   ["elevation_required", "请以管理员身份启动客户端。"],
-  ["macos_login_required", "请以当前登录用户在 Finder 的「应用程序」中打开 CVBBMSO。"],
-  ["macos_unsupported", "当前 macOS 版本不支持考试后台服务，请联系考试管理员。"],
-  ["macos_untrusted_installation", "请使用监考方提供的安装包，将 CVBBMSO.app 从磁盘映像拖到「应用程序」，再双击打开。"],
-  ["macos_trial_launcher_required", "未能确认试用版网络守卫。请退出客户端，再从管理员提供的启动脚本打开试用版。"],
-  ["macos_approval_required", "请在系统设置的「登录项与扩展」中允许 CVBBMSO 后台服务，然后返回客户端。"],
-  ["macos_service_unavailable", "考试后台服务尚未就绪，请重试。"],
+  ["macos_unsupported", "CVBBMSO 需要 macOS 14 或更新版本，请联系考试管理员。"],
+  ["macos_untrusted_installation", "请将监考方提供的 CVBBMSO.app 拖入「应用程序」，再从那里打开。"],
+  ["macos_service_unavailable", "未能连接考试网络守卫。请退出客户端，再从「应用程序」打开 CVBBMSO。"],
+  ["macos_authorization_required", "需要管理员授权才能部署考试网络守卫。"],
+  ["macos_authorization_cancelled", "管理员授权已取消，可以重试。"],
+  ["macos_authorization_failed", "无法部署或启动考试网络守卫，请重试或联系监考管理员。"],
   ["macos_unsupported_pf_configuration", "当前 PF 配置无法启用考试网络限制，请联系考试管理员后重试。"],
   ["macos_busy", "另一个客户端或守卫会话仍在运行，请关闭后重试。"],
   ["monitor_unconfigured", "未配置监考服务地址，请联系考试管理员。"],
@@ -77,7 +78,7 @@ const admissionErrors = new Map([
   ["guard_install_failed", "无法启用出站网络守卫，请联系考试管理员。"],
   ["guard_lost", "出站网络守卫校验失败，客户端将结束当前考试。请联系监考人员后重新启动客户端。"],
   ["screen_permission", "请在系统设置中允许客户端录制屏幕，再重试。"],
-  ["screen_restart_required", "屏幕录制权限已设置，请重新启动客户端。"],
+  ["screen_restart_required", "屏幕录制权限已设置。请退出客户端，再从「应用程序」重新打开 CVBBMSO。"],
 ]);
 const runtimeNetworkErrors = new Map([
   ["proxy_configured", "检测到系统代理，请关闭代理。"],
@@ -85,8 +86,24 @@ const runtimeNetworkErrors = new Map([
 ]);
 const restartRequired = new Set([
   "elevation_required", "monitor_unconfigured", "guard_lost", "screen_restart_required",
-  "macos_login_required", "macos_unsupported", "macos_untrusted_installation", "macos_trial_launcher_required",
+  "macos_unsupported", "macos_untrusted_installation", "macos_service_unavailable",
 ]);
+const authorizationReasons = new Set([
+  "macos_authorization_required", "macos_authorization_cancelled", "macos_authorization_failed",
+]);
+
+async function authorizeEgress() {
+  admissionAuthorize.disabled = true;
+  try {
+    await core.invoke("authorize_macos_egress");
+  } catch {
+    if (!admissionAuthorize.hidden) {
+      admissionStatus.textContent = "无法请求管理员授权，请重试。";
+    }
+  } finally {
+    admissionAuthorize.disabled = false;
+  }
+}
 
 async function refreshAdmission(retry = false) {
   const revision = ++admissionRevision;
@@ -96,8 +113,9 @@ async function refreshAdmission(retry = false) {
     const ready = result.status === "ready";
     admittedControls.hidden = !ready;
     admissionPanel.hidden = ready;
-    admissionRetry.hidden = result.status !== "blocked" || restartRequired.has(result.reason);
-    admissionSettings.hidden = result.status !== "blocked" || result.reason !== "macos_approval_required";
+    const needsAuthorization = result.status === "blocked" && authorizationReasons.has(result.reason);
+    admissionAuthorize.hidden = !needsAuthorization;
+    admissionRetry.hidden = result.status !== "blocked" || needsAuthorization || restartRequired.has(result.reason);
     const cleanupFailed = result.status === "cleanup_failed";
     admissionExit.hidden = !cleanupFailed;
     if (cleanupFailed) {
@@ -109,41 +127,37 @@ async function refreshAdmission(retry = false) {
       admissionStatus.textContent = `网络守卫清理失败（${result.reason.code}）。请联系监考人员。${diagnostic}`;
       return;
     }
-    admissionStatus.textContent = result.status === "exiting"
-      ? "正在关闭客户端…"
-      : admissionErrors.get(result.reason) ?? "正在检查考试环境…";
+    if (result.status === "exiting") {
+      admissionStatus.textContent = "正在关闭客户端…";
+    } else if (result.status === "authorizing") {
+      admissionStatus.textContent = "正在等待管理员授权并启动考试网络守卫。请完成或取消系统授权后再退出。";
+    } else {
+      admissionStatus.textContent = admissionErrors.get(result.reason) ?? "正在检查考试环境…";
+    }
     if (result.status === "restricted") {
       admissionStatus.textContent = (runtimeNetworkErrors.get(result.reason) ?? admissionStatus.textContent)
         + " 网络环境恢复后，将自动重新开放入场。进行中的考试仍会录像。";
+    }
+    if (result.reason === "macos_authorization_required" && !authorizationRequested) {
+      authorizationRequested = true;
+      void authorizeEgress();
     }
   } catch {
     if (revision !== admissionRevision) return;
     admissionPanel.hidden = false;
     admittedControls.hidden = true;
-    admissionSettings.hidden = true;
+    admissionAuthorize.hidden = true;
     admissionStatus.textContent = "无法读取考试环境检查结果。";
   }
 }
 
 admissionRetry.addEventListener("click", () => refreshAdmission(true));
+admissionAuthorize.addEventListener("click", authorizeEgress);
 admissionExit.addEventListener("click", () => {
   tauriWindow.getCurrentWindow().close().catch(() => {
     admissionStatus.append(" 请关闭客户端窗口以退出。");
   });
 });
-admissionSettings.addEventListener("click", async () => {
-  admissionSettings.disabled = true;
-  try {
-    await core.invoke("open_helper_approval_settings");
-  } catch (error) {
-    if (!admissionSettings.hidden && typeof error === "string") {
-      admissionStatus.textContent = error;
-    }
-  } finally {
-    admissionSettings.disabled = false;
-  }
-});
-
 async function checkDevice(retry) {
   vmRetry.hidden = true;
   vmDiagnostic.hidden = true;

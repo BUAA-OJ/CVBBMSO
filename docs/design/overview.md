@@ -93,7 +93,7 @@ cvbbmso/
 - **录像**：客户端接到开始命令后录制主显示器，音频关闭；每段元信息包含 `index`、`start_at`、`end_at`、`sha256`；合并结束后上报 `merged_sha256`。录像保留在客户端，服务端保存摘要。录屏故障由客户端上报 incident 并自行重试。
 - **异常**：每条异常以 `occurred_at` 记录发生时间。服务端记录 `connection_lost`、`connection_restored`、`process_restarted`；客户端上报录屏和导航异常作为独立证据记录。CLI 按时间排序关联。
 - **认证**：原生客户端使用 WebView Cookie Store 中的 Accoding Cookie 连接服务端；服务端向学生站 `/api/users/me` 复验，并以返回身份作为唯一登录凭据。
-- **网络隔离**：客户端启动并取得管理员/root 权限后安装系统级出站守卫，只放行 Accoding、监考服务器、回环、DNS、DHCP/NTP 和系统证书验证所需的流量；其他进程的出站连接被拒绝。守卫随应用退出或崩溃清理，安装或运行期校验失败时停止考试。
+- **网络隔离**：启动时由具备管理员权限的 Windows 客户端或 macOS 特权 helper 安装系统级出站守卫，只放行 Accoding、监考服务器、回环、DNS、DHCP/NTP 和系统证书验证所需的流量；其他进程的出站连接被拒绝。守卫随应用退出或崩溃清理，安装或运行期校验失败时停止考试。
 
 ## 部署边界
 
@@ -101,7 +101,7 @@ cvbbmso/
 - TLS 由反向代理终止；Rust 进程监听内网 HTTP/WS。对外地址为 `wss://<监考服务端>/api/exams/{exam_id}/ws`。
 - 客户端与服务端同版本部署；协议按同版本契约设计。
 - 本机 CLI（设计）与可选的 HTTP 控制面板均通过 `AdminService` 执行管理操作。面板须配置独立的管理令牌，生产环境须经 HTTPS 反向代理并限制在管理网络、VPN 或受信任代理之后，详见[服务端部署说明](crates/cvbbmso-server.md#管理控制面板)。
-- 系统出站守卫需要管理员或 root 权限。Windows 由 WFP 动态会话清理规则。macOS 使用特权看门狗和 launchd 恢复任务，租约为 15 分钟。
+- 系统出站守卫需要管理员或 root 权限。Windows 由 WFP 动态会话清理规则。macOS 通过 App 请求系统管理员授权，由特权 helper 安装 PF 并以普通用户启动客户端。看门狗和 launchd 恢复任务管理 15 分钟租约。
 
 ## 协作时序
 
@@ -117,6 +117,7 @@ sequenceDiagram
     UI->>Net: Inspector::check
     Net-->>UI: proxy clear / server reachable
     UI->>Net: EgressGuard::install(accoding, server)
+    Note over UI,Net: macOS 连接经系统授权启动的守卫
     Net-->>UI: guard active
     Student->>UI: 在 WebView 登录 Accoding
     UI->>Exam: Exam::connect(exam_id, cookies)

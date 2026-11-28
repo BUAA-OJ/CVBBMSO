@@ -6,9 +6,9 @@
 
 主窗口顶部在监考连接断开或录像失败时显示独立的高对比警示，滚动页面时保持可见。恢复连接或结束后更新并清除不再适用的连接警示；录像最终失败时保留警示。原始状态文字继续保留。
 
-客户端在 Windows 和 macOS 启动本地控制窗。Windows 使用安装后的程序，macOS 正式启动要求 macOS 14 或更新版本。先从 DMG 将已签名的 CVBBMSO.app 拖到「应用程序」，再以当前登录用户在 Finder 中双击打开。准入通过后，可以从控制窗打开独立的 Accoding 窗口。关闭控制窗或点击「退出客户端」时先显示退出确认，取消或按 Escape 后继续运行；入场后直至服务端确认本场结束回执，禁止主动关闭客户端或退出当前考试。点击「退出当前考试」会说明暂不能退出的原因。收尾期间显示结束和确认进度，收到最终 ACK 后明确显示「考试已结束」及录像结果，再允许离开当前考试。确定退出后清理网络守卫并关闭 Accoding 窗口。`inspect_session` 将 Cookie 是否可用定向通知本地 UI。加载报名列表时由监考服务复验 Accoding 身份。
+客户端在 Windows 和 macOS 启动本地控制窗。Windows 使用安装后的程序，macOS 14 或更新版本从 DMG 将 `CVBBMSO.app` 拖到「应用程序」，再从「应用程序」双击并完成系统管理员授权。稳态客户端以当前桌面用户运行。准入通过后，可以从控制窗打开独立的 Accoding 窗口。关闭控制窗或点击「退出客户端」时先显示退出确认，取消或按 Escape 后继续运行；入场后直至服务端确认本场结束回执，禁止主动关闭客户端或退出当前考试。点击「退出当前考试」会说明暂不能退出的原因。收尾期间显示结束和确认进度，收到最终 ACK 后明确显示「考试已结束」及录像结果，再允许离开当前考试。确定退出后清理网络守卫并关闭 Accoding 窗口。`inspect_session` 将 Cookie 是否可用定向通知本地 UI。加载报名列表时由监考服务复验 Accoding 身份。
 
-部署时可在编译环境中设置 `CVBBMSO_SERVER_ORIGIN`，例如 `https://monitor.example.org`。该值须为 HTTPS Origin，可含端口。显式配置无效地址（含空字符串）会导致启动失败。未设置该变量时，控制窗可照常启动，加载报名列表会提示未配置监考服务地址。远程页面和前端命令均无法设置请求目的地。应用数据根目录通过 Tauri 的 `app_local_data_dir()` 取得。Windows 的 Accoding WebView 用该目录下的 `accoding/` 保存浏览器配置，macOS 使用系统管理的应用 WebKit 数据存储。
+部署时可在编译环境中设置 `CVBBMSO_SERVER_ORIGIN`，例如 `https://monitor.example.org`。该值须为 HTTPS Origin，可含端口。显式配置无效地址（含空字符串）会导致启动失败。macOS 打包时必须设置该变量。未设置时，开发构建的控制窗会报告监考地址缺失并阻止准入。远程页面和前端命令均无法设置请求目的地。应用数据根目录通过 Tauri 的 `app_local_data_dir()` 取得。Windows 的 Accoding WebView 用该目录下的 `accoding/` 保存浏览器配置，macOS 使用系统管理的应用 WebKit 数据存储。
 
 关闭 Accoding 窗口会暂时隐藏它。再次点击「打开 Accoding」会恢复原页面和会话。退出应用后的 Cookie 保留遵循站点设置的有效期和 WebView 的存储规则。
 
@@ -29,7 +29,7 @@
 | `vm_preflight` | `{ retry: bool }` | `{ status, reason }` | 读取设备检查结果。仅在上次结果为 `unknown` 时响应重试 |
 | `admission_status` | `{ retry: bool }` | `{ status, reason? }` | 读取正式准入状态，或重试可恢复的失败。仅本地控制窗可调用 |
 | `admission-status` 事件 | 无 | `{ status, reason? }` | 定向通知本地控制窗正式准入状态变化 |
-| `open_helper_approval_settings` | 无 | `()` | macOS 等待后台服务批准时，由本地控制窗点击操作后打开系统设置 |
+| `authorize_macos_egress` | 无 | `()` | macOS 引导窗口发起一次系统管理员授权。同一进程只允许一个在途请求。取消或失败由 `admission-status` 报告。窗口或状态不符合要求时返回 `authorization_unavailable` |
 | `list_exams` | 无 | `ExamSummary[]` | 使用当前 Cookie 调用 `GET /api/exams` |
 | `open_exam` | `{ exam_id: uuid }` | `{ "connected": true }` | 调用 `Exam::connect`；等待初始 `sync` 后返回。网络、出站守卫和权限预检已在启动时完成 |
 | `get_exam_status` | 无 | `ClientView` 或 `null` | 读取当前考试状态快照 |
@@ -71,16 +71,14 @@ impl AppState {
 
 启动时先在 Rust 中执行虚拟机预检。其余准入步骤只在 `NotDetected` 后运行。两端都调用 `cvbbmso-network::Inspector::check` 检查系统代理和监考地址。代理状态须为 `clear`，监考状态须为 `reachable`。检查失败时，界面给出原因并等待重试。
 
-- **macOS** 正式应用以当前登录用户运行。从磁盘映像或其他位置运行时，控制窗提示将应用复制到「应用程序」后重新打开。网络预检通过后，Rust 在主线程检查屏幕录制权限，按需请求系统授权。还未授权或需要重启时，客户端停在控制窗。之后才调用 `MacosEgressGuard::install`，守卫先核对安装来源和签名，再通过系统服务流程注册、等待批准以及启用 PF。等待批准时可打开「登录项与扩展」。返回控制窗会重新检查，拒绝后也可手动重试。PF 无法启用所需规则时保留阻断，管理员修复后可以重试。
-
-管理员试用版通过编译特性 `macos-pf-trial` 选择 `MacosTrialGuard::connect`。试用 App 从固定受保护目录启动，以当前桌面用户运行。客户端仍完成虚拟机、代理、监考 HTTPS 和录屏检查，只有通过守卫会话校验后才开放受限功能。定期复查、守卫失效中止和退出清理沿用同一流程。安装和恢复见 [macOS PF 试用包](../../deployment/macos-pf-trial.md)。
+- **macOS** 从「应用程序」打开的 App 通过设备、代理和监考 HTTPS 检查后，自动请求一次系统管理员授权。引导状态为 `blocked / macos_authorization_required`，在途状态为 `authorizing`。取消或失败后返回 `blocked`，原因为 `macos_authorization_cancelled` 或 `macos_authorization_failed`，控制窗提供手动重试。授权过程安装或更新受保护的 App，helper 启用并核验 PF，随后以当前控制台用户启动受保护的 App。引导窗口收到可信启动结果后退出。受保护的 App 通过 `EgressGuard::install` 连接已验证的守卫，然后检查录屏权限。等待录屏授权期间继续校验守卫，考试入口保持关闭。录屏授权要求重启时，退出客户端后从「应用程序」重开。详见 [macOS 部署](../../deployment/macos-client.md)。
 - **Windows** 进程先检查管理员权限，再做网络预检并调用 `EgressGuard::install`。Windows 视为具备录屏权限。
 
-刚启动、等待批准与安装期间，Rust 拒绝打开 Accoding、读取会话、请求报名列表和进入考试。守卫返回已验证的句柄后，`admission_status` 才返回 `ready` 并开放这些操作。虚拟机预检通过后，若监考地址缺失，`list_exams` 仍返回 `monitor_unconfigured`。
+设备检查、管理员授权、守卫安装和连接期间，Rust 拒绝打开 Accoding、读取会话、请求报名列表和进入考试。守卫返回已验证的句柄后，`admission_status` 才返回 `ready` 并开放这些操作。虚拟机预检通过后，若监考地址缺失，`list_exams` 仍返回 `monitor_unconfigured`。
 
 应用每 30 秒校验网络守卫。安装守卫后，独立任务检查系统代理与 TUN 或 VPN 默认路由，每次检查完成后间隔 3 秒。检测到冲突、无法读取配置或检查超过 3 秒时，准入状态变为 `restricted`，暂停新入场并显示原因。超时的系统调用返回后才开始下一次检查，新检查通过后自动恢复准入。期间现有考试保留会话和录像，守卫校验和退出清理照常进行。守卫校验失败时，Rust 阻止新入场并结束活动考试，界面提示联系监考人员后重新启动客户端。关闭一场考试时守卫继续运行。退出客户端会先结束并封存考试，再等待已开始的守卫安装并清理其状态。守卫清理失败时，控制窗仍可关闭，并显示错误类别。准入状态为 `cleanup_failed`，其 `reason` 携带 `code` 和 `diagnostic_saved`。客户端尝试在应用数据目录写入最近一次失败的 `egress-cleanup.json`，只记录操作、时间、平台和错误类别。macOS 的目录为 `~/Library/Application Support/edu.buaa.accoding.cvbbmso/`，Windows 为 `%LOCALAPPDATA%\edu.buaa.accoding.cvbbmso\`。
 
-Release 桌面冒烟使用替身检查权限顺序、并发重试、macOS 等待批准和 PF 阻断，以及运行期守卫失效。`--native-admission-exit` 覆盖安装尚未返回时退出。`--native-admission-cleanup-failure` 覆盖重复关闭、诊断和确认退出。签名 DMG、系统服务授权、真实 PF 与 WFP 在隔离环境中验收。
+Release 桌面冒烟使用替身检查权限顺序、并发重试、macOS 录屏权限和 PF 阻断，以及运行期守卫失效。`--native-admission-exit` 覆盖安装尚未返回时退出。`--native-admission-cleanup-failure` 覆盖重复关闭、诊断和确认退出。DMG 启动、系统管理员授权、真实 PF 与 WFP 在隔离环境中验收。
 
 ### 虚拟机预检
 
@@ -107,7 +105,7 @@ Windows 基于 WebView2 配置 `AreDevToolsEnabled=false`、`AreBrowserAccelerat
 
 客户端在首次入场时将 `device_id` 持久化到应用数据根目录，后续入场读取同一标识。`instance_id` 在进程启动时生成，同一进程内的重连和重新入场都沿用它。准入通过后，Rust 读取原生 Cookie 并调用 `Exam::connect(config, exam_id, cookies)`，由运行时重新获取 `user` 并校验报名，再连接 `GET /api/exams/{exam_id}/ws`。
 
-活动考试期间，Rust 间隔两秒读取原生 Cookie Store，通过 `UiNotice::CookiesUpdated` 提交有效的变化。读取失败或暂时没有会话时保留上次结果，自动采样只在 Cookie 变化时触发复验。监考服务短时无法复验时，学生可点击「检查会话」，用浏览器里的当前 Cookie 重试。运行时核对考生身份，采用同一考生的新 Cookie 后恢复连接。控制窗根据 `ClientView` 提示重连，在 `ACCODING_AUTH_EXPIRED` 时提供重新登录入口。最终录像保存在应用数据目录内的 `exams/<考试 ID>/<Accoding 用户 ID>/recording/final.mp4`，试用版的应用标识为 `edu.buaa.accoding.cvbbmso.trial`。学生点击后，控制窗在受控 Accoding 窗口打开登录页。
+活动考试期间，Rust 间隔两秒读取原生 Cookie Store，通过 `UiNotice::CookiesUpdated` 提交有效的变化。读取失败或暂时没有会话时保留上次结果，自动采样只在 Cookie 变化时触发复验。监考服务短时无法复验时，学生可点击「检查会话」，用浏览器里的当前 Cookie 重试。运行时核对考生身份，采用同一考生的新 Cookie 后恢复连接。控制窗根据 `ClientView` 提示重连，在 `ACCODING_AUTH_EXPIRED` 时提供重新登录入口。学生点击后，控制窗在受控 Accoding 窗口打开登录页。最终录像保存在应用数据目录内的 `exams/<考试 ID>/<Accoding 用户 ID>/recording/final.mp4`。
 
 受控窗口拒绝跨源导航或弹窗时，向活动运行时非阻塞地提交 `UiNotice::NavigationDenied`。通知只携带可解析的目标 Origin。关闭或结束考试会丢弃该场考试待提交的浏览器通知，后续考试使用自己的通知队列。
 

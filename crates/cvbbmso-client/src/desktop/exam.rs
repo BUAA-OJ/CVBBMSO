@@ -197,6 +197,10 @@ pub(super) fn handle_exit(app: &AppHandle, event: &RunEvent) {
         match exit {
             Exit::Running => {
                 api.prevent_exit();
+                #[cfg(target_os = "macos")]
+                if !app.state::<Admission>().request_exit(app) {
+                    return;
+                }
                 sessions
                     .exit
                     .send_replace(Exit::Requested(code.unwrap_or(0)));

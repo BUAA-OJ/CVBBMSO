@@ -259,11 +259,11 @@ async fn check_admission_retry(ui: &WebviewWindow, admission: &FakeAdmission) ->
     ui.eval("document.querySelector('#admission-retry').click()")?;
     #[cfg(target_os = "macos")]
     {
-        wait_for(ui, "!document.querySelector('#admission-retry').hidden && document.querySelector('#admission-status').textContent.includes('录制屏幕')", "screen permission denial").await?;
+        wait_for(ui, "!document.querySelector('#admission-retry').hidden && document.querySelector('#admission-status').textContent.includes('PF 配置')", "PF configuration denial").await?;
         assert_eq!(admission.installs(), 0);
         check_environment_gate(ui).await?;
+        admission.enable_pf();
         ui.eval("document.querySelector('#admission-retry').click()")?;
-        check_helper_approval(ui, admission).await?;
     }
     timeout(DEADLINE, admission.install_started()).await?;
     ui.eval(r"
@@ -282,6 +282,13 @@ async fn check_admission_retry(ui: &WebviewWindow, admission: &FakeAdmission) ->
     assert_eq!(admission.installs(), 1);
     admission.resume();
 
+    #[cfg(target_os = "macos")]
+    {
+        wait_for(ui, "!document.querySelector('#admission-retry').hidden && document.querySelector('#admission-status').textContent.includes('录制屏幕')", "screen permission denial with an attached guard").await?;
+        check_environment_gate(ui).await?;
+        ui.eval("document.querySelector('#admission-retry').click()")?;
+    }
+
     wait_for(
         ui,
         "!document.querySelector('#admitted-controls').hidden",
@@ -291,44 +298,6 @@ async fn check_admission_retry(ui: &WebviewWindow, admission: &FakeAdmission) ->
     assert_eq!(admission.installs(), 1);
     assert_eq!(admission.shutdowns(), 0);
     println!("Startup checks preceded installation; concurrent retries installed one guard.");
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-async fn check_helper_approval(ui: &WebviewWindow, fake: &FakeAdmission) -> Result<(), Error> {
-    wait_for(
-        ui,
-        "!document.querySelector('#admission-settings').hidden && document.querySelector('#admission-status').textContent.includes('登录项与扩展')",
-        "the native helper approval prompt",
-    )
-    .await?;
-    check_environment_gate(ui).await?;
-    assert_eq!(fake.installs(), 0);
-    assert_eq!(fake.settings_opens(), 0);
-
-    ui.eval("document.querySelector('#admission-settings').click()")?;
-    timeout(DEADLINE, fake.settings_opened()).await?;
-    assert_eq!(fake.settings_opens(), 1);
-    check_environment_gate(ui).await?;
-    assert_eq!(fake.installs(), 0);
-
-    fake.grant_approval();
-    let app = ui.app_handle();
-    app.state::<admission::Admission>().recheck_approval(app);
-    wait_for(
-        ui,
-        "document.querySelector('#admission-settings').hidden && !document.querySelector('#admission-retry').hidden && document.querySelector('#admission-status').textContent.includes('PF 配置')",
-        "PF configuration blocking the approved helper",
-    )
-    .await?;
-    check_environment_gate(ui).await?;
-    assert_eq!(fake.installs(), 0);
-
-    fake.enable_pf();
-    ui.eval("document.querySelector('#admission-retry').click()")?;
-    println!(
-        "A pending approval and unavailable PF both blocked admission; only the local settings action opened settings."
-    );
     Ok(())
 }
 
@@ -1113,7 +1082,7 @@ async fn check_ipc(ui: &WebviewWindow, oj: &WebviewWindow) -> Result<(), Error> 
             const results = await Promise.allSettled([
                 invoke("vm_preflight", { retry: true }),
                 invoke("admission_status", { retry: true }),
-                invoke("open_helper_approval_settings"),
+                invoke("authorize_macos_egress"),
                 invoke("inspect_session"),
                 invoke("list_exams"),
                 invoke("open_exam", { exam_id: "00000000-0000-0000-0000-000000000010" }),

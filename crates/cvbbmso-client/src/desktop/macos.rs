@@ -7,36 +7,37 @@ use objc2_web_kit::WKWebView;
 use tauri::WebviewWindow;
 use url::Url;
 
+#[path = "macos/authorization.rs"]
+pub(super) mod authorization;
 #[path = "macos/cookie_scope.rs"]
 mod cookie_scope;
 
 use super::admission::Failure;
 use cookie_scope::matches_cookie;
 
+#[cfg(not(test))]
 pub(super) fn is_root() -> bool {
     // SAFETY: geteuid has no arguments or memory preconditions.
     unsafe { libc::geteuid() == 0 }
 }
 
-#[cfg(not(feature = "macos-pf-trial"))]
-pub(super) fn is_in_applications() -> bool {
-    let Ok(applications) = Path::new("/Applications").canonicalize() else {
-        return false;
-    };
-    std::env::current_exe()
-        .and_then(|path| path.canonicalize())
-        .is_ok_and(|path| path.starts_with(applications))
+pub(super) fn is_in_installed_bundle() -> bool {
+    const INSTALLED: &str =
+        "/Library/Application Support/com.cvbbmso-client/CVBBMSO.app/Contents/MacOS/cvbbmso-client";
+    running_at(INSTALLED)
 }
 
-#[cfg(feature = "macos-pf-trial")]
-pub(super) fn is_in_trial_bundle() -> bool {
-    const INSTALLED: &str = "/Library/Application Support/com.cvbbmso-trial/CVBBMSO Trial.app/Contents/MacOS/cvbbmso-client";
-    let Ok(installed) = Path::new(INSTALLED).canonicalize() else {
+pub(super) fn is_in_applications() -> bool {
+    running_at("/Applications/CVBBMSO.app/Contents/MacOS/cvbbmso-client")
+}
+
+fn running_at(expected: &str) -> bool {
+    let Ok(expected) = Path::new(expected).canonicalize() else {
         return false;
     };
     std::env::current_exe()
         .and_then(|path| path.canonicalize())
-        .is_ok_and(|path| path == installed)
+        .is_ok_and(|path| path == expected)
 }
 
 pub(super) fn screen_permission() -> Result<(), Failure> {

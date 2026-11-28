@@ -18,13 +18,7 @@ struct Counters {
     #[cfg(target_os = "macos")]
     screen_once: AtomicBool,
     #[cfg(target_os = "macos")]
-    approval_required: AtomicBool,
-    #[cfg(target_os = "macos")]
     pf_blocked: AtomicBool,
-    #[cfg(target_os = "macos")]
-    settings_opens: AtomicUsize,
-    #[cfg(target_os = "macos")]
-    settings_opened: Notify,
     pause_install: AtomicBool,
     fail_verify: AtomicBool,
     fail_shutdown: AtomicBool,
@@ -50,7 +44,6 @@ impl Admission {
         #[cfg(target_os = "macos")]
         {
             self.0.screen_once.store(true, Ordering::Relaxed);
-            self.0.approval_required.store(true, Ordering::Relaxed);
             self.0.pf_blocked.store(true, Ordering::Relaxed);
         }
     }
@@ -111,36 +104,12 @@ impl Admission {
     }
 
     #[cfg(target_os = "macos")]
-    pub(in crate::desktop) fn grant_approval(&self) {
-        self.0.approval_required.store(false, Ordering::Relaxed);
-    }
-
-    #[cfg(target_os = "macos")]
     pub(in crate::desktop) fn enable_pf(&self) {
         self.0.pf_blocked.store(false, Ordering::Relaxed);
     }
 
     #[cfg(target_os = "macos")]
-    pub(in crate::desktop) fn settings_opens(&self) -> usize {
-        self.0.settings_opens.load(Ordering::Relaxed)
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(in crate::desktop) async fn settings_opened(&self) {
-        self.0.settings_opened.notified().await;
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(super) fn open_approval_settings(&self) {
-        self.0.settings_opens.fetch_add(1, Ordering::Relaxed);
-        self.0.settings_opened.notify_one();
-    }
-
-    #[cfg(target_os = "macos")]
     pub(super) fn check_helper(&self) -> Result<(), Failure> {
-        if self.0.approval_required.load(Ordering::Relaxed) {
-            return Err(Failure::MacosApprovalRequired);
-        }
         if self.0.pf_blocked.load(Ordering::Relaxed) {
             return Err(Failure::MacosUnsupportedPfConfiguration);
         }

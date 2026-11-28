@@ -10,7 +10,7 @@ CVBBMSO 是配合 [Accoding](https://accoding.buaa.edu.cn) 使用的程序设计
 客户端与服务端需保持同版本部署，构建安装包时通过发布配置注入监考服务的 HTTPS Origin。
 
 - **Windows x64（MSI）**：需以管理员权限安装与运行，详见 [Windows 客户端部署](docs/deployment/windows-client.md)。
-- **macOS 14 及以上（DMG）**：需将已签名的 `CVBBMSO.app` 拖入 `/Applications` 并批准后台特权服务，详见 [macOS 客户端部署](docs/deployment/macos-client.md)。
+- **macOS 14 及以上（DMG）**：把 `CVBBMSO.app` 从对应架构的 DMG 拖到「应用程序」，从「应用程序」双击打开并按系统提示授权。详见 [macOS 客户端部署](docs/deployment/macos-client.md)。
 
 ## 服务端运行与部署
 

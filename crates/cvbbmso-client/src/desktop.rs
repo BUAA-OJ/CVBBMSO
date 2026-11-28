@@ -118,11 +118,11 @@ pub fn run() -> tauri::Result<()> {
     }
     #[cfg(not(test))]
     {
-        #[cfg(all(target_os = "macos", feature = "macos-pf-trial"))]
+        #[cfg(target_os = "macos")]
         if platform::is_root() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "CVBBMSO Trial must run as the current console user",
+                "CVBBMSO must run as the current console user",
             )
             .into());
         }
@@ -153,7 +153,7 @@ fn builder() -> tauri::Builder<Wry> {
             vm_preflight,
             admission::admission_status,
             #[cfg(target_os = "macos")]
-            admission::open_helper_approval_settings,
+            admission::authorize_macos_egress,
             open_accoding,
             inspect_session,
             list_exams,
@@ -163,15 +163,18 @@ fn builder() -> tauri::Builder<Wry> {
             confirm_exit,
         ])
         .on_window_event(|window, event| {
-            #[cfg(target_os = "macos")]
-            if window.label() == UI && matches!(event, WindowEvent::Focused(true)) {
-                let app = window.app_handle();
-                app.state::<admission::Admission>().recheck_approval(app);
-            }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 match window.label() {
                     UI => {
                         api.prevent_close();
+                        #[cfg(target_os = "macos")]
+                        if window
+                            .app_handle()
+                            .state::<admission::Admission>()
+                            .is_authorizing()
+                        {
+                            return;
+                        }
                         let _ = window.app_handle().emit_to(
                             EventTarget::webview(UI),
                             "confirm-exit",
