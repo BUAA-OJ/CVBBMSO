@@ -1,6 +1,6 @@
 # cvbbmso-network — 客户端网络预检与系统出站守卫
 
-本 crate 提供 Windows/macOS 的启动网络预检，以及应用生命周期内的系统级出站网络守卫。预检检查系统代理和监考服务端可达性；出站守卫把系统网络限制为 Accoding、监考服务器和少量必要系统服务。平台相关 API 封装在 crate 内，其他模块使用统一 `NetworkReport` / `EgressGuard`。本 crate 由 `cvbbmso-client` 在应用启动时安装，并在运行期校验；错误展示和是否进入考试由 `cvbbmso-client` 负责。
+本 crate 提供 Windows/macOS 的启动网络预检和系统级出站守卫。预检检查系统代理和监考服务器可达性。守卫只放行 Accoding、监考服务器和必要的系统服务。客户端使用统一的 `NetworkReport` 和 `EgressGuard`，负责运行期校验、错误展示和考试准入。
 
 ## 公开 Rust API
 
@@ -48,8 +48,7 @@ impl Inspector {
 }
 
 impl EgressGuard {
-    /// 安装系统级出站过滤；需要管理员/root 权限。
-    /// 安装前清理上一次运行遗留的规则；任一步失败时回滚已应用的规则。
+    /// Windows 安装系统级出站过滤，macOS 附着管理员启动的守卫。
     pub async fn install(policy: EgressPolicy) -> Result<Self, NetworkError>;
 
     /// 校验当前过滤规则和允许 IP 集仍然生效。
@@ -62,7 +61,7 @@ impl EgressGuard {
 
 `Inspector::new` 接受监考服务器的 HTTP(S) Origin；检查器据此探测服务端可达性。`check` 返回 `Err(NetworkError)` 表示检查本身无法执行（平台 API 或 I/O 失败）；检查可以完成但代理配置无法确定时，返回 `ProxyState::Unknown`。
 
-`EgressGuard::install` 要求 `accoding_origin` 和 `server_origin` 是 `https` Origin，主机非空；否则返回 `Policy`。无法解析任一允许域名时返回 `Resolution`。缺少管理员/root 权限时返回 `PermissionDenied`。平台过滤 API 或清理任务失败时返回 `Platform` / `Io`。
+`EgressGuard::install` 要求两个 Origin 使用 HTTPS 且主机非空，否则返回 `Policy`。本地安装无法解析任一允许域名时返回 `Resolution`，缺少管理员权限时返回 `PermissionDenied`。macOS 无法连接或验证管理员会话时返回 `MacosServiceUnavailable`。平台过滤 API 或清理任务失败时可返回 `Platform` 或 `Io`。
 
 ## 状态语义
 
@@ -87,7 +86,7 @@ Windows 使用 WinINet、WinHTTP 与代理环境变量；macOS 使用 SystemConf
 
 ## 系统出站守卫
 
-`EgressGuard` 在 Accoding 登录前安装，保持到应用退出。调用该 API 的进程需要管理员或 root 权限。Windows 使用 WFP，macOS 使用 PF。规则按 IP 和端口匹配，域名在安装和刷新时解析为 IP 集。
+`EgressGuard` 在 Accoding 登录前建立，保持到应用退出。Windows 客户端以管理员身份安装 WFP。macOS 客户端以普通用户身份连接持有 PF 的 root helper。规则按 IP 和端口匹配，域名在安装和刷新时解析为 IP 集。
 
 ### 允许的出站流量
 
@@ -115,11 +114,11 @@ Windows 后台发现加密 DNS 和时间同步配置时，PowerShell 与 `w32tm.
 
 ### 生命周期与清理
 
-客户端每 30 秒调用 `verify`。过滤规则或允许 IP 集失效时，客户端负责停止考试并展示错误。安装需要管理员或 root 权限。安装失败时客户端停留在考试外。
+客户端每 30 秒调用 `verify`。过滤规则或允许 IP 集失效时，客户端负责停止考试并展示错误。修改系统过滤器需要管理员权限。Windows 由提权后的客户端安装，macOS 由 root helper 安装。守卫未通过校验时客户端停留在考试外。
 
 - **Windows** 使用动态 WFP 会话。IPv4 和 IPv6 的 ALE 连接层与出站传输层在同一事务安装和替换，校验检查两层所有过滤器的 ID。ALE 保留原有默认拒绝和回环规则。出站传输层只按远端 IP 和端口检查 TCP/UDP，覆盖被动打开的 TCP 握手回包、已存在的连接和 UDP 回包。名单内流量仍受宿主防火墙判定。IPv6 邻居发现继续由宿主处理，包括同链路全局地址和唯一本地地址的单播 NS/NA。出站传输层尚未覆盖 ICMP/ICMPv6 回包。正常退出关闭会话，进程崩溃后由 WFP 删除会话对象。[Microsoft WFP TCP 报文流转](https://learn.microsoft.com/en-us/windows/win32/fwp/tcp-packet-flows) · [RFC 4861](https://www.rfc-editor.org/rfc/rfc4861.html)
-- **macOS** 直连模式从 `/Library/PrivilegedHelperTools/com.cvbbmso.egress-watchdog` 启动看门狗。固定 helper 由 root 安装，普通用户无权修改 helper 及其父目录。正式 DMG 使用签名恢复副本。守卫先清理遗留状态并登记看门狗和 launchd 恢复任务。受管模式此时才可激活主过滤入口，随后加载专用 anchor、获取 PF 启用引用并核对内核规则。启动成功前按非回环本机地址撤销两个方向的旧 PF 状态。既有连接可能需要重连。
-- **macOS 清理** 使用跨进程锁协调正常退出、看门狗和 launchd。看门狗发现客户端退出后撤销 anchor、释放本次安装持有的 PF 引用并清理状态。平台命令的子进程保留同一把锁并有 5 秒期限，超时会终止进程。即使父进程退出，子进程仍有自己的截止信号。若内核里的命令尚未退出，恢复方等待锁并在有界等待失败后重试。恢复任务每分钟检查，负责在看门狗失效或 15 分钟租约到期后重试清理。客户端每 5 分钟续期。
+- **macOS** 包内的 root helper 先清理遗留状态并登记看门狗和 launchd 恢复任务，再激活主过滤入口、加载专用 anchor、获取 PF 启用引用并核对内核规则。启动成功前按非回环本机地址撤销两个方向的旧 PF 状态。既有连接可能需要重连。
+- **macOS 清理** 使用跨进程锁协调正常退出、看门狗和 launchd。helper 在 App 退出时撤销 anchor、释放本场 PF 引用并清理状态。平台命令的子进程保留同一把锁并有 5 秒期限，超时会终止进程。即使父进程退出，子进程仍有自己的截止信号。若内核里的命令尚未退出，恢复方等待锁并在有界等待失败后重试。看门狗监视 helper 的退出和租约。launchd 任务每分钟检查，在守卫进程退出或 15 分钟租约到期后重试清理。helper 至多每 5 分钟续期一次。
 
 macOS 在 PF 已清理但 launchd 任务状态未确认时保留受保护的 `egress-cleanup.pending`，记录需要卸载的任务。仍在运行的看门狗、下一次计划任务或新版安装只对该标识重试。CLI 超时本身无法撤销 launchd 已收到的请求。
 
@@ -127,28 +126,17 @@ PF 启用前保存引用快照。子进程必须先将 PID 和行末换行符完
 
 新版开始清理时原子移走 `pf.enable`，避免旧 helper 接手续跑新版已发出的释放操作。释放前记录 PID、进程名和创建时间，再次释放前核对这些记录。内核把同一数值令牌分给另一引用时，保留新引用。归属无法确认时保留故障记录。PF 的释放接口按令牌操作，无法原子核对其他字段。 [Apple XNU 的 PF 引用实现](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/pf_ioctl.c)
 
-新版 guard 在改动 PF 或登记任务前，以有界命令探测 helper 的 `--capabilities`。确认响应 `cvbbmso-egress-leases-v2` 后，每个租约分配新代次，使用唯一的 launchd 标识和一次写入的 plist 路径。持续运行和计划恢复都携带代次。任务在锁内核对当前所有者，过期任务只能清自己的任务文件和标识。旧接口 `--watch PID`、`--recover` 及旧租约状态仍可用。
-
-| guard | helper | 恢复行为 |
-| --- | --- | --- |
-| 旧版 | 旧版 | 使用固定任务标识，两端平台命令可能无界等待 |
-| 旧版 | 新版 | 使用固定任务标识，helper 有界，guard 仍可能无界等待 |
-| 新版 | 旧版 | 使用固定任务标识，guard 有界，helper 仍可能无界等待 |
-| 新版 | 新版 | 双方执行有界平台命令，按代次隔离迟到的 launchd 请求 |
-
-滚动升级时先停止旧租约并确认旧恢复完成，将新版 helper 原子安装到原路径。新版 helper 可先和旧 guard 配合。随后升级 guard 并检查能力探测。回退时先退出新版租约，核对没有待清理的新版任务，再回退 guard，最后按需回退 helper。部署脚本保留租约计数，并检查新版待清理记录、任务定义和已加载任务。固定标识的兼容组合仍可能受迟到请求影响。
+helper 在改动 PF 或登记任务前，以有界命令确认受保护的 helper 路径支持 `cvbbmso-egress-leases-v2`。新租约使用独立代次、唯一的 launchd 标识和一次写入的 plist。任务在锁内核对当前所有者，过期任务只能清自己的任务文件和标识。恢复仍读取旧租约、引用日志和待清理记录，并接受已有任务使用的 `--watch PID` 和 `--recover`。升级应先结束活动会话并完成恢复，保留旧恢复程序和记录，直到遗留清理完成。
 
 系统服务白名单按 IP、协议和端口匹配。平台未报告的加密 DNS 配置和部署证书链独有的 OCSP、CRL 或时间戳地址需要随部署验证。
 
 ### macOS 部署
 
-macOS 14 及以上的正式 DMG 提供 `MacosEgressGuard::install(policy).await`。普通用户会话完成前置检查后调用，运行特权操作的是应用内经过系统授权的 LaunchDaemon。两个 HTTPS 来源随签名版本固定，XPC 只接受固定操作。安装成功意味着守卫已校验内核规则。句柄的 `verify(&self).await` 和 `shutdown(self).await` 只对本连接的守卫生效。系统需要批准时返回 `NetworkError::MacosApprovalRequired`，客户端可在明确的用户操作后调用 `MacosEgressGuard::open_approval_settings()`，获批后重试。[macOS DMG 部署](../../deployment/macos-client.md)
+macOS 14 及以上支持 arm64 和 x86_64。DMG 内的引导 App 请求系统管理员授权，安装至 `/Library/Application Support/com.cvbbmso-client/CVBBMSO.app`，再调用包内的 `Contents/Helpers/cvbbmso-pf launch`。helper 以 root 管理 PF，并降权到当前控制台用户启动受保护的 App。授权调用在确认内核 PF 已安装且指定进程已执行该 App 后返回。该返回只用于引导窗交接，录屏权限仍由普通用户 App 处理。 [macOS DMG 部署](../../deployment/macos-client.md)
 
-Apple Silicon 的管理员试用构建提供 `MacosTrialGuard::connect(policy).await`。管理员通过已安装的受保护脚本启动 helper。helper 持有实际 PF 守卫，并以当前控制台用户身份启动受保护目录内的试用 App。Unix socket 使用内核凭据核对 helper 的 root 身份，以及 App 的 UID、启动进程和可执行文件。两端策略随构建固定，首次 live PF 校验通过后客户端才获得守卫句柄。未附着有 45 秒期限，已附着的 App 通过定期校验维持现有租约。非正常退出仍由看门狗和临时 launchd 任务恢复。 [管理员试用部署](../../../deploy/macos-egress/README.md#管理员启动的-pf-试用)
+macOS 客户端使用 `EgressGuard::install(policy).await` 附着会话。Unix socket 核验 helper 的 root 对端身份，以及 App 的当前控制台 UID、启动进程和可执行文件。构建时固定两个 HTTPS Origin。实际 PF 校验成功后客户端才能拿到守卫。安装后最多等待 45 秒完成启动和附着。已附着时 helper 定期校验并续期，断连后清理。进程异常退出时，由看门狗和临时 launchd 任务恢复。`status` 检查受保护安装和构建配置，`recover` 处理无活动会话时的遗留状态。
 
-以下固定 helper 与宿主预部署方式用于直接调用 `EgressGuard` 的现有部署，仍可用于预先激活宿主管理的 PF 入口。
-
-部署方须在 PF 主过滤规则的第一条配置并加载这个入口。anchor 由守卫独占，初始为空，规则由守卫在安装时加载。
+PF 主过滤规则的第一条使用下列入口。anchor 由守卫独占，启动前为空。
 
 ```pf
 anchor "com.cvbbmso.egress"
@@ -158,9 +146,7 @@ anchor "com.cvbbmso.egress"
 
 名单收窄时，守卫撤销本机地址与被撤销对端地址之间两个方向的 PF 状态，让后续报文重新经过规则。地址宽限期内继续使用现有名单。PF 按地址而非按端口删除状态，同一对端地址的其他端口也可能需要重连。当前变更保持 IPv6 邻居发现、路径 MTU 和其他非 TCP/UDP 入站处理。宿主为普通 ICMP/ICMPv6 查询建立的状态仍可能让相关回包跳过出站规则，该类回包尚未覆盖。
 
-内核中缺少入口、入口排位不符、入口带 `out` 或 `quick`、非回环接口跳过 PF，或检测到绕过过滤阶段的地址转换时，`install` 返回 `NetworkError::Platform`。更新时先退出守卫，保存宿主规则源，将旧的 `out` 或 `out quick` 项换成上述双向入口。旧的静态 `load anchor` 在确认属于本项目后移除。管理员先做语法检查，再按宿主流程加载与核对内核入口。守卫只管理专用 anchor 内容。回退时先完全退出新守卫，再从配置管理恢复旧入口及旧版本，并按宿主流程验证生效。
-
-固定部署片段和脚本、正式 DMG 的候选过滤段与内核快照均使用双向入口。受管启动在恢复锁内校验并按需原子替换签名副本，副本须匹配当前 daemon 的签名代码并返回 V2 能力。看门狗和 launchd 通过同一受保护路径运行，使用同一租约代次。正常与异常清理释放 PF 引用后恢复原过滤段。恢复失败时保留原租约和恢复记录，以便后续重试。只有旧的受管还原记录和严格匹配的旧版空闲快照同时存在时，才自动撤除旧的 `out` 入口。 [macOS DMG 部署](../../deployment/macos-client.md)
+守卫可用内核快照临时给受支持的宿主规则添加上述入口，也可使用管理员已设置的入口。入口位置错误、带 `out` 或 `quick`、非回环接口跳过 PF，或地址转换会绕过过滤阶段时，启动失败。看门狗和 launchd 使用同一受保护 helper 和租约代次。清理释放本场 PF 引用后恢复原过滤段。恢复失败时保留原租约和记录以供重试。旧的 `out` 入口只有在存在旧还原记录且内核严格匹配旧版空闲快照时才会自动撤除。
 
 macOS 方案面向系统协议栈产生的普通连接。PF 会丢弃未能重组的非回环出站分片，因为守卫无法读取这些分片的传输层端口。Darwin PF 的规则语法无法单独匹配部分保留值或协议与地址族不符的畸形报文。需要过滤管理员生成的原始报文或转发流量的部署场景，须由宿主策略处理。
 

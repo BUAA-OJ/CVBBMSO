@@ -11,10 +11,12 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixStream;
 use tokio::process::Child;
+use tokio::time::sleep;
 
 use crate::NetworkError;
 use crate::egress::commands::{REAP_TIMEOUT, poll_until};
@@ -22,7 +24,8 @@ use crate::egress::state;
 
 use super::HELPER;
 
-const APP: &str = "/Library/Application Support/com.cvbbmso-trial/CVBBMSO Trial.app/Contents/MacOS/cvbbmso-client";
+const APP: &str =
+    "/Library/Application Support/com.cvbbmso-client/CVBBMSO.app/Contents/MacOS/cvbbmso-client";
 
 pub(super) fn protected(path: &Path, directory: bool) -> Result<(), NetworkError> {
     for ancestor in path.ancestors().skip(1) {
@@ -121,12 +124,15 @@ impl Process {
     pub(super) fn matches_peer(&self, stream: &UnixStream, uid: libc::uid_t) -> bool {
         peer_uid(stream).ok() == Some(uid)
             && peer_pid(stream.as_raw_fd()).ok() == Some(self.pid)
-            && Self::inspect(self.pid).as_ref().ok() == Some(self)
-            && is_trial_app(self.pid)
+            && self.is_app()
+    }
+
+    fn is_app(&self) -> bool {
+        Self::inspect(self.pid).as_ref().ok() == Some(self) && is_app(self.pid)
     }
 }
 
-fn is_trial_app(pid: libc::pid_t) -> bool {
+fn is_app(pid: libc::pid_t) -> bool {
     let mut path = [0_u8; 4096];
     let Ok(length) = u32::try_from(path.len()) else {
         return false;
@@ -143,7 +149,7 @@ pub(super) async fn spawn(uid: libc::uid_t) -> Result<(Child, Process), NetworkE
     // drops credentials itself and reports the PID it will exec into.
     let uid = uid.to_string();
     let mut child = tokio::process::Command::new("/bin/launchctl")
-        .args(["asuser", &uid, HELPER, "--trial-launch-client", &uid])
+        .args(["asuser", &uid, HELPER, "--launch-client", &uid])
         .env_clear()
         .process_group(0)
         .stdin(Stdio::null())
@@ -151,6 +157,14 @@ pub(super) async fn spawn(uid: libc::uid_t) -> Result<(Child, Process), NetworkE
         .spawn()
         .map_err(|_| NetworkError::MacosServiceUnavailable)?;
     let identity = read_launch_identity(&mut child).await?;
+    // The PID report precedes exec. The authorization handoff must wait
+    // until the kernel identifies that same process as the installed App.
+    while !identity.is_app() {
+        tokio::select! {
+            _ = child.wait() => return Err(NetworkError::MacosServiceUnavailable),
+            () = sleep(Duration::from_millis(25)) => {}
+        }
+    }
     Ok((child, identity))
 }
 
@@ -241,19 +255,18 @@ pub(super) fn exec_app(expected_uid: libc::uid_t) -> Result<(), NetworkError> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .exec();
-    eprintln!("Could not launch the trial App: {error}");
+    eprintln!("Could not launch CVBBMSO: {error}");
     Err(NetworkError::MacosServiceUnavailable)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::time::timeout;
 
     #[tokio::test]
-    async fn the_connecting_uid_and_pid_do_not_make_an_unrelated_executable_the_trial_app() {
+    async fn the_connecting_uid_and_pid_do_not_admit_an_unrelated_executable() {
         let (socket, _) = UnixStream::pair().unwrap();
         let uid = peer_uid(&socket).unwrap();
         let pid = i32::try_from(std::process::id()).unwrap();

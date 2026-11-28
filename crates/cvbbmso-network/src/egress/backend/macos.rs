@@ -20,7 +20,7 @@ mod lifecycle;
 mod managed_pf;
 mod rules;
 use lifecycle::Prepared;
-pub(crate) use lifecycle::{managed_watchdog_entry, watchdog_entry};
+pub(crate) use lifecycle::run_watchdog;
 use rules::Rules;
 
 const ANCHOR: &str = "com.cvbbmso.egress";
@@ -34,35 +34,16 @@ const PFCTL: &str = "/sbin/pfctl";
 const REFERENCES: &[&str] = &["-s", "References"];
 const ROOT_RULE: &str = "anchor \"com.cvbbmso.egress\" all";
 pub(crate) fn prepare() -> Result<(), NetworkError> {
-    Prepared::new().map(drop)
+    lifecycle::prepare(false).map(drop)
 }
 
 pub(crate) fn install(plan: &Plan) -> Result<InstallResult, NetworkError> {
     Prepared::new()?.install(plan)
 }
 
-pub(crate) fn prepare_managed() -> Result<(), NetworkError> {
-    Prepared::clean_before_resolution()
-}
-
-pub(crate) fn install_managed(plan: &Plan) -> Result<InstallResult, NetworkError> {
-    Prepared::managed()?.install(plan)
-}
-
-#[cfg(feature = "macos-pf-trial")]
-pub(crate) fn prepare_trial() -> Result<(), NetworkError> {
-    Prepared::clean_before_trial().map(drop)
-}
-
-#[cfg(feature = "macos-pf-trial")]
-pub(crate) fn install_trial(plan: &Plan) -> Result<InstallResult, NetworkError> {
-    Prepared::trial()?.install(plan)
-}
-
 struct PfGuard {
     expected: Mutex<Expected>,
     watchdog: Mutex<Option<lifecycle::Watchdog>>,
-    managed: bool,
 }
 
 struct Expected {
@@ -103,14 +84,13 @@ impl GuardBackend for PfGuard {
         if let Some(running) = watchdog.as_mut() {
             match state::read(&commands)? {
                 Some(state) if running.owns(&state) => {
-                    lifecycle::recover_job(&commands, &running.job, self.managed)?;
+                    lifecycle::recover_job(&commands, &running.job)?;
                 }
                 None => {
                     lifecycle::recover_without_owner(
                         &commands,
                         &running.job,
                         Some(std::process::id()),
-                        self.managed,
                     )?;
                 }
                 _ => {}
@@ -810,7 +790,7 @@ mod tests {
 
         recorder.reply(LIVE, Ok(BOTH));
         recorder.reply(REFERENCES, Ok(PROJECT_REFERENCE));
-        lifecycle::recover(&recorder, false).unwrap();
+        lifecycle::recover(&recorder).unwrap();
         assert_only_own_mutations(&recorder);
         assert_eq!(recorder.contents(PF_CONF).as_deref(), Some(BASE));
         assert!(recorder.contents(TOKEN).is_none());

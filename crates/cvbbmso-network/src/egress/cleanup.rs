@@ -36,18 +36,16 @@ impl Job {
     }
 
     pub(crate) fn schedule(
-        &self,
         commands: &dyn Commands,
+        generation: &Generation,
         helper: &str,
     ) -> Result<(), NetworkError> {
-        let definition = self.definition();
-        let contents = self.render_definition(helper);
-        match self {
-            Self::Legacy => commands.write(&definition, &contents)?,
-            Self::Lease(_) => commands.write_new(&definition, &contents)?,
-        }
+        let job = Self::Lease(generation.clone());
+        let definition = job.definition();
+        let contents = job.render_definition(helper, generation);
+        commands.write_new(&definition, &contents)?;
         commands.run(LAUNCHCTL, &["bootstrap", "system", &definition])?;
-        self.verify(commands)
+        job.verify(commands)
     }
 
     pub(crate) fn verify(&self, commands: &dyn Commands) -> Result<(), NetworkError> {
@@ -107,14 +105,11 @@ impl Job {
         Ok(())
     }
 
-    fn render_definition(&self, helper: &str) -> String {
-        let arguments = match self {
-            Self::Legacy => "<string>--recover</string>".to_owned(),
-            Self::Lease(generation) => format!(
-                "<string>--recover-lease</string><string>{}</string>",
-                generation.as_str()
-            ),
-        };
+    fn render_definition(&self, helper: &str, generation: &Generation) -> String {
+        let arguments = format!(
+            "<string>--recover-lease</string><string>{}</string>",
+            generation.as_str()
+        );
         let label = self.label();
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -136,23 +131,8 @@ mod tests {
     use crate::egress::commands::testing::Recorder;
 
     const DOMAIN: &str = "system/com.cvbbmso.egress-cleanup";
-    const HELPER: &str = "/Library/PrivilegedHelperTools/com.cvbbmso.egress-watchdog";
     const ABSENT: &str =
         "Could not find service \"com.cvbbmso.egress-cleanup\" in domain for system";
-
-    #[test]
-    fn launchd_legacy_job_uses_the_existing_helper_contract() {
-        let recorder = Recorder::default();
-        let job = Job::Legacy;
-        job.schedule(&recorder, HELPER).unwrap();
-        let definition = job.definition();
-        let contents = recorder.contents(&definition).unwrap();
-        assert!(contents.contains(HELPER));
-        assert!(contents.contains("<string>--recover</string>"));
-        job.record_cleanup(&recorder).unwrap();
-        job.finish_cleanup(&recorder).unwrap();
-        assert!(recorder.contents(&definition).is_none());
-    }
 
     #[test]
     fn a_timed_out_launchctl_is_not_evidence_the_job_is_gone() {
@@ -191,13 +171,16 @@ mod tests {
         let generation = Generation::allocate(&recorder).unwrap();
         let lease = Job::Lease(generation.clone());
         let next = Job::Lease(Generation::allocate(&recorder).unwrap());
-        let helper = crate::egress::managed::RECOVERY_SERVICE;
-        lease.schedule(&recorder, helper).unwrap();
+        let helper = crate::egress::session::HELPER;
+        Job::schedule(&recorder, &generation, helper).unwrap();
         let definition = recorder.contents(&lease.definition()).unwrap();
         assert!(definition.contains(&format!("<string>{helper}</string>")));
         assert!(definition.contains("<string>--recover-lease</string>"));
         assert!(definition.contains(generation.as_str()));
-        assert_eq!(lease.schedule(&recorder, helper), Err(NetworkError::Io));
+        assert_eq!(
+            Job::schedule(&recorder, &generation, helper),
+            Err(NetworkError::Io)
+        );
         assert_ne!(lease.definition(), next.definition());
         assert_ne!(lease.domain(), next.domain());
     }

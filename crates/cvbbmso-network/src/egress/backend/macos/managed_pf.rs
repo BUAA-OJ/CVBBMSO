@@ -451,21 +451,25 @@ mod tests {
     fn recovery_retries_the_old_managed_entry_before_retiring_its_lease() {
         use super::super::lifecycle::recover_job;
         use crate::egress::cleanup::Job;
-        use crate::egress::managed::RECOVERY_SERVICE;
         use crate::egress::state::GuardState;
 
         let recorder = stock_disk();
         recorder.write(JOURNAL, STOCK_FILTER).unwrap();
         state::write(&recorder, &GuardState::new(1234, None)).unwrap();
         let job = Job::Legacy;
-        job.schedule(&recorder, RECOVERY_SERVICE).unwrap();
+        recorder
+            .write(
+                "/Library/LaunchDaemons/com.cvbbmso.egress-cleanup.plist",
+                "old job definition",
+            )
+            .unwrap();
 
         recorder.reply(&["-s", "Anchors"], Ok(ANCHOR));
         for _ in 0..3 {
             stock(&recorder, Some("pass in all"));
         }
         assert_eq!(
-            recover_job(&recorder, &job, true),
+            recover_job(&recorder, &job),
             Err(NetworkError::MacosUnsupportedPfConfiguration)
         );
         assert!(
@@ -486,7 +490,7 @@ mod tests {
             stock(&recorder, Some(LEGACY_ROOT_RULE));
         }
         stock(&recorder, None);
-        assert_eq!(recover_job(&recorder, &job, true), Ok(()));
+        assert_eq!(recover_job(&recorder, &job), Ok(()));
         assert!(recorder.contents(JOURNAL).is_none());
         assert!(state::read(&recorder).unwrap().is_none());
         assert_eq!(Job::pending(&recorder).unwrap(), None);

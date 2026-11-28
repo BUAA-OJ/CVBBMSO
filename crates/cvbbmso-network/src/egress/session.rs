@@ -4,30 +4,33 @@
 mod console;
 
 use std::fs::{self, File, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Stdout, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::process::Child;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
 use super::{
-    EgressGuard, EgressPolicy,
+    EgressPolicy, LocalGuard,
     backend::macos,
-    commands::{Commands, SystemCommands},
-    managed, state,
+    commands::{Commands, REAP_TIMEOUT, SystemCommands},
+    state,
 };
 use crate::NetworkError;
 
-pub(crate) const HELPER: &str = "/Library/PrivilegedHelperTools/com.cvbbmso.pf-trial";
-const DIRECTORY: &str = "/Library/Application Support/com.cvbbmso-trial";
-const SOCKET: &str = "/Library/Application Support/com.cvbbmso-trial/session.sock";
-const LOCK: &str = "/Library/Application Support/com.cvbbmso-trial/session.lock";
+pub(super) const HELPER: &str =
+    "/Library/Application Support/com.cvbbmso-client/CVBBMSO.app/Contents/Helpers/cvbbmso-pf";
+const DIRECTORY: &str = "/Library/Application Support/com.cvbbmso-client";
+const SOCKET: &str = "/Library/Application Support/com.cvbbmso-client/session.sock";
+const LOCK: &str = "/Library/Application Support/com.cvbbmso-client/session.lock";
 const STARTUP: Duration = Duration::from_secs(120);
 const ADMISSION: Duration = Duration::from_secs(45);
 const OPERATION: Duration = Duration::from_secs(60);
@@ -37,6 +40,9 @@ const REPLY_WRITE: Duration = Duration::from_secs(2);
 const ROUND_TRIP: Duration =
     Duration::from_secs(2 * OPERATION.as_secs() + REPLY_WRITE.as_secs() + 3);
 const HEALTH: Duration = Duration::from_secs(15);
+const HANDOFF: Duration =
+    Duration::from_secs(STARTUP.as_secs() + ADMISSION.as_secs() + OPERATION.as_secs() + 5);
+const STARTED: &str = "CVBBMSO-STARTED\n";
 const VERIFY: u8 = b'V';
 const SHUTDOWN: u8 = b'S';
 const READY: u8 = b'R';
@@ -44,8 +50,7 @@ const OK: u8 = b'K';
 const ERROR: u8 = b'E';
 const POLICY: u8 = b'P';
 
-/// A macOS PF trial session held by the administrator-started helper.
-pub struct MacosTrialGuard(mpsc::Sender<Request>);
+pub(super) struct Session(mpsc::Sender<Request>);
 
 struct Request {
     operation: u8,
@@ -53,14 +58,9 @@ struct Request {
     result: oneshot::Sender<Result<(), NetworkError>>,
 }
 
-impl MacosTrialGuard {
-    /// Authenticates the root helper and waits for its live PF verification.
-    ///
-    /// # Errors
-    /// Returns a policy error if the client and helper policies differ, or an
-    /// availability or verification error if the session cannot be established.
-    pub async fn connect(policy: EgressPolicy) -> Result<Self, NetworkError> {
-        let sealed = managed::build_policy()?;
+impl Session {
+    pub(super) async fn install(policy: EgressPolicy) -> Result<Self, NetworkError> {
+        let sealed = build_policy()?;
         if policy.validate()? != sealed.validate()? {
             return Err(NetworkError::Policy);
         }
@@ -90,19 +90,11 @@ impl MacosTrialGuard {
         Ok(Self(sender))
     }
 
-    /// Rechecks the running guard owned by this connection.
-    ///
-    /// # Errors
-    /// Returns an error if the helper disconnects or cannot verify live PF.
-    pub async fn verify(&self) -> Result<(), NetworkError> {
+    pub(super) async fn verify(&self) -> Result<(), NetworkError> {
         self.request(VERIFY).await
     }
 
-    /// Ends this session and waits for PF cleanup.
-    ///
-    /// # Errors
-    /// Returns an error if the helper cannot confirm cleanup.
-    pub async fn shutdown(self) -> Result<(), NetworkError> {
+    pub(super) async fn shutdown(self) -> Result<(), NetworkError> {
         self.request(SHUTDOWN).await
     }
 
@@ -166,9 +158,32 @@ fn require_root_peer(socket: &UnixStream) -> Result<(), NetworkError> {
     Ok(())
 }
 
+fn build_policy() -> Result<EgressPolicy, NetworkError> {
+    let origin = |value: &str| {
+        let url = url::Url::parse(value).map_err(|_| NetworkError::Policy)?;
+        if url.scheme() != "https"
+            || url.host().is_none()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(NetworkError::Policy);
+        }
+        Ok(url)
+    };
+    Ok(EgressPolicy {
+        accoding_origin: origin("https://accoding.buaa.edu.cn")?,
+        server_origin: origin(
+            option_env!("CVBBMSO_SERVER_ORIGIN").ok_or(NetworkError::MacosUntrustedInstallation)?,
+        )?,
+    })
+}
+
 fn policy_message(policy: &EgressPolicy) -> Vec<u8> {
     format!(
-        "CVBBMSO-PF-TRIAL/1\n{}\n{}\n",
+        "CVBBMSO-PF/1\n{}\n{}\n",
         policy.accoding_origin.origin().ascii_serialization(),
         policy.server_origin.origin().ascii_serialization(),
     )
@@ -186,7 +201,7 @@ async fn bounded<T>(
     timeout(limit, operation).await.map_err(|_| unavailable())?
 }
 
-pub(crate) fn check_helper() -> Result<(), NetworkError> {
+pub(super) fn check_helper() -> Result<(), NetworkError> {
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         return Err(NetworkError::PermissionDenied);
@@ -198,9 +213,8 @@ pub(crate) fn check_helper() -> Result<(), NetworkError> {
 }
 
 fn check_installation() -> Result<EgressPolicy, NetworkError> {
-    check_helper()?;
     let version = SystemCommands::new(None).output("/usr/bin/sw_vers", &["-productVersion"])?;
-    if !cfg!(target_arch = "aarch64")
+    if !cfg!(any(target_arch = "aarch64", target_arch = "x86_64"))
         || version
             .trim()
             .split('.')
@@ -212,7 +226,7 @@ fn check_installation() -> Result<EgressPolicy, NetworkError> {
     }
     console::check_app()?;
     console::console_uid()?;
-    managed::build_policy()
+    build_policy()
 }
 
 fn take_session_lock() -> Result<File, NetworkError> {
@@ -300,13 +314,22 @@ async fn accept_peer(
 }
 
 async fn serve(
-    guard: &EgressGuard,
+    guard: &LocalGuard,
     listener: &UnixListener,
     uid: libc::uid_t,
     message: &[u8],
+    handoff: &mut Option<Stdout>,
 ) -> Result<Option<UnixStream>, NetworkError> {
     let socket = bounded(ADMISSION, async {
         let (mut child, launched) = console::spawn(uid).await?;
+        verify_console(uid)?;
+        if let Some(mut pipe) = handoff.take() {
+            // LocalGuard::install already verified live PF. This report
+            // hands over the GUI, and never grants the App exam admission.
+            pipe.write_all(STARTED.as_bytes())
+                .and_then(|()| pipe.flush())
+                .map_err(|_| NetworkError::Io)?;
+        }
         let mut socket = tokio::select! {
             result = accept_peer(listener, |peer| {
                 console::console_uid().ok() == Some(uid) && launched.matches_peer(peer, uid)
@@ -317,7 +340,6 @@ async fn serve(
         Ok(socket)
     })
     .await?;
-    println!("PF verified. The trial App is connected.");
     serve_session(socket, async || {
         verify_console(uid)?;
         guard.verify().await
@@ -374,7 +396,7 @@ async fn finish(
     outcome.map(drop)
 }
 
-async fn run(policy: EgressPolicy) -> Result<(), NetworkError> {
+async fn run(policy: EgressPolicy, handoff: &mut Option<Stdout>) -> Result<(), NetworkError> {
     let uid = console::console_uid()?;
     let message = policy_message(&policy);
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|_| NetworkError::Io)?;
@@ -389,63 +411,122 @@ async fn run(policy: EgressPolicy) -> Result<(), NetworkError> {
     };
     tokio::pin!(stopped);
     let (_socket, listener) = bind_session()?;
-    println!("Preparing PF and recovery for the current console session.");
     let guard = tokio::select! {
         () = &mut stopped => return Err(unavailable()),
-        result = bounded(STARTUP, EgressGuard::install_using(policy, macos::prepare_trial, macos::install_trial)) => result?,
+        result = bounded(STARTUP, LocalGuard::install(policy)) => result?,
     };
     let outcome = tokio::select! {
         () = &mut stopped => Ok(None),
-        result = serve(&guard, &listener, uid, &message) => result,
+        result = serve(&guard, &listener, uid, &message, handoff) => result,
     };
-    finish(outcome, guard.shutdown()).await?;
-    println!("Trial ended and PF cleanup confirmed.");
-    Ok(())
+    finish(outcome, guard.shutdown()).await
 }
 
 pub(crate) fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let result = match args.as_slice() {
-        [mode] if mode == "--trial" => check_installation().and_then(|policy| {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|_| NetworkError::Platform)?;
-            let outcome = runtime.block_on(run(policy));
-            // If a bounded blocking operation did not return, the existing
-            // watchdog and scheduled recovery own the abandoned PF lease.
-            runtime.shutdown_timeout(Duration::from_secs(1));
-            outcome
-        }),
-        [mode] if mode == "--trial-check" => check_installation().map(|policy| {
-            println!(
-                "Trial installation verified. Monitor: {}",
-                policy.server_origin
-            );
-        }),
-        [mode] if mode == "--trial-recover" => check_helper().and_then(|()| {
-            let _lock = take_session_lock()?;
-            macos::prepare_trial()?;
-            remove_socket()?;
-            println!("No trial lease is active. Stale PF recovery completed.");
-            Ok(())
-        }),
-        [mode, uid] if mode == "--trial-launch-client" => check_helper().and_then(|()| {
-            console::exec_app(uid.parse().map_err(|_| NetworkError::PermissionDenied)?)
-        }),
-        [mode] if mode == "--capabilities" => return macos::managed_watchdog_entry(),
-        _ => match check_helper() {
-            Ok(()) => return macos::managed_watchdog_entry(),
-            Err(error) => Err(error),
-        },
-    };
-    match result {
+    match check_helper().and_then(|()| run_command(&args)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("macOS PF trial failed: {error}");
+            eprintln!("macOS PF helper failed: {error}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_command(args: &[String]) -> Result<(), NetworkError> {
+    match args {
+        [mode] if mode == "launch" => runtime()?.block_on(launch()),
+        [mode] if mode == "run" => start(false),
+        [mode, flag] if mode == "run" && flag == "--handoff" => start(true),
+        [mode] if mode == "status" => check_installation().map(|policy| {
+            println!("Installation verified. Monitor: {}", policy.server_origin);
+        }),
+        [mode] if mode == "recover" => {
+            let _lock = take_session_lock()?;
+            macos::prepare()?;
+            remove_socket()?;
+            println!("No session is active. Stale PF recovery completed.");
+            Ok(())
+        }
+        [mode, uid] if mode == "--launch-client" => {
+            console::exec_app(uid.parse().map_err(|_| NetworkError::PermissionDenied)?)
+        }
+        _ => macos::run_watchdog(args),
+    }
+}
+
+fn runtime() -> Result<tokio::runtime::Runtime, NetworkError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| NetworkError::Platform)
+}
+
+fn start(detached: bool) -> Result<(), NetworkError> {
+    let mut handoff = detached.then(std::io::stdout);
+    let outcome = check_installation().and_then(|policy| {
+        let runtime = runtime()?;
+        let outcome = runtime.block_on(run(policy, &mut handoff));
+        // Existing recovery jobs own the lease if a platform call outlives
+        // its async deadline.
+        runtime.shutdown_timeout(Duration::from_secs(1));
+        outcome
+    });
+    if let Some(mut pipe) = handoff {
+        let error = outcome.err().unwrap_or_else(unavailable);
+        let _ = writeln!(pipe, "{error}");
+        return Err(error);
+    }
+    outcome
+}
+
+async fn launch() -> Result<(), NetworkError> {
+    let mut command = tokio::process::Command::new(HELPER);
+    command
+        .args(["run", "--handoff"])
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // SAFETY: the hook runs after fork and only calls async-signal-safe
+    // functions. setsid detaches the keepalive process from authorization.
+    unsafe {
+        command.as_std_mut().pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|_| NetworkError::Io)?;
+    await_handoff(&mut child).await
+}
+
+async fn await_handoff(child: &mut Child) -> Result<(), NetworkError> {
+    let pipe = child.stdout.take().ok_or(NetworkError::Io)?;
+    let mut reply = String::new();
+    let result = timeout(
+        HANDOFF,
+        BufReader::new(pipe.take(512)).read_line(&mut reply),
+    )
+    .await;
+    if matches!(result, Ok(Ok(_))) && reply == STARTED {
+        return Ok(());
+    }
+    if !reply.trim().is_empty() {
+        eprintln!("{}", reply.trim());
+    }
+    if let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) {
+        // SAFETY: this is our unreaped direct child. Let it roll back before
+        // resorting to a kill, which leaves recovery to the existing jobs.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+    if !matches!(timeout(OPERATION, child.wait()).await, Ok(Ok(_))) {
+        let _ = child.start_kill();
+        let _ = timeout(REAP_TIMEOUT, child.wait()).await;
+    }
+    Err(unavailable())
 }
 
 #[cfg(test)]
@@ -462,6 +543,33 @@ mod tests {
         let uid = unsafe { libc::geteuid() };
         assert_eq!(console::peer_uid(&peer), Ok(uid));
         assert_eq!(require_root_peer(&peer).is_ok(), uid == 0);
+    }
+
+    #[tokio::test]
+    async fn authorization_handoff_leaves_only_a_successful_supervisor_running() {
+        // SAFETY: geteuid has no preconditions. Only a nonprivileged shell
+        // stands in for the installed supervisor.
+        assert_ne!(unsafe { libc::geteuid() }, 0);
+        for (line, expected) in [
+            (STARTED, Ok(())),
+            ("could not start the fixture\n", Err(unavailable())),
+        ] {
+            let mut supervisor = tokio::process::Command::new("/bin/sh")
+                .args(["-c", "printf '%s' \"$1\"; read -r release", "sh", line])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let control = supervisor.stdin.take().unwrap();
+            assert_eq!(await_handoff(&mut supervisor).await, expected);
+            assert_eq!(supervisor.id().is_some(), expected.is_ok());
+            drop(control);
+            timeout(Duration::from_secs(5), supervisor.wait())
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -531,7 +639,7 @@ mod tests {
             let (client, root) = tokio::io::duplex(1);
             let (sender, requests) = mpsc::channel(1);
             tokio::spawn(client_worker(client, requests));
-            let guard = MacosTrialGuard(sender);
+            let guard = Session(sender);
             let checking = Notify::new();
             let checks = Cell::new(0);
             let cleaned = Cell::new(false);

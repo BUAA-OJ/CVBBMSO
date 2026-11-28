@@ -3,8 +3,7 @@
 //! Installing the guard restricts outbound traffic to the Accoding origin, the
 //! monitoring server and the services an exam client needs; the restriction is
 //! enforced by the platform filter adapter and kept alive for as long as the
-//! application runs. Installation requires administrator or root rights and every
-//! step rolls back when a later step fails.
+//! application runs. Privileged installation rolls back when a later step fails.
 
 mod allow_set;
 mod backend;
@@ -12,15 +11,13 @@ mod backend;
 mod cleanup;
 #[cfg(target_os = "macos")]
 mod commands;
-#[cfg(target_os = "macos")]
-pub(crate) mod managed;
 mod policy;
 mod resolver;
 mod services;
 #[cfg(target_os = "macos")]
+pub(crate) mod session;
+#[cfg(target_os = "macos")]
 mod state;
-#[cfg(all(target_os = "macos", feature = "macos-pf-trial"))]
-pub(crate) mod trial;
 
 use std::future::{Future, poll_fn};
 use std::net::{IpAddr, SocketAddr};
@@ -28,11 +25,15 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_os = "macos"))]
+use self::LocalGuard as ClientGuard;
 use self::allow_set::AllowSet;
 use self::backend::GuardBackend;
 use self::policy::{Plan, Service, Target, Transport, ValidatedPolicy};
 use self::resolver::{Resolver, SystemResolver};
 use self::services::Services;
+#[cfg(target_os = "macos")]
+use self::session::Session as ClientGuard;
 use crate::NetworkError;
 
 pub use self::policy::EgressPolicy;
@@ -67,7 +68,44 @@ const CERTIFICATE_HOSTS: &[(&str, u16)] = &[];
 /// Active system-level egress guard.
 ///
 /// Use [`EgressGuard::shutdown`] to remove the filter when the app exits.
-pub struct EgressGuard {
+pub struct EgressGuard(ClientGuard);
+
+impl EgressGuard {
+    /// Establishes the system filter for `policy`.
+    ///
+    /// On macOS the administrator's helper installs the filter. The client
+    /// authenticates that session and waits for successful live verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::Policy`] for an invalid policy,
+    /// [`NetworkError::Resolution`] when an origin has no address,
+    /// [`NetworkError::PermissionDenied`] when local installation lacks
+    /// administrator rights, or a platform error if setup fails.
+    pub async fn install(policy: EgressPolicy) -> Result<Self, NetworkError> {
+        Ok(Self(ClientGuard::install(policy).await?))
+    }
+
+    /// Confirms the filter is still installed and refreshes addresses when due.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when live verification cannot complete.
+    pub async fn verify(&self) -> Result<(), NetworkError> {
+        self.0.verify().await
+    }
+
+    /// Removes the filter and its platform cleanup resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if cleanup could not be confirmed.
+    pub async fn shutdown(self) -> Result<(), NetworkError> {
+        self.0.shutdown().await
+    }
+}
+
+struct LocalGuard {
     backend: Arc<dyn GuardBackend>,
     endpoints: ValidatedPolicy,
     runtime: Arc<Mutex<Runtime>>,
@@ -79,33 +117,11 @@ struct Runtime {
     last_refresh: Option<Instant>,
 }
 
-impl EgressGuard {
-    /// Installs the system filter for `policy`.
-    ///
-    /// # Errors
-    ///
-    /// [`NetworkError::Policy`] when an origin is not a usable `https` origin,
-    /// [`NetworkError::Resolution`] when an origin currently has no address,
-    /// [`NetworkError::PermissionDenied`] without administrator or root rights,
-    /// and [`NetworkError::Platform`] or [`NetworkError::Io`] when the platform
-    /// filter or its supporting files cannot be installed.
-    pub async fn install(policy: EgressPolicy) -> Result<Self, NetworkError> {
-        Self::install_using(
-            policy,
-            backend::platform::prepare,
-            backend::platform::install,
-        )
-        .await
-    }
-
-    async fn install_using(
-        policy: EgressPolicy,
-        prepare: fn() -> Result<(), NetworkError>,
-        install: fn(&Plan) -> Result<backend::InstallResult, NetworkError>,
-    ) -> Result<Self, NetworkError> {
+impl LocalGuard {
+    async fn install(policy: EgressPolicy) -> Result<Self, NetworkError> {
         let endpoints = policy.validate()?;
-        let config = tokio::task::spawn_blocking(move || {
-            prepare()?;
+        let config = tokio::task::spawn_blocking(|| {
+            backend::platform::prepare()?;
             Services::discover()
         })
         .await
@@ -126,7 +142,7 @@ impl EgressGuard {
         allowed.refresh_authentication(resolved.authentication, now);
         let destinations = config.resolve(&SystemResolver).await;
         let plan = make_plan(&endpoints, &allowed, destinations, now);
-        let backend = tokio::task::spawn_blocking(move || install(&plan))
+        let backend = tokio::task::spawn_blocking(move || backend::platform::install(&plan))
             .await
             .map_err(|_| NetworkError::Platform)??;
         Ok(Self {
@@ -140,14 +156,7 @@ impl EgressGuard {
         })
     }
 
-    /// Confirms that the filter is still installed and refreshes the allowed
-    /// addresses when they are due.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NetworkError::Platform`] when the rules disappeared, or a
-    /// platform, I/O or resolution error when verification cannot complete.
-    pub async fn verify(&self) -> Result<(), NetworkError> {
+    async fn verify(&self) -> Result<(), NetworkError> {
         let backend = Arc::clone(&self.backend);
         let endpoints = self.endpoints.clone();
         let runtime = Arc::clone(&self.runtime);
@@ -200,18 +209,8 @@ impl EgressGuard {
         .map_err(|_| NetworkError::Platform)?
     }
 
-    /// Removes the filter and its platform cleanup resources.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the platform could not complete cleanup.
-    pub async fn shutdown(self) -> Result<(), NetworkError> {
-        self.shutdown_inner().await
-    }
-
-    async fn shutdown_inner(&self) -> Result<(), NetworkError> {
-        let backend = Arc::clone(&self.backend);
-        tokio::task::spawn_blocking(move || backend.revert())
+    async fn shutdown(self) -> Result<(), NetworkError> {
+        tokio::task::spawn_blocking(move || self.backend.revert())
             .await
             .map_err(|_| NetworkError::Platform)?
     }
@@ -244,13 +243,6 @@ impl Runtime {
         self.last_refresh = Some(now);
         Ok(())
     }
-}
-
-pub(crate) fn watchdog_entry() -> std::process::ExitCode {
-    #[cfg(target_os = "macos")]
-    return backend::platform::watchdog_entry();
-    #[cfg(not(target_os = "macos"))]
-    std::process::ExitCode::FAILURE
 }
 
 /// Resolved addresses of everything the policy allows.

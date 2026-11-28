@@ -11,16 +11,8 @@ name = "cvbbmso_network"
 path = "src/lib.rs"
 
 [[bin]]
-name = "cvbbmso-egress-watchdog"
-path = "src/bin/cvbbmso-egress-watchdog.rs"
-
-[[bin]]
-name = "cvbbmso-pf-trial"
-path = "src/bin/cvbbmso-pf-trial.rs"
-required-features = ["macos-pf-trial"]
-
-[features]
-macos-pf-trial = ["tokio/io-util", "tokio/process", "tokio/signal", "tokio/sync"]
+name = "cvbbmso-pf"
+path = "src/bin/cvbbmso-pf.rs"
 
 [dependencies]
 reqwest.workspace = true
@@ -35,7 +27,7 @@ core-foundation.workspace = true
 libc.workspace = true
 system-configuration.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["io-util", "process", "signal", "sync"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
