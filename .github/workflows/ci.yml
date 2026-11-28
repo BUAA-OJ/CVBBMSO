@@ -84,10 +84,13 @@ jobs:
       - name: Test macOS egress with substitutes and PF syntax checks
         if: matrix.os == 'macos-latest'
         run: cargo test --locked -p cvbbmso-network --lib 'egress::'
-      - name: Check the macOS PF trial and test its IPC
+      - name: Check both macOS PF trial binaries and test their IPC
         if: matrix.os == 'macos-latest'
         run: |
-          cargo check --locked -p cvbbmso-client --bin cvbbmso-client --features macos-pf-trial
+          MACOSX_DEPLOYMENT_TARGET=14.0 cargo check --locked \
+            -p cvbbmso-client -p cvbbmso-network \
+            --features cvbbmso-client/macos-pf-trial,cvbbmso-network/macos-pf-trial \
+            --bin cvbbmso-client --bin cvbbmso-pf-trial
           cargo test --locked -p cvbbmso-network --lib --features macos-pf-trial egress::trial
 
   desktop-smoke:

@@ -46,7 +46,8 @@ target_dir=$(printf '%s' "$metadata" | /usr/bin/python3 -c 'import json,sys; pri
 version=$(printf '%s' "$metadata" | /usr/bin/python3 -c \
     'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "cvbbmso-client"))')
 MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --locked --release --target "$target" \
-    -p cvbbmso-client -p cvbbmso-network --features cvbbmso-client/macos-pf-trial \
+    -p cvbbmso-client -p cvbbmso-network \
+    --features cvbbmso-client/macos-pf-trial,cvbbmso-network/macos-pf-trial \
     --bin cvbbmso-client --bin cvbbmso-pf-trial
 
 artifact_dir="$target_dir/$target/release"
