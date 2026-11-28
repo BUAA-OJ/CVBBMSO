@@ -1,6 +1,6 @@
 use cvbbmso_accoding::AccodingCookies;
 use cvbbmso_exam::ExamError;
-use cvbbmso_protocol::ExamSummary;
+use cvbbmso_protocol::ExamListResponse;
 use reqwest::Certificate;
 use thiserror::Error;
 use url::{Origin, Url};
@@ -56,7 +56,7 @@ impl Monitor {
     pub(crate) async fn list_exams(
         &self,
         cookies: &AccodingCookies,
-    ) -> Result<Vec<ExamSummary>, MonitorError> {
-        Ok(self.0.list_exams(cookies).await?.items)
+    ) -> Result<ExamListResponse, MonitorError> {
+        self.0.list_exams(cookies).await.map_err(MonitorError::from)
     }
 }

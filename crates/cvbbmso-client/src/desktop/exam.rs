@@ -41,6 +41,7 @@ pub(super) enum ExamCommandError {
     MonitorUnconfigured,
     ConnectionFailed,
     NotEnrolled,
+    ExamEnded,
     StorageFailed,
     RecordingFailed,
     ShutdownFailed,
@@ -52,6 +53,7 @@ impl From<ExamError> for ExamCommandError {
         match error {
             ExamError::Auth => Self::SignInRequired,
             ExamError::NotEnrolled => Self::NotEnrolled,
+            ExamError::ExamEnded => Self::ExamEnded,
             ExamError::Storage(_) => Self::StorageFailed,
             ExamError::Recording(_) => Self::RecordingFailed,
             ExamError::Closed => Self::SessionClosed,

@@ -217,6 +217,7 @@ const currentExamStatus = document.querySelector("#current-exam-status");
 const closeExam = document.querySelector("#close-exam");
 const examListRefreshMs = 30_000;
 let exams = [];
+let pendingFinalizations = new Set();
 let examListTimer;
 let examView = null;
 let examSelection = null;
@@ -238,6 +239,7 @@ const examSessionErrors = new Map([
   ["session_busy", "已有考试会话，请先退出当前考试。"],
   ["session_closed", "考试会话已关闭，请重新选择。"],
   ["not_enrolled", "监考服务未核验到本场考试的报名。"],
+  ["exam_ended", "考试已结束，当前账号没有待确认的收尾记录。"],
   ["storage_failed", "无法读取或保存本地考试数据。"],
   ["recording_failed", "无法初始化本场考试的录像数据。"],
   ["shutdown_failed", "考试会话已结束，但本地收尾失败，请联系考试管理员。"],
@@ -258,6 +260,7 @@ const recordingStates = new Map([
 const examPhases = new Map([
   ["scheduled", "未开始"],
   ["running", "进行中"],
+  ["ended", "已结束"],
 ]);
 const examTime = new Intl.DateTimeFormat("zh-CN", {
   year: "numeric",
@@ -277,7 +280,8 @@ function renderTime(timestamp) {
 
 function renderExamEntry(button) {
   const entered = button.dataset.examId === examView?.exam_id;
-  button.textContent = entered ? "已进入" : "进入考试";
+  button.textContent = entered ? "已进入"
+    : pendingFinalizations.has(button.dataset.examId) ? "继续收尾" : "进入考试";
   button.disabled = !examEventsReady || examBusy || examView !== null;
 }
 
@@ -300,11 +304,15 @@ function renderExam(exam) {
   return item;
 }
 
+function canOpenExam(exam) {
+  return exam.phase !== "ended" || pendingFinalizations.has(exam.id);
+}
+
 function renderExamList() {
   const rows = document.createDocumentFragment();
   let count = 0;
   for (const exam of exams) {
-    if (exam.phase === "ended") continue;
+    if (!canOpenExam(exam)) continue;
     rows.append(renderExam(exam));
     count++;
   }
@@ -314,6 +322,9 @@ function renderExamList() {
 }
 
 function renderExamSession() {
+  if (examView?.state.execution === "finished" && pendingFinalizations.delete(examView.exam_id)) {
+    renderExamList();
+  }
   for (const button of examList.querySelectorAll(".open-exam")) {
     renderExamEntry(button);
   }
@@ -380,7 +391,7 @@ async function refreshExamSession() {
 
 async function changeExamSession(exam) {
   if (examBusy || (exam && examView) || (!exam && !examView)) return;
-  if (exam?.phase === "ended") {
+  if (exam && !canOpenExam(exam)) {
     renderExamList();
     examFeedback.textContent = "这场考试已结束。";
     return;
@@ -400,6 +411,9 @@ async function changeExamSession(exam) {
     }
     examFeedback.textContent = "";
   } catch (error) {
+    if (exam && error === "exam_ended" && pendingFinalizations.delete(exam.id)) {
+      renderExamList();
+    }
     examFeedback.textContent = examSessionErrors.get(error) ?? examErrors.get(error) ?? "考试操作失败，请重试。";
   } finally {
     examBusy = false;
@@ -416,20 +430,28 @@ async function refreshExamList(manual) {
   clearTimeout(examListTimer);
   if (manual) {
     exams = [];
+    pendingFinalizations.clear();
     examList.replaceChildren();
     examList.setAttribute("aria-busy", "true");
     examStatus.textContent = "正在加载报名列表…";
   }
   try {
-    exams = await core.invoke("list_exams");
+    const result = await core.invoke("list_exams_with_finalization");
+    exams = result.items;
+    pendingFinalizations = new Set(result.pending_finalizations);
+    if (examView?.state.execution === "finished") pendingFinalizations.delete(examView.exam_id);
     renderExamList();
   } catch (error) {
+    if (pendingFinalizations.size > 0) {
+      pendingFinalizations.clear();
+      renderExamList();
+    }
     if (manual) examStatus.textContent = examErrors.get(error) ?? "获取报名列表失败，请重试。";
   } finally {
     examList.removeAttribute("aria-busy");
     refreshExams.textContent = "刷新列表";
     refreshExams.disabled = false;
-    if (exams.some((exam) => exam.phase !== "ended")) {
+    if (exams.some(canOpenExam)) {
       examListTimer = setTimeout(() => refreshExamList(false), examListRefreshMs);
     }
   }

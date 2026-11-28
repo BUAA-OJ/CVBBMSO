@@ -9,6 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "open_accoding",
         "inspect_session",
         "list_exams",
+        "list_exams_with_finalization",
         "open_exam",
         "get_exam_status",
         "close_exam",

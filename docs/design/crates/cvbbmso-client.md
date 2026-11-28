@@ -31,7 +31,8 @@
 | `admission-status` 事件 | 无 | `{ status, reason? }` | 定向通知本地控制窗正式准入状态变化 |
 | `authorize_macos_egress` | 无 | `()` | macOS 引导窗口发起一次系统管理员授权。同一进程只允许一个在途请求。取消或失败由 `admission-status` 报告。窗口或状态不符合要求时返回 `authorization_unavailable` |
 | `list_exams` | 无 | `ExamSummary[]` | 使用当前 Cookie 调用 `GET /api/exams` |
-| `open_exam` | `{ exam_id: uuid }` | `{ "connected": true }` | 调用 `Exam::connect`；等待初始 `sync` 后返回。网络、出站守卫和权限预检已在启动时完成 |
+| `list_exams_with_finalization` | 无 | `{ items: ExamSummary[], pending_finalizations: uuid[] }` | 使用同一次 `GET /api/exams` 返回的已验证账号，在本地查找列表中已结束且收尾待确认的考试 |
+| `open_exam` | `{ exam_id: uuid }` | `{ "connected": true }` | 调用 `Exam::connect`，等待初始 `sync` 后返回。已结束且当前账号没有待确认记录时返回 `exam_ended`。网络、出站守卫和权限预检已在启动时完成 |
 | `get_exam_status` | 无 | `ClientView` 或 `null` | 读取当前考试状态快照 |
 | `confirm_exit` | 无 | `()` | 本地控制窗确认退出后，触发现有考试与网络守卫收尾流程 |
 | `close_exam` | 无 | `{ "closed": true }` | 停止当前考试运行时，封存当前录像片段并释放考试 |
@@ -97,11 +98,11 @@ Windows 基于 WebView2 配置 `AreDevToolsEnabled=false`、`AreBrowserAccelerat
 
 ## Cookie 登录与考试连接
 
-报名列表按服务端状态显示未开始和进行中的考试，隐藏已结束的考试。列表中有可参加的考试时，控制窗每 30 秒重新获取状态。成功入场后，本场报名卡片显示「已进入」。进行中的会话继续显示，直到用户在收尾确认后离开。当前会话仍在等待确认时，控制窗定期读取本地状态快照，以免遗漏结束通知。
+报名列表按服务端状态显示未开始和进行中的考试。已结束的考试只有在当前账号有有效的待收尾日志时才显示「继续收尾」。点击后通过 `open_exam` 重新验证账号和报名，再按原有协议补传并等待最终 ACK。收到 ACK 后移除该入口。列表有可进入或可收尾的考试时，控制窗每 30 秒刷新。成功入场后，本场报名卡片显示「已进入」。当前会话仍在等待确认时，控制窗定期读取本地状态快照。
 
 学生在 WebView 加载 `https://accoding.buaa.edu.cn/user/login`。浏览器完成 `GET /user/login`、带 `_csrf` 的表单 POST、跳转和 `Set-Cookie` 处理；Rust 原生代码从 WebView Cookie Store 取得 `connect.sid` 和可用的附加 Cookie，创建 `cvbbmso-accoding::AccodingCookies`。
 
-每次加载或刷新报名列表，`list_exams` 都从原生 Cookie Store 读取当前会话，并通过 [`cvbbmso-exam::Monitor`](cvbbmso-exam.md#公开-rust-api) 向构建时配置的 HTTPS Origin 发送 `GET /api/exams`。列表命令只把通过校验的 `items` 返回本地控制窗。HTTP 200 且列表为空表示用户已登录但未报名。手动刷新时清空旧列表，并显示请求错误。HTTP 401 提示重新登录，HTTP 503 提示稍后重试。定时刷新失败时保留上次成功加载的列表。
+列表命令从原生 Cookie Store 读取当前会话，通过 [`cvbbmso-exam::Monitor`](cvbbmso-exam.md#公开-rust-api) 向构建时配置的 HTTPS Origin 发送一次 `GET /api/exams`。`list_exams` 返回通过校验的 `items`。`list_exams_with_finalization` 也返回同一响应所验证账号的可收尾考试 ID，读取失败的日志不生成入口。HTTP 200 且列表为空表示用户已登录但未报名。手动刷新时清空旧列表。HTTP 401 提示重新登录，HTTP 503 提示稍后重试。定时刷新失败时保留上次的普通考试，隐藏待收尾入口，等下次复验后更新。
 
 客户端在首次入场时将 `device_id` 持久化到应用数据根目录，后续入场读取同一标识。`instance_id` 在进程启动时生成，同一进程内的重连和重新入场都沿用它。准入通过后，Rust 读取原生 Cookie 并调用 `Exam::connect(config, exam_id, cookies)`，由运行时重新获取 `user` 并校验报名，再连接 `GET /api/exams/{exam_id}/ws`。
 

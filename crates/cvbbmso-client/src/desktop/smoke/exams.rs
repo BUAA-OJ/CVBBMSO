@@ -35,6 +35,7 @@ use serde_json::{Value, json};
 
 pub(super) const FIRST: Uuid = Uuid::from_u128(0x10);
 pub(super) const SECOND: Uuid = Uuid::from_u128(0x20);
+pub(super) const ENDED: Uuid = Uuid::from_u128(0x30);
 const FIXTURE_SESSION: &str = "connect.sid=synthetic-v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +62,7 @@ impl Candidate {
 }
 
 pub(super) struct Auth {
+    restoring: bool,
     expired: watch::Sender<bool>,
     stale_handshake: Notify,
     renewed_checks: AtomicUsize,
@@ -69,8 +71,9 @@ pub(super) struct Auth {
 }
 
 impl Auth {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(restoring: bool) -> Self {
         Self {
+            restoring,
             expired: watch::Sender::new(false),
             stale_handshake: Notify::new(),
             renewed_checks: AtomicUsize::new(0),
@@ -94,7 +97,7 @@ impl Auth {
             }
             _ => {}
         }
-        exam_list(headers, true)
+        exam_list(headers, true, self.restoring)
     }
 }
 
@@ -193,7 +196,9 @@ async fn upgrade(
     let Some(candidate) = Candidate::from_headers(&headers) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    if !matches!(exam_id, FIRST | SECOND) || exam_list(&headers, true).status() != StatusCode::OK {
+    if !matches!(exam_id, FIRST | SECOND)
+        || exam_list(&headers, true, listener.auth.restoring).status() != StatusCode::OK
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     if candidate == Candidate::Initial && *listener.auth.expired.borrow() {
@@ -326,6 +331,7 @@ fn sync() -> ServerMessage {
 async fn open_enrolled_fixture(
     app: &AppHandle,
     ui: &WebviewWindow,
+    restoring: bool,
 ) -> Result<WebviewWindow, Error> {
     let oj = open_fixture_browser(app, ui).await?;
     check_ipc(ui, &oj).await?;
@@ -345,12 +351,11 @@ async fn open_enrolled_fixture(
           .then(() => document.querySelector('#refresh-exams').click());
         ",
     )?;
-    wait_for(
-        ui,
-        "document.querySelectorAll('.open-exam:enabled').length === 2 && document.querySelector('.exam-phase').textContent === '进行中' && !document.querySelector('#exams').textContent.includes('Ended fixture exam')",
-        "server-confirmed exam phases with a fast local clock",
-    )
-    .await?;
+    if restoring {
+        wait_for(ui, "document.querySelectorAll('.open-exam:enabled').length === 2 && document.querySelector('.open-exam').textContent === '继续收尾' && document.querySelector('.exam-phase').textContent === '已结束' && !document.querySelector('#exams').textContent.includes('Ended fixture exam') && !document.querySelector('#exams').textContent.includes('No journal fixture exam')", "only the pending ended exam and the scheduled exam are offered").await?;
+    } else {
+        wait_for(ui, "document.querySelectorAll('.open-exam:enabled').length === 2 && document.querySelector('.exam-phase').textContent === '进行中' && !document.querySelector('#exams').textContent.includes('Ended fixture exam')", "server-confirmed exam phases with a fast local clock").await?;
+    }
 
     Ok(oj)
 }
@@ -370,7 +375,7 @@ pub(super) async fn exercise(
     ) {
         return recording::exercise(app, ui, fixture, case == super::Case::Recording).await;
     }
-    let oj = open_enrolled_fixture(app, ui).await?;
+    let oj = open_enrolled_fixture(app, ui, false).await?;
 
     let initial_hello = check_pending_open(ui, &mut fixture.incoming).await?;
     ui.eval("document.querySelector('.open-exam').click()")?;

@@ -11,6 +11,7 @@
     "allow-open-accoding",
     "allow-inspect-session",
     "allow-list-exams",
+    "allow-list-exams-with-finalization",
     "allow-open-exam",
     "allow-get-exam-status",
     "allow-close-exam",

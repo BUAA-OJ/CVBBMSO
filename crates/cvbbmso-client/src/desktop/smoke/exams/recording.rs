@@ -7,14 +7,16 @@ use std::{
     path::Path,
 };
 
-use cvbbmso_protocol::{RecordingSummary, SegmentMeta, Sha256Digest};
+use cvbbmso_protocol::{ExecutionState, RecordingSummary, SegmentMeta, Sha256Digest};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use tauri::Manager;
 
 use super::{
-    AppHandle, ClientMessage, CommandName, CommandStatus, Connection, DEADLINE, Error, ExamEvent,
-    ExamPhase, FIRST, Fixture, OffsetDateTime, RecordingPolicy, ServerMessage, Uuid, WebviewWindow,
-    check_pending_close, connection, io, oneshot, open_enrolled_fixture, timeout, wait_for,
+    AppHandle, ClientMessage, CommandName, CommandStatus, Connection, DEADLINE, ENDED, Error,
+    ExamEvent, ExamPhase, FIRST, Fixture, OffsetDateTime, RecordingPolicy, ServerMessage, Uuid,
+    WebviewWindow, check_pending_close, connection, io, oneshot, open_enrolled_fixture, probe,
+    probe_value, timeout, wait_for,
 };
 use crate::desktop::{Desktop, smoke::FIXTURE_USER_ID};
 
@@ -24,35 +26,54 @@ pub(super) async fn exercise(
     mut fixture: Fixture,
     capture_display: bool,
 ) -> Result<oneshot::Receiver<()>, Error> {
-    let recording_dir = app
-        .state::<Desktop>()
-        .data_dir
+    let data_dir = app.state::<Desktop>().data_dir.clone();
+    let recording_dir = data_dir
         .join("exams")
         .join(FIRST.to_string())
         .join(FIXTURE_USER_ID.to_string())
         .join("recording");
     if !capture_display {
         seed_recording(&recording_dir)?;
+        seed_journal(&data_dir, FIRST, "recording", "capturing")?;
+        seed_journal(&data_dir, ENDED, "finished", "failed")?;
     }
-    open_enrolled_fixture(app, ui).await?;
+    let oj = open_enrolled_fixture(app, ui, !capture_display).await?;
+    if !capture_display {
+        check_recovery_account(ui, &oj).await?;
+    }
     ui.set_focus()?;
     ui.eval("document.querySelector('.open-exam').click()")?;
     let mut connection = connection(&mut fixture.incoming, FIRST).await?;
+    if !capture_display {
+        assert_eq!(connection.hello.state.execution, ExecutionState::Recording);
+    }
     let now = OffsetDateTime::now_utc();
     connection
         .outgoing
         .send(ServerMessage::Sync {
             server_time: now,
-            phase: ExamPhase::Running,
+            phase: if capture_display {
+                ExamPhase::Running
+            } else {
+                ExamPhase::Ended
+            },
             start_at: now - time::Duration::seconds(1),
-            end_at: now + time::Duration::minutes(5),
+            end_at: if capture_display {
+                now + time::Duration::minutes(5)
+            } else {
+                now
+            },
             recording_policy: RecordingPolicy::new(2, 15)?,
             ack_event_through: 0,
         })
         .await?;
     wait_for(
         ui,
-        "window.examEvents.at(-1)?.state.execution === 'ready'",
+        if capture_display {
+            "window.examEvents.at(-1)?.state.execution === 'ready'"
+        } else {
+            "window.examEvents.at(-1)?.connected === true"
+        },
         "the recording exercise receiving initial sync",
     )
     .await?;
@@ -105,9 +126,60 @@ pub(super) async fn exercise(
     .await?;
     if capture_display {
         ui.eval("clearInterval(window.recordingPaint)")?;
+    } else {
+        wait_for(
+            ui,
+            "document.querySelectorAll('.open-exam').length === 1 && !document.querySelector('#exams').textContent.includes('继续收尾')",
+            "final ACK removing the completed exam's recovery entry",
+        )
+        .await?;
     }
     println!("Desktop recording sealed and hashed real files; the end ACK completed the exam.");
     Ok(connection.closed)
+}
+
+fn seed_journal(root: &Path, exam_id: Uuid, execution: &str, recording: &str) -> io::Result<()> {
+    let runtime = root
+        .join("exams")
+        .join(exam_id.to_string())
+        .join(FIXTURE_USER_ID.to_string())
+        .join("runtime");
+    fs::create_dir_all(&runtime)?;
+    // A snapshot left by an earlier process, with no events uploaded yet.
+    let snapshot = json!({
+        "next_seq": null,
+        "queue": [],
+        "segments": [],
+        "finalized": false,
+        "state": { "execution": execution, "recording": recording },
+    });
+    fs::write(runtime.join("journal.json"), snapshot.to_string())
+}
+
+async fn check_recovery_account(ui: &WebviewWindow, oj: &WebviewWindow) -> Result<(), Error> {
+    oj.eval("location.assign('/relogin/other')")?;
+    wait_for(
+        oj,
+        "document.title === 'Fixture other candidate'",
+        "another verified account",
+    )
+    .await?;
+    ui.eval("document.querySelector('#refresh-exams').click()")?;
+    wait_for(ui, "document.querySelectorAll('.open-exam:enabled').length === 1 && !document.querySelector('#exams').textContent.includes('继续收尾')", "the other account cannot see the original account's pending exam").await?;
+    probe(
+        ui,
+        "window.__TAURI__.core.invoke('open_exam', { exam_id: '00000000-0000-0000-0000-000000000010' })",
+    )?;
+    assert_eq!(probe_value(ui).await?, json!({ "error": "exam_ended" }));
+    oj.eval("location.assign('/rotate')")?;
+    wait_for(
+        oj,
+        "document.title === 'Fixture updated'",
+        "the original verified account",
+    )
+    .await?;
+    ui.eval("document.querySelector('#refresh-exams').click()")?;
+    wait_for(ui, "document.querySelectorAll('.open-exam:enabled').length === 2 && document.querySelector('.open-exam').textContent === '继续收尾'", "the original account's recovery action").await
 }
 
 async fn start_capture(

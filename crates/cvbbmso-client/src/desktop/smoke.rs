@@ -143,8 +143,11 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
             let (monitor, exam_connections) = if case.pauses_install() {
                 (Monitor::new(None), None)
             } else {
-                let (monitor, connections) =
-                    start_monitor(requests.clone(), exam_identity.as_deref())?;
+                let (monitor, connections) = start_monitor(
+                    requests.clone(),
+                    exam_identity.as_deref(),
+                    case == Case::RestoredRecording,
+                )?;
                 (Ok(monitor), connections)
             };
             let base = Url::parse(&format!("http://{fixture}/"))?;
@@ -309,11 +312,13 @@ async fn check_environment_gate(ui: &WebviewWindow) -> Result<(), Error> {
             const invoke = window.__TAURI__.core.invoke;
             const results = await Promise.allSettled([
                 invoke('open_accoding'), invoke('inspect_session'), invoke('list_exams'),
+                invoke('list_exams_with_finalization'),
                 invoke('open_exam', {exam_id: '00000000-0000-0000-0000-000000000010'})
             ]);
             window.gatedRequests = results.every(result => result.status === 'rejected')
                 && results[2].reason === 'preflight_blocked'
-                && results[3].reason === 'admission_unavailable';
+                && results[3].reason === 'preflight_blocked'
+                && results[4].reason === 'admission_unavailable';
         })();
     ",
     )?;
@@ -498,9 +503,10 @@ fn check_deployment(data_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn start_monitor(
     requests: Arc<AtomicUsize>,
     exam_identity: Option<&Path>,
+    restoring: bool,
 ) -> io::Result<(Monitor, Option<exams::Fixture>)> {
     let exam_smoke = exam_identity.is_some();
-    let auth = Arc::new(exams::Auth::new());
+    let auth = Arc::new(exams::Auth::new(restoring));
     let http_auth = auth.clone();
     let router = Router::new().route(
         "/api/exams",
@@ -512,7 +518,7 @@ fn start_monitor(
                 if exam_smoke {
                     auth.enrollment(&headers)
                 } else {
-                    exam_list(&headers, false)
+                    exam_list(&headers, false, false)
                 }
             }
         }),
@@ -654,7 +660,7 @@ fn fixture_relogin(mode: &str) -> Response {
     ([(header::SET_COOKIE, cookie)], Html(page)).into_response()
 }
 
-fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
+fn exam_list(headers: &HeaderMap, include_second_exam: bool, restoring: bool) -> Response {
     let cookie = headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -691,7 +697,9 @@ fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
     };
     let mut items = vec![];
     if enrolled {
-        let phase = if include_second_exam {
+        let phase = if restoring {
+            ExamPhase::Ended
+        } else if include_second_exam {
             ExamPhase::Running
         } else {
             ExamPhase::Scheduled
@@ -705,7 +713,7 @@ fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
             ));
             items.push(
                 ExamSummary::new(
-                    Uuid::from_u128(0x30),
+                    exams::ENDED,
                     "Ended fixture exam".into(),
                     start_at,
                     end_at,
@@ -713,6 +721,13 @@ fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
                 )
                 .unwrap(),
             );
+            if restoring {
+                items.push(summary(
+                    Uuid::from_u128(0x31),
+                    "No journal fixture exam",
+                    ExamPhase::Ended,
+                ));
+            }
         }
     }
     Json(ExamListResponse {
@@ -839,9 +854,10 @@ async fn check_blocked_preflight(
             invoke('open_accoding'),
             invoke('inspect_session'),
             invoke('list_exams'),
+            invoke('list_exams_with_finalization'),
             invoke('open_exam', { exam_id: '00000000-0000-0000-0000-000000000010' }),
           ]);
-          const denied = ['设备检查通过后才能继续。', '设备检查通过后才能继续。', 'preflight_blocked', 'preflight_blocked'];
+          const denied = ['设备检查通过后才能继续。', '设备检查通过后才能继续。', 'preflight_blocked', 'preflight_blocked', 'preflight_blocked'];
           window.blockedCommands = results.every(
             (result, index) => result.status === 'rejected' && result.reason === denied[index]
           ) ? 'rejected' : 'unexpected';
@@ -1085,6 +1101,7 @@ async fn check_ipc(ui: &WebviewWindow, oj: &WebviewWindow) -> Result<(), Error> 
                 invoke("authorize_macos_egress"),
                 invoke("inspect_session"),
                 invoke("list_exams"),
+                invoke("list_exams_with_finalization"),
                 invoke("open_exam", { exam_id: "00000000-0000-0000-0000-000000000010" }),
                 invoke("get_exam_status"),
                 invoke("close_exam"),
