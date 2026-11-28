@@ -143,11 +143,8 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
             let (monitor, exam_connections) = if case.pauses_install() {
                 (Monitor::new(None), None)
             } else {
-                let (monitor, connections) = start_monitor(
-                    requests.clone(),
-                    exam_identity.as_deref(),
-                    case == Case::RestoredRecording,
-                )?;
+                let (monitor, connections) =
+                    start_monitor(case, requests.clone(), exam_identity.as_deref())?;
                 (Ok(monitor), connections)
             };
             let base = Url::parse(&format!("http://{fixture}/"))?;
@@ -501,12 +498,12 @@ fn check_deployment(data_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn start_monitor(
+    case: Case,
     requests: Arc<AtomicUsize>,
     exam_identity: Option<&Path>,
-    restoring: bool,
 ) -> io::Result<(Monitor, Option<exams::Fixture>)> {
     let exam_smoke = exam_identity.is_some();
-    let auth = Arc::new(exams::Auth::new(restoring));
+    let auth = Arc::new(exams::Auth::new(case == Case::RestoredRecording));
     let http_auth = auth.clone();
     let router = Router::new().route(
         "/api/exams",

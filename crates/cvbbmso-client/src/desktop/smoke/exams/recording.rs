@@ -4,7 +4,7 @@ use std::{
     fmt::Write as _,
     fs::{self, File},
     io::{BufReader, Read},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use cvbbmso_protocol::{ExecutionState, RecordingSummary, SegmentMeta, Sha256Digest};
@@ -26,21 +26,7 @@ pub(super) async fn exercise(
     mut fixture: Fixture,
     capture_display: bool,
 ) -> Result<oneshot::Receiver<()>, Error> {
-    let data_dir = app.state::<Desktop>().data_dir.clone();
-    let recording_dir = data_dir
-        .join("exams")
-        .join(FIRST.to_string())
-        .join(FIXTURE_USER_ID.to_string())
-        .join("recording");
-    if !capture_display {
-        seed_recording(&recording_dir)?;
-        seed_journal(&data_dir, FIRST, "recording", "capturing")?;
-        seed_journal(&data_dir, ENDED, "finished", "failed")?;
-    }
-    let oj = open_enrolled_fixture(app, ui, !capture_display).await?;
-    if !capture_display {
-        check_recovery_account(ui, &oj).await?;
-    }
+    let recording_dir = open_recording_fixture(app, ui, capture_display).await?;
     ui.set_focus()?;
     ui.eval("document.querySelector('.open-exam').click()")?;
     let mut connection = connection(&mut fixture.incoming, FIRST).await?;
@@ -136,6 +122,29 @@ pub(super) async fn exercise(
     }
     println!("Desktop recording sealed and hashed real files; the end ACK completed the exam.");
     Ok(connection.closed)
+}
+
+async fn open_recording_fixture(
+    app: &AppHandle,
+    ui: &WebviewWindow,
+    capture_display: bool,
+) -> Result<PathBuf, Error> {
+    let data_dir = app.state::<Desktop>().data_dir.clone();
+    let recording_dir = data_dir
+        .join("exams")
+        .join(FIRST.to_string())
+        .join(FIXTURE_USER_ID.to_string())
+        .join("recording");
+    if !capture_display {
+        seed_recording(&recording_dir)?;
+        seed_journal(&data_dir, FIRST, "recording", "capturing")?;
+        seed_journal(&data_dir, ENDED, "finished", "failed")?;
+    }
+    let oj = open_enrolled_fixture(app, ui, !capture_display).await?;
+    if !capture_display {
+        check_recovery_account(ui, &oj).await?;
+    }
+    Ok(recording_dir)
 }
 
 fn seed_journal(root: &Path, exam_id: Uuid, execution: &str, recording: &str) -> io::Result<()> {
