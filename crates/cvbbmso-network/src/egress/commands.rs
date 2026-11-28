@@ -275,7 +275,7 @@ fn finish_child(
     }
 }
 
-fn observe_exit(pid: u32) -> std::io::Result<Option<()>> {
+pub(super) fn observe_exit(pid: u32) -> std::io::Result<Option<()>> {
     // SAFETY: the siginfo buffer is valid. With WNOHANG a zero PID means
     // there was no event. WNOWAIT observes without releasing the child's PID.
     unsafe {

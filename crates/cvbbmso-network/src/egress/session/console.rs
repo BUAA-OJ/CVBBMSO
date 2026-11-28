@@ -19,7 +19,7 @@ use tokio::process::Child;
 use tokio::time::sleep;
 
 use crate::NetworkError;
-use crate::egress::commands::{REAP_TIMEOUT, poll_until};
+use crate::egress::commands::{REAP_TIMEOUT, observe_exit, poll_until};
 use crate::egress::state;
 
 use super::HELPER;
@@ -156,15 +156,7 @@ pub(super) async fn spawn(uid: libc::uid_t) -> Result<(Child, Process), NetworkE
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|_| NetworkError::MacosServiceUnavailable)?;
-    let identity = read_launch_identity(&mut child).await?;
-    // The PID report precedes exec. The authorization handoff must wait
-    // until the kernel identifies that same process as the installed App.
-    while !identity.is_app() {
-        tokio::select! {
-            _ = child.wait() => return Err(NetworkError::MacosServiceUnavailable),
-            () = sleep(Duration::from_millis(25)) => {}
-        }
-    }
+    let identity = await_app(&mut child, Process::is_app).await?;
     Ok((child, identity))
 }
 
@@ -188,7 +180,11 @@ impl Drop for PendingLaunch<'_> {
     }
 }
 
-async fn read_launch_identity(child: &mut Child) -> Result<Process, NetworkError> {
+async fn await_app(
+    child: &mut Child,
+    is_app: impl Fn(&Process) -> bool,
+) -> Result<Process, NetworkError> {
+    let launcher = child.id();
     let output = child.stdout.take();
     let mut pending = PendingLaunch(Some(child));
     let mut output = output.ok_or(NetworkError::Platform)?;
@@ -209,8 +205,18 @@ async fn read_launch_identity(child: &mut Child) -> Result<Process, NetworkError
     if identity.pid <= 1 || identity.started == 0 {
         return Err(NetworkError::MacosServiceUnavailable);
     }
-    // The protected launch command reports only after dropping privileges.
-    // The GUI process may now be waiting for recording permission.
+    let launcher = launcher.ok_or(NetworkError::MacosServiceUnavailable)?;
+    // Identity is reported before exec. Keep ownership until the kernel
+    // sees the App and observe launcher exit without releasing its group ID.
+    while !is_app(&identity) {
+        if observe_exit(launcher)
+            .map_err(|_| NetworkError::MacosServiceUnavailable)?
+            .is_some()
+        {
+            return Err(NetworkError::MacosServiceUnavailable);
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
     pending.0 = None;
     Ok(identity)
 }
@@ -263,6 +269,7 @@ pub(super) fn exec_app(expected_uid: libc::uid_t) -> Result<(), NetworkError> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::sync::Notify;
     use tokio::time::timeout;
 
     #[tokio::test]
@@ -275,12 +282,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_before_identity_terminates_the_group_and_reaps_the_launcher() {
+    async fn cancellation_before_app_exec_terminates_the_group_and_reaps_the_launcher() {
         // SAFETY: geteuid has no preconditions. The shell and its child are
         // stand-ins and must run only under an ordinary user.
         assert_ne!(unsafe { libc::geteuid() }, 0);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("report");
+        let valid_identity = [
+            2_i32.to_be_bytes().as_slice(),
+            1_u64.to_be_bytes().as_slice(),
+            0_u64.to_be_bytes().as_slice(),
+        ]
+        .concat();
+        for report in [b"".as_slice(), &valid_identity] {
+            std::fs::write(&path, report).unwrap();
+            cancel_launcher(&path, !report.is_empty()).await;
+        }
+    }
+
+    async fn cancel_launcher(report: &Path, wait_for_identity: bool) {
         let mut child = tokio::process::Command::new("/bin/sh")
-            .args(["-c", "/bin/sleep 30 & printf 'started\\n' >&2; wait"])
+            .args([
+                "-c",
+                "/bin/sleep 30 & printf 'started\\n' >&2; /bin/cat \"$1\"; wait",
+                "sh",
+            ])
+            .arg(report)
             .process_group(0)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -289,12 +316,19 @@ mod tests {
         let pid = libc::pid_t::try_from(child.id().unwrap()).unwrap();
         let mut stderr = BufReader::new(child.stderr.take().unwrap());
         let mut marker = String::new();
+        let identity_read = Notify::new();
         tokio::select! {
             biased;
-            report = read_launch_identity(&mut child) => panic!("unexpected report: {report:?}"),
-            ready = timeout(Duration::from_secs(5), stderr.read_line(&mut marker)) => {
-                ready.unwrap().unwrap();
-            }
+            result = await_app(&mut child, |_| {
+                identity_read.notify_one();
+                false
+            }) => panic!("unexpected App result: {result:?}"),
+            ready = timeout(Duration::from_secs(5), async {
+                stderr.read_line(&mut marker).await.unwrap();
+                if wait_for_identity {
+                    identity_read.notified().await;
+                }
+            }) => ready.unwrap(),
         }
         assert_eq!(marker, "started\n");
         // SAFETY: test owns the spawned PID. No status output is needed.
