@@ -77,12 +77,8 @@ impl Session {
                 .write_all(&message)
                 .await
                 .map_err(|_| unavailable())?;
-            match socket.read_u8().await.map_err(|_| unavailable())? {
-                READY => Ok(socket),
-                POLICY => Err(NetworkError::Policy),
-                ERROR => Err(NetworkError::Platform),
-                _ => Err(unavailable()),
-            }
+            read_welcome(&mut socket).await?;
+            Ok(socket)
         })
         .await?;
         let (sender, requests) = mpsc::channel(1);
@@ -114,6 +110,15 @@ impl Session {
         })
         .await
         .map_err(|_| unavailable())?
+    }
+}
+
+async fn read_welcome(stream: &mut UnixStream) -> Result<(), NetworkError> {
+    match stream.read_u8().await.map_err(|_| unavailable())? {
+        READY => Ok(()),
+        POLICY => Err(NetworkError::Policy),
+        // A rejected initial PF verification ends this helper session.
+        _ => Err(unavailable()),
     }
 }
 
@@ -587,7 +592,12 @@ mod tests {
                 .unwrap();
             client.write_all(payload).await.unwrap();
             let result = welcome(&mut root, b"policy", std::future::ready(verified)).await;
-            assert_eq!(client.read_u8().await.unwrap(), response);
+            let expected = match response {
+                READY => Ok(()),
+                POLICY => Err(NetworkError::Policy),
+                _ => Err(unavailable()),
+            };
+            assert_eq!(read_welcome(&mut client).await, expected);
             assert_eq!(result.is_ok(), response == READY);
         }
     }

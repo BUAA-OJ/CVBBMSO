@@ -44,6 +44,16 @@ pub(in crate::desktop) fn check_startup_network_recovery() {
         Failure::MonitorUnconfigured.before_guard(true),
         Failure::MonitorUnconfigured
     );
+    let rejected = Status::Blocked(super::install_failure(
+        NetworkError::MacosServiceUnavailable,
+    ));
+    assert!(!rejected.can_start(true));
+    assert!(
+        rejected
+            .require_ready()
+            .unwrap_err()
+            .contains("从「应用程序」重新打开")
+    );
     println!("macOS startup network recovery checks passed.");
 }
 
