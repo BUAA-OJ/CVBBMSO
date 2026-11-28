@@ -8,8 +8,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
-      - 'crates/cvbbmso-client/**'
-      - 'crates/cvbbmso-network/**'
+      - 'crates/**'
       - 'deploy/macos-egress/**'
       - 'docs/deployment/macos-client.md'
   workflow_dispatch:
