@@ -122,6 +122,22 @@ pub struct Event {
     pub received_at: OffsetDateTime,
 }
 
+/// Selects the latest events or an older page.
+#[derive(Debug, Deserialize)]
+pub struct EventPageQuery {
+    /// Optional exclusive upper bound on the event sequence.
+    pub before: Option<i64>,
+}
+
+/// A page of reliable events, newest sequence first.
+#[derive(Debug, Serialize)]
+pub struct EventPage {
+    /// Up to 20 events.
+    pub items: Vec<Event>,
+    /// Decimal sequence cursor for the next older page, or null at the end.
+    pub next_before: Option<String>,
+}
+
 /// Error body for a rejected admin API operation.
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {

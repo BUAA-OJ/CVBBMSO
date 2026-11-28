@@ -6,7 +6,7 @@ use cvbbmso_protocol::{
 };
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, EntityTrait, QueryFilter,
-    QueryOrder, QueryTrait, Set,
+    QueryOrder, QuerySelect, QueryTrait, Set,
     sea_query::{Expr, OnConflict, Query},
 };
 use serde::{Serialize, Serializer};
@@ -19,6 +19,8 @@ use crate::{
     entity::{audit as stored_audit, enrollment, event, exam, incident, runtime},
     events as stored_events, exam as exam_service,
 };
+
+const EVENT_PAGE_SIZE: usize = 20;
 
 /// A management operation to perform against the shared exam database.
 #[derive(Debug, Clone, Serialize)]
@@ -90,6 +92,15 @@ pub enum AdminOperation {
         /// The participant's Accoding user ID.
         oj_user_id: i64,
     },
+    /// Reads the latest page or a page strictly before a sequence.
+    EventsPage {
+        /// The ID of the exam.
+        exam_id: Uuid,
+        /// The participant's Accoding user ID.
+        oj_user_id: i64,
+        /// Optional exclusive upper bound on event sequence.
+        before: Option<i64>,
+    },
     /// Lists incidents using optional student, kind and inclusive time filters.
     IncidentsList {
         /// The ID of the exam.
@@ -152,6 +163,13 @@ pub enum AdminOutput {
     Student(StudentRuntime),
     /// A student's persisted reliable events.
     Events(Vec<EventRecord>),
+    /// A bounded page of events in descending sequence order.
+    EventPage {
+        /// The events in this page.
+        items: Vec<EventRecord>,
+        /// The exclusive bound for the next older page, if any.
+        next_before: Option<i64>,
+    },
     /// The matching incidents in occurrence order.
     Incidents(Vec<IncidentRecord>),
     /// A single incident record.
@@ -456,7 +474,18 @@ async fn query(
             oj_user_id,
         } => {
             let key = StudentKey::new(exam_id, oj_user_id)?;
-            events(tx, &key).await
+            events(tx, &key, EventOrder::Ascending).await
+        }
+        AdminOperation::EventsPage {
+            exam_id,
+            oj_user_id,
+            before,
+        } => {
+            if before.is_some_and(|seq| seq <= 0) {
+                return Err(DomainError::InvalidInput);
+            }
+            let key = StudentKey::new(exam_id, oj_user_id)?;
+            events(tx, &key, EventOrder::Page { before }).await
         }
         AdminOperation::IncidentsList {
             exam_id,
@@ -538,14 +567,38 @@ impl TryFrom<Runtime> for StudentRuntime {
     }
 }
 
-async fn events(tx: &DatabaseTransaction, key: &StudentKey) -> Result<AdminOutput, DomainError> {
+#[derive(Clone, Copy)]
+enum EventOrder {
+    Ascending,
+    Page { before: Option<i64> },
+}
+
+async fn events(
+    tx: &DatabaseTransaction,
+    key: &StudentKey,
+    order: EventOrder,
+) -> Result<AdminOutput, DomainError> {
     Runtime::get(tx, key).await?;
-    let events = event::Entity::find()
+    let query = event::Entity::find()
         .filter(event::Column::ExamId.eq(key.exam.as_str()))
-        .filter(event::Column::OjUserId.eq(key.user))
-        .order_by_asc(event::Column::Seq)
-        .all(tx)
-        .await?
+        .filter(event::Column::OjUserId.eq(key.user));
+    let query = match order {
+        EventOrder::Ascending => query.order_by_asc(event::Column::Seq),
+        EventOrder::Page { before } => query
+            .apply_if(before, |query, before| {
+                query.filter(event::Column::Seq.lt(before))
+            })
+            .order_by_desc(event::Column::Seq)
+            .limit(EVENT_PAGE_SIZE as u64 + 1),
+    };
+    let mut rows = query.all(tx).await?;
+    let next_before = if matches!(order, EventOrder::Page { .. }) && rows.len() > EVENT_PAGE_SIZE {
+        rows.truncate(EVENT_PAGE_SIZE);
+        rows.last().map(|row| row.seq)
+    } else {
+        None
+    };
+    let items = rows
         .into_iter()
         .map(|row| -> Result<_, DomainError> {
             Ok(EventRecord {
@@ -557,7 +610,10 @@ async fn events(tx: &DatabaseTransaction, key: &StudentKey) -> Result<AdminOutpu
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(AdminOutput::Events(events))
+    Ok(match order {
+        EventOrder::Ascending => AdminOutput::Events(items),
+        EventOrder::Page { .. } => AdminOutput::EventPage { items, next_before },
+    })
 }
 
 impl TryFrom<incident::Model> for IncidentRecord {

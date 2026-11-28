@@ -69,7 +69,17 @@
           <button type="button" id="refresh-evidence">刷新</button>
         </div>
         <h3>异常记录</h3><ul id="incidents" class="records"></ul>
-        <h3>可靠事件</h3><ul id="events" class="records"></ul>
+        <div class="section-heading event-heading">
+          <h3>可靠事件</h3>
+          <span id="event-refresh-status" class="muted"></span>
+        </div>
+        <div id="event-pagination" class="event-pagination" role="group" aria-label="可靠事件分页" hidden>
+          <button type="button" id="event-latest">回到最新</button>
+          <button type="button" id="event-newer">上一页</button>
+          <span id="event-page-number" aria-live="polite"></span>
+          <button type="button" id="event-older">下一页</button>
+        </div>
+        <ul id="events" class="records"></ul>
         <h3>录像摘要</h3><p id="recording" class="muted"></p>
       </section>
     </div>

@@ -15,6 +15,7 @@ const errorMessages = {
 let session = null;
 let selection = null;
 let evidenceRequest = null;
+let eventState = null;
 let view = "exams";
 
 function node(tag, text) {
@@ -213,6 +214,9 @@ async function refreshRoster(force = false) {
 }
 
 function clearEvidence(message) {
+  eventState = null;
+  element("event-pagination").hidden = true;
+  element("event-refresh-status").textContent = "";
   element("incidents").replaceChildren(node("li", message));
   element("events").replaceChildren(node("li", message));
   element("recording").textContent = message;
@@ -227,28 +231,86 @@ async function loadEvidence() {
   const query = id ? `?oj_user_id=${id}` : "";
   const studentPath = `/exams/${current.id}/students/${id}`;
   clearEvidence("正在加载…");
+  if (id) {
+    eventState = { path: `${studentPath}/events`, cursors: [null], next: null };
+    loadEventPage();
+  } else {
+    element("events").replaceChildren(node("li", "选择一位考生以查看事件"));
+  }
   try {
-    const [incidents, events, recording] = await Promise.all([
+    const [incidents, recording] = await Promise.all([
       request(`/exams/${current.id}/incidents${query}`),
-      id ? request(`${studentPath}/events`) : [],
       id ? request(`${studentPath}/recording`, { allowMissing: true }) : null,
     ]);
     if (current !== selection || marker !== evidenceRequest) return;
     element("incidents").replaceChildren(...(incidents.length ? incidents.map((item) => node("li",
       `${formatTime(item.occurred_at)} · ${item.oj_user_id} · ${item.source === "server" ? "服务端" : "客户端"} · ${item.kind}${item.detail ? ` · ${item.detail}` : ""}`
     )) : [node("li", "暂无异常记录")]));
-    element("events").replaceChildren(...(events.length ? events.map((item) => {
-      const entry = node("li", `#${item.seq} · ${formatTime(item.received_at)}`);
-      const details = node("details");
-      details.append(node("summary", item.event.kind), node("pre", JSON.stringify(item.event, null, 2)));
-      entry.append(details);
-      return entry;
-    }) : [node("li", id ? "暂无上报事件" : "选择一位考生以查看事件")]));
     element("recording").textContent = recording ? `${recording.segment_count} 个分片 · SHA-256：${recording.merged_sha256}` : id ? "暂无录像摘要" : "选择一位考生以查看录像摘要";
   } catch (error) {
     if (current !== selection || marker !== evidenceRequest) return;
-    clearEvidence("读取失败，可点击刷新重试");
+    element("incidents").replaceChildren(node("li", "读取失败，可点击刷新重试"));
+    element("recording").textContent = "读取失败，可点击刷新重试";
     report(error);
+  }
+}
+
+function renderEventControls(state, message) {
+  const page = state.cursors.length;
+  element("event-pagination").hidden = !state.loaded;
+  element("event-page-number").textContent = `第 ${page} 页`;
+  element("event-latest").disabled = page === 1 || state.navigating;
+  element("event-newer").disabled = page === 1 || state.navigating;
+  element("event-older").disabled = !state.next || state.navigating;
+  element("event-refresh-status").textContent = message;
+}
+
+function renderEvents(items) {
+  const list = element("events");
+  const existing = new Map([...list.children].map((entry) => [entry.dataset.seq, entry]));
+  const entries = items.map((item) => {
+    if (existing.has(item.seq)) return existing.get(item.seq);
+    const entry = node("li", `#${item.seq} · ${formatTime(item.received_at)}`);
+    entry.dataset.seq = item.seq;
+    const details = node("details");
+    details.append(node("summary", item.event.kind), node("pre", JSON.stringify(item.event, null, 2)));
+    entry.append(details);
+    return entry;
+  });
+  if (!entries.length) entries.push(node("li", "暂无上报事件"));
+  if (entries.length !== list.children.length || entries.some((entry, index) => entry !== list.children[index])) {
+    list.replaceChildren(...entries);
+  }
+}
+
+async function loadEventPage(cursors, automatic = false) {
+  const state = eventState;
+  if (!state || state.navigating || (automatic && state.pending)) return;
+  const target = cursors ?? state.cursors;
+  const before = target.at(-1);
+  const marker = {};
+  state.pending = marker;
+  state.navigating = !automatic;
+  const status = before ? "历史页 · 不自动刷新" : "最新事件在上 · 每 5 秒刷新";
+  if (!automatic) renderEventControls(state, "正在加载事件…");
+  let message = status;
+  try {
+    const page = await request(state.path + (before ? `?before=${before}` : ""));
+    if (state !== eventState || marker !== state.pending) return;
+    renderEvents(page.items);
+    state.cursors = target;
+    state.next = page.next_before;
+    state.loaded = true;
+  } catch (error) {
+    if (state !== eventState || marker !== state.pending) return;
+    message = state.loaded ? "刷新失败 · 保留上次结果" : "读取失败 · 可点击刷新重试";
+    if (!state.loaded) element("events").replaceChildren(node("li", message));
+  } finally {
+    if (state === eventState && marker === state.pending) {
+      state.pending = null;
+      state.navigating = false;
+      renderEventControls(state, message);
+    }
   }
 }
 
@@ -325,6 +387,9 @@ element("logout").addEventListener("click", resetSession);
 element("exam-select").addEventListener("change", chooseExam);
 element("student-select").addEventListener("change", loadEvidence);
 element("refresh-evidence").addEventListener("click", loadEvidence);
+element("event-latest").addEventListener("click", () => loadEventPage([null]));
+element("event-newer").addEventListener("click", () => loadEventPage(eventState.cursors.slice(0, -1)));
+element("event-older").addEventListener("click", () => loadEventPage([...eventState.cursors, eventState.next]));
 for (const button of document.querySelectorAll("[data-view]")) {
   button.addEventListener("click", () => {
     selectView(button.dataset.view);
@@ -332,5 +397,7 @@ for (const button of document.querySelectorAll("[data-view]")) {
   });
 }
 setInterval(() => {
-  if (!document.hidden && selection) refreshRoster().catch(report);
+  if (document.hidden) return;
+  if (selection) refreshRoster().catch(report);
+  if (view === "evidence" && eventState?.cursors.length === 1) loadEventPage(undefined, true);
 }, 5000);

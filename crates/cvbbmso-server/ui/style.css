@@ -37,6 +37,10 @@ th, td { border-bottom: 1px solid #dce5f1; padding: .55rem .65rem; }
 .enrollments { max-height: 15rem; overflow: auto; }
 .enrollments li { display: flex; justify-content: space-between; align-items: center; gap: .5rem; padding: .3rem 0; }
 .records li { padding: .45rem 0; border-bottom: 1px solid #dce5f1; }
+.event-heading { margin-top: 1.25rem; }
+.event-heading h3 { margin-top: 0; }
+.event-pagination { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .35rem 0; }
+.event-pagination span { padding: 0 .35rem; }
 pre, #recording { overflow-wrap: anywhere; white-space: pre-wrap; }
 @media (max-width: 48rem) { .grid { grid-template-columns: 1fr; } }
 @media (max-width: 27rem) { .fields { grid-template-columns: 1fr; } }

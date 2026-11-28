@@ -209,6 +209,7 @@ pub enum AdminOperation {
     StudentsStatus { exam_id: Uuid },
     StudentsShow { exam_id: Uuid, oj_user_id: i64 },
     EventsList { exam_id: Uuid, oj_user_id: i64 },
+    EventsPage { exam_id: Uuid, oj_user_id: i64, before: Option<i64> },
     IncidentsList {
         exam_id: Uuid,
         oj_user_id: Option<i64>,
@@ -273,7 +274,9 @@ pub struct IncidentRecord {
 
 `actor` 由调用方提供：控制面板使用 `control_panel`，CLI 设计默认使用当前操作系统用户名。审计记录包含整数 `audit_id`、`actor`、序列化的操作类型与参数，以及 `occurred_at`；创建考试的审计包含生成的 `exam_id`。`AdminOperation` 的输入先经过域层校验：`start_at < end_at`，`RecordingPolicy` 参数大于零，`oj_user_id` 为正整数，批量导入去重。报名只能在 `now < start_at` 时撤销，时间检查与删除在同一事务内完成。错误以 `DomainError` 返回，由 server 或 CLI 映射为对外错误。
 
-`RecordingsShow` 在录像状态为 `complete` 时从 `recording_finalized` 事件读取 `RecordingSummary`。尚未 finalize、finalize 失败或没有摘要事件时返回 `NotFound`。已单独上报的分片明细通过 `EventsList` 查询。
+`EventsList` 保留序号升序的全量读取。HTTP 面板使用 `EventsPage`，按序号降序从数据库取最多 20 条，返回 `AdminOutput::EventPage { items, next_before }`；`before` 为可选的排他上界。
+
+`RecordingsShow` 在录像状态为 `complete` 时从 `recording_finalized` 事件读取 `RecordingSummary`。尚未 finalize、finalize 失败或没有摘要事件时返回 `NotFound`。已单独上报的分片明细可通过事件查询读取。
 
 ## 数据所有权
 
