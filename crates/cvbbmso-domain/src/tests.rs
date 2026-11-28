@@ -1076,7 +1076,7 @@ async fn migrations_create_the_final_tables() {
             .await
             .unwrap()
             .len(),
-        2
+        3
     );
     let tables = database
         .query_all_raw(Statement::from_string(
@@ -1098,6 +1098,38 @@ async fn migrations_create_the_final_tables() {
         "seaql_migrations",
         "student_runtimes",
     ]));
+}
+
+#[tokio::test]
+async fn event_write_id_migration_preserves_existing_evidence() {
+    use migration::{Migrator, MigratorTrait};
+
+    let fixture = Fixture::memory().await;
+    fixture.connect(ready()).await;
+    fixture.receive(incident_event(1, time(START))).await;
+    let database = fixture.service.admin().0.writer;
+    Migrator::down(&database, Some(1)).await.unwrap();
+    Migrator::up(&database, Some(1)).await.unwrap();
+
+    fixture.receive(incident_event(2, time(START))).await;
+    let AdminOutput::EventPage {
+        items, snapshot, ..
+    } = fixture
+        .admin(AdminOperation::EventsPage {
+            exam_id: fixture.exam,
+            oj_user_id: USER,
+            before: None,
+            snapshot: None,
+        })
+        .await
+    else {
+        panic!("expected event page");
+    };
+    assert_eq!(
+        items.iter().map(|item| item.seq).collect::<Vec<_>>(),
+        [2, 1]
+    );
+    assert_eq!(snapshot, 2);
 }
 
 #[tokio::test]

@@ -78,12 +78,14 @@ cargo run --locked -p cvbbmso-server -- --listen-addr 127.0.0.1:8080 --database-
 | `POST` | `/exams/{exam_id}/participants` | `200 ImportedParticipants`，请求为 `ImportParticipants` |
 | `DELETE` | `/exams/{exam_id}/participants/{oj_user_id}` | `204`，只允许在开考前撤销 |
 | `GET` | `/exams/{exam_id}/incidents` | `200 Incident[]`，支持 `?oj_user_id=...` |
-| `GET` | `/exams/{exam_id}/students/{oj_user_id}/events` | `200 Event[]`，按序号升序 |
+| `GET` | `/exams/{exam_id}/students/{oj_user_id}/events` | `200 EventPage`，按序号降序，每页最多 20 条 |
 | `GET` | `/exams/{exam_id}/students/{oj_user_id}/recording` | `200 RecordingSummary`，无摘要时返回 `404` |
 
 管理载荷由 `cvbbmso_protocol::admin` 定义。创建考试的标题去掉首尾空白后为 1–120 个字符，起止时间使用带时区的 RFC 3339，`policy` 使用现有 `RecordingPolicy`。报名导入支持逐个或批量提交，单次为 1–1,000 个正 `i64` 用户 ID，使用 `{"oj_user_ids":["12345"]}`；重复报名忽略，响应 `count` 仅统计新增。管理 JSON 请求体上限为 64 KiB。JSON 中的考生 ID 和事件序号用十进制字符串传输，避免浏览器损失 64 位整数精度。
 
-名单合并当前报名和运行记录；`runtime: null` 代表从未连接，`runtime.connected: false` 代表有历史记录但当前离线，`enrolled: false` 代表报名已撤销但仍有运行记录。面板可见时每 5 秒轮询考生状态，异常与事件按需查询。首版历史查询未分页，不提供录像上传、下载或播放。
+名单合并当前报名和运行记录；`runtime: null` 代表从未连接，`runtime.connected: false` 代表有历史记录但当前离线，`enrolled: false` 代表报名已撤销但仍有运行记录。面板可见时每 5 秒轮询考生状态。可靠事件的最新页同样每 5 秒刷新，仅在浏览器页面可见且打开该考生的事件列表时轮询；历史页不自动刷新。异常和录像摘要仍按需查询，不提供录像上传、下载或播放。
+
+事件响应为 `{"items":[...],"next_before":"21","snapshot":"108"}`，没有更早事件时 `next_before` 为 `null`。默认取最新页并生成新快照；翻页须同时传入同一响应的 `before` 和 `snapshot`，例如 `?before=21&snapshot=108`。这样乱序补报不会改变已打开的历史页。手动刷新保留当前历史页和快照，回到最新后才重新查询新快照。自动刷新若会移除正在展开或聚焦的事件，则推迟更新并提示；仍在列表内的行不重新挂载。
 
 管理业务错误返回 `{"code":"..."}`：`401 ADMIN_AUTH_REQUIRED`、`400 INVALID_INPUT`、`404 NOT_FOUND`、`409 CONFLICT`、`413 BODY_TOO_LARGE`、`415 JSON_REQUIRED`、`503 STORAGE_BUSY`、`500 INTERNAL_ERROR`。路径或查询参数无法解析时由 Axum 拒绝；考生端错误格式保持不变。
 

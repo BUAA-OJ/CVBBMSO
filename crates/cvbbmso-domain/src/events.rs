@@ -25,7 +25,8 @@ pub(crate) async fn receive(
         return Err(DomainError::InvalidInput);
     }
     let event = validated(event)?;
-    if let Some(existing) = stored_event::Entity::find_by_id((key.exam.clone(), key.user, seq))
+    if let Some(existing) = student_events(key)
+        .filter(stored_event::Column::Seq.eq(seq))
         .one(tx)
         .await?
     {
@@ -50,6 +51,7 @@ pub(crate) async fn receive(
     }
 
     stored_event::Entity::insert(stored_event::ActiveModel {
+        write_id: sea_orm::NotSet,
         exam_id: Set(key.exam.clone()),
         oj_user_id: Set(key.user),
         seq: Set(seq),

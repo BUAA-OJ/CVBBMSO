@@ -10,8 +10,8 @@ use axum::{
 };
 use cvbbmso_domain::{AdminOperation, AdminOutput, DomainError};
 use cvbbmso_protocol::admin::{
-    CreateExam, CreatedExam, ErrorResponse, Event, ExamDetail, ImportParticipants,
-    ImportedParticipants, Incident, IncidentFilter, RosterEntry, StudentStatus,
+    CreateExam, CreatedExam, ErrorResponse, Event, EventPage, EventPageQuery, ExamDetail,
+    ImportParticipants, ImportedParticipants, Incident, IncidentFilter, RosterEntry, StudentStatus,
 };
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
@@ -268,12 +268,16 @@ async fn incidents(
 async fn events(
     State(hub): State<Hub>,
     Path((exam_id, oj_user_id)): Path<(Uuid, i64)>,
+    query: Result<Query<EventPageQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Response, AdminError> {
+    let Query(query) = query.map_err(|_| AdminError::INVALID)?;
     execute(
         &hub,
-        AdminOperation::EventsList {
+        AdminOperation::EventsPage {
             exam_id,
             oj_user_id,
+            before: query.before,
+            snapshot: query.snapshot,
         },
     )
     .await
@@ -371,16 +375,22 @@ async fn execute(hub: &Hub, operation: AdminOperation) -> Result<Response, Admin
                 .collect::<Vec<_>>(),
         )
         .into_response(),
-        AdminOutput::Events(items) => Json(
-            items
+        AdminOutput::EventPage {
+            items,
+            next_before,
+            snapshot,
+        } => Json(EventPage {
+            items: items
                 .into_iter()
                 .map(|item| Event {
                     seq: item.seq.to_string(),
                     event: item.event,
                     received_at: item.received_at,
                 })
-                .collect::<Vec<_>>(),
-        )
+                .collect(),
+            next_before: next_before.map(|seq| seq.to_string()),
+            snapshot: snapshot.to_string(),
+        })
         .into_response(),
         AdminOutput::Recording(summary) => Json(summary).into_response(),
         _ => return Err(AdminError::INTERNAL),
