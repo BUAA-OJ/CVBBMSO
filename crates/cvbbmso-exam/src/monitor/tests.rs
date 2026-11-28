@@ -1,4 +1,5 @@
 use cvbbmso_accoding::AccodingCookies;
+use cvbbmso_protocol::ExamPhase;
 use serde_json::json;
 use url::Url;
 use uuid::Uuid;
@@ -47,11 +48,14 @@ async fn monitor_answering(response: ResponseTemplate) -> (MockServer, Monitor) 
 }
 
 #[tokio::test]
-async fn enrollment_returns_the_user_id() {
+async fn enrollment_returns_the_user_id_and_exam_phase() {
     let (_server, monitor) =
         monitor_answering(ResponseTemplate::new(200).set_body_json(list(EXAM))).await;
 
-    assert_eq!(monitor.enrollment(&cookies(), EXAM).await.unwrap(), 42);
+    assert_eq!(
+        monitor.enrollment(&cookies(), EXAM).await.unwrap(),
+        (42, ExamPhase::Scheduled)
+    );
 }
 
 #[tokio::test]

@@ -35,6 +35,7 @@ use serde_json::{Value, json};
 
 pub(super) const FIRST: Uuid = Uuid::from_u128(0x10);
 pub(super) const SECOND: Uuid = Uuid::from_u128(0x20);
+pub(super) const ENDED: Uuid = Uuid::from_u128(0x30);
 const FIXTURE_SESSION: &str = "connect.sid=synthetic-v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,20 +62,24 @@ impl Candidate {
 }
 
 pub(super) struct Auth {
+    restoring: bool,
     expired: watch::Sender<bool>,
     stale_handshake: Notify,
     renewed_checks: AtomicUsize,
     other_checks: AtomicUsize,
+    other_verified: Notify,
     other_handshakes: AtomicUsize,
 }
 
 impl Auth {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(restoring: bool) -> Self {
         Self {
+            restoring,
             expired: watch::Sender::new(false),
             stale_handshake: Notify::new(),
             renewed_checks: AtomicUsize::new(0),
             other_checks: AtomicUsize::new(0),
+            other_verified: Notify::new(),
             other_handshakes: AtomicUsize::new(0),
         }
     }
@@ -91,10 +96,11 @@ impl Auth {
             }
             Some(Candidate::Other) => {
                 self.other_checks.fetch_add(1, Ordering::Relaxed);
+                self.other_verified.notify_one();
             }
             _ => {}
         }
-        exam_list(headers, true)
+        exam_list(headers, true, self.restoring)
     }
 }
 
@@ -193,7 +199,9 @@ async fn upgrade(
     let Some(candidate) = Candidate::from_headers(&headers) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    if !matches!(exam_id, FIRST | SECOND) || exam_list(&headers, true).status() != StatusCode::OK {
+    if !matches!(exam_id, FIRST | SECOND)
+        || exam_list(&headers, true, listener.auth.restoring).status() != StatusCode::OK
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     if candidate == Candidate::Initial && *listener.auth.expired.borrow() {
@@ -338,17 +346,14 @@ async fn open_enrolled_fixture(
     .await?;
     ui.eval(
         r"
+        window.originalExamClock = Date.now;
+        Date.now = () => window.originalExamClock() + 2 * 60 * 60 * 1000;
         window.examEvents = [];
         window.__TAURI__.event.listen('cvbbmso-status', ({ payload }) => window.examEvents.push(payload))
           .then(() => document.querySelector('#refresh-exams').click());
         ",
     )?;
-    wait_for(
-        ui,
-        "document.querySelectorAll('.open-exam').length === 3 && document.querySelectorAll('.open-exam:enabled').length === 2 && document.querySelector('#exams li:last-child .open-exam').disabled",
-        "enrolled exams",
-    )
-    .await?;
+    wait_for(ui, "document.querySelectorAll('.open-exam:enabled').length === 2 && document.querySelector('.exam-phase').textContent === '进行中' && !document.querySelector('#exams').textContent.includes('Ended fixture exam')", "server-confirmed exam phases with a fast local clock").await?;
 
     Ok(oj)
 }
@@ -377,10 +382,11 @@ pub(super) async fn exercise(
     first.outgoing.send(sync()).await?;
     wait_for(
         ui,
-        "document.querySelector('#current-exam-status').textContent.includes('已连接监考服务')",
-        "initial sync in the desktop UI",
+        "document.querySelector('#current-exam-status').textContent.includes('已连接监考服务') && [...document.querySelectorAll('.open-exam:disabled')].map(button => button.textContent).join(',') === '已进入,进入考试'",
+        "initial sync marking only the joined exam in the desktop UI",
     )
     .await?;
+    ui.eval("Date.now = window.originalExamClock; delete window.originalExamClock;")?;
     assert_eq!(
         evaluate(
             ui,
@@ -393,7 +399,7 @@ pub(super) async fn exercise(
     let previous = check_status_updates(ui, &mut first).await?;
 
     ui.eval("document.querySelector('#close-exam').click()")?;
-    wait_for(ui, "document.querySelector('#current-exam').hidden && !document.querySelector('.open-exam').disabled", "the closed exam UI").await?;
+    wait_for(ui, "document.querySelector('#current-exam').hidden && [...document.querySelectorAll('.open-exam:enabled')].every(button => button.textContent === '进入考试') && document.querySelectorAll('.open-exam:enabled').length === 2", "the closed exam UI restoring the entry buttons").await?;
     timeout(DEADLINE, first.closed).await??;
     probe(
         ui,
@@ -408,11 +414,11 @@ pub(super) async fn exercise(
     assert_eq!(
         evaluate(
             ui,
-            "document.querySelector('#exams li:last-child .open-exam').disabled"
+            "!document.querySelector('#exams').textContent.includes('Ended fixture exam')"
         )
         .await?,
         true,
-        "Refreshing session state must not enable an ended exam"
+        "Refreshing session state must keep ended exams hidden"
     );
 
     probe(
@@ -429,7 +435,7 @@ pub(super) async fn exercise(
     );
     wait_for(
         ui,
-        "document.querySelector('#current-exam-title').textContent === 'Second fixture exam'",
+        "document.querySelector('#current-exam-title').textContent === 'Second fixture exam' && [...document.querySelectorAll('.open-exam:disabled')].map(button => button.textContent).join(',') === '进入考试,已进入'",
         "a second exam after close",
     )
     .await?;
@@ -632,11 +638,13 @@ async fn check_status_updates(ui: &WebviewWindow, first: &mut Connection) -> Res
         .outgoing
         .send(ServerMessage::CommandAck { command_id })
         .await?;
-    wait_for(ui, "document.querySelector('#current-exam-status').textContent.includes('请等待监考老师指示') && !document.querySelector('#close-exam').disabled", "final ACK releasing the close restriction").await?;
+    wait_for(ui, "document.querySelector('#current-exam-status').textContent.includes('考试已结束') && document.querySelector('#current-exam-status').textContent.includes('录像收尾失败') && document.querySelector('#exam-session-feedback').textContent === '' && !document.querySelector('#close-exam').disabled", "final ACK updating the visible finish status and releasing the close restriction").await?;
     Ok(previous)
 }
 
 async fn check_pending_close(ui: &WebviewWindow) -> Result<(), Error> {
+    ui.eval("document.querySelector('#close-exam').click()")?;
+    wait_for(ui, "document.querySelector('#exam-session-feedback').textContent.includes('监考服务确认收尾后再退出') && !document.querySelector('#current-exam').hidden && !document.querySelector('#close-exam').disabled", "the exit button explaining why the exam remains open").await?;
     probe(
         ui,
         "Promise.allSettled([window.__TAURI__.core.invoke('close_exam'), window.__TAURI__.core.invoke('confirm_exit')])",

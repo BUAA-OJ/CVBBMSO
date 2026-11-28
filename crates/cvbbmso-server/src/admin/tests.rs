@@ -6,8 +6,8 @@ use axum::{
 };
 use cvbbmso_domain::{DisconnectReason, ExamService};
 use cvbbmso_protocol::{
-    ClientHello, ClientIncident, ClientMessage, ClientState, ExamEvent, ExecutionState,
-    IncidentCode, Platform, RecordingState,
+    AccodingUser, ClientHello, ClientIncident, ClientMessage, ClientState, ExamEvent,
+    ExecutionState, IncidentCode, Platform, RecordingState,
 };
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -165,7 +165,9 @@ async fn admin_routes_require_bearer_before_reading_or_mutating() {
             .contains("frame-ancestors 'none'")
     );
     let html = to_bytes(page.into_body(), 16_384).await.unwrap();
-    assert!(!String::from_utf8_lossy(&html).contains(TEST_ADMIN_TOKEN));
+    let html = String::from_utf8_lossy(&html);
+    assert!(html.contains("id=\"refresh-dashboard\""));
+    assert!(!html.contains(TEST_ADMIN_TOKEN));
 }
 
 #[tokio::test]
@@ -184,6 +186,116 @@ async fn trailing_slash_redirects_to_the_dashboard() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(response.headers()[header::LOCATION], "/admin");
+}
+
+#[tokio::test]
+async fn school_roster_import_deduplicates_and_preserves_leading_zeros() {
+    let fixture = Fixture::new().await;
+    let exam_id = fixture.create().await;
+    let path = format!("/exams/{exam_id}/student-enrollments");
+    assert_eq!(
+        fixture
+            .request(
+                Method::POST,
+                &path,
+                Some(json!({"student_numbers": ["0007", "7", "0007"]}))
+            )
+            .await,
+        (StatusCode::OK, json!({"count": 2}))
+    );
+    assert_eq!(
+        fixture
+            .request(
+                Method::POST,
+                &path,
+                Some(json!({"student_numbers": ["0007"]}))
+            )
+            .await,
+        (StatusCode::OK, json!({"count": 0}))
+    );
+    for bad in [
+        json!([17]),
+        json!(["17@buaa.edu.cn"]),
+        json!(["１２"]),
+        json!([]),
+    ] {
+        let (status, _) = fixture
+            .request(Method::POST, &path, Some(json!({"student_numbers": bad})))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(
+        fixture.request(Method::GET, &path, None).await,
+        (
+            StatusCode::OK,
+            json!([
+                {"student_number":"0007","oj_user_id":null,"enrolled":true},
+                {"student_number":"7","oj_user_id":null,"enrolled":true}
+            ])
+        )
+    );
+    assert_eq!(
+        fixture
+            .request(Method::DELETE, &format!("{path}/0007"), None)
+            .await,
+        (StatusCode::NO_CONTENT, Value::Null)
+    );
+    let (_, roster) = fixture.request(Method::GET, &path, None).await;
+    assert_eq!(roster[0]["enrolled"], false);
+    assert_eq!(roster[1]["enrolled"], true);
+}
+
+#[tokio::test]
+async fn labels_historical_evidence_only_on_the_authenticated_identity_route() {
+    let fixture = Fixture::new().await;
+    let exam_id = fixture.create().await;
+    let base = format!("/exams/{exam_id}");
+    let identities = format!("{base}/student-identities");
+    let id = LARGE_ID.to_string();
+    let (status, _) = fixture
+        .request(
+            Method::POST,
+            &format!("{base}/participants"),
+            Some(json!({"oj_user_ids": [id]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    fixture.connect(exam_id, LARGE_ID).await;
+    let (status, _) = fixture
+        .request(Method::DELETE, &format!("{base}/participants/{id}"), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        fixture.request(Method::GET, &identities, None).await,
+        (
+            StatusCode::OK,
+            json!([{"oj_user_id": id, "student_number": null, "nickname": null}])
+        )
+    );
+    let user = AccodingUser::new(LARGE_ID, "0007@buaa.edu.cn".into(), " 示例考生 ".into()).unwrap();
+    fixture
+        .exam
+        .remember_verified_profile(&user, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.request(Method::GET, &identities, None).await,
+        (
+            StatusCode::OK,
+            json!([{"oj_user_id": id, "student_number": "0007", "nickname": "示例考生"}])
+        )
+    );
+    let anonymous = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/admin{identities}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

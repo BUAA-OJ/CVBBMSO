@@ -33,7 +33,7 @@ async fn serve(config: ServerConfig, admin_token: Option<admin::Token>) -> Resul
 | `GET` | `/api/exams` | Accoding Cookie | `200 ExamListResponse` | 返回当前考生报名的考试 |
 | `GET` | `/api/exams/{exam_id}/ws` | Accoding Cookie | `101 WebSocket Upgrade` | 连接或重连指定考试 |
 
-`exam_id` 是 UUID。客户端在 `GET /api/exams` 和 WS Upgrade 时显式发送 `Cookie: connect.sid=...`，服务器调用 Accoding `/api/users/me` 复验，得到 `oj_user_id`，再按 `(exam_id, oj_user_id)` 检查报名及运行记录。业务标识为 `(exam_id, oj_user_id)`。
+`exam_id` 是 UUID。客户端在 `GET /api/exams` 和 WS Upgrade 时显式发送 `Cookie: connect.sid=...`。服务器向 Accoding `/api/users/me` 复验，使用返回的 `id` 和 `username` 检查资格。已验证的 `学号@buaa.edu.cn` 登录名按学号匹配名单。考试列表和 WebSocket 升级不写入绑定。首次有效 `hello` 在入场事务里将学号绑定到该考试的 Accoding ID，业务记录仍以 `(exam_id, oj_user_id)` 定位。
 
 错误响应为：
 
@@ -56,7 +56,7 @@ HTTP 与 WebSocket 拒绝日志同时记录协议错误码和经过脱敏的失�
 
 ## 管理控制面板
 
-`/admin` 提供同源页面，不依赖额外前端服务。管理员身份与考生 Cookie 独立；未设置 `CVBBMSO_ADMIN_TOKEN` 时不挂载页面和管理 API。令牌由服务端进程环境注入，格式为 32 字节随机值的小写十六进制表示；格式无效时拒绝启动。浏览器仅在当前页面内存保存令牌，显式发送 `Authorization: Bearer <token>`，不使用 Cookie、URL 参数或浏览器持久存储。退出或刷新后需重新输入。管理响应禁止缓存。
+`/admin` 提供同源页面，不依赖额外前端服务。管理员身份与考生 Cookie 独立；未设置 `CVBBMSO_ADMIN_TOKEN` 时不挂载页面和管理 API。令牌由服务端进程环境注入，格式为 32 字节随机值的小写十六进制表示；格式无效时拒绝启动。浏览器仅在当前页面内存保存令牌，显式发送 `Authorization: Bearer <token>`，不使用 Cookie、URL 参数或浏览器持久存储。页面内的「刷新」重新读取考试列表、当前考试及当前栏目的记录，保留令牌和仍有效的考试与考生筛选。退出或用浏览器重新加载整页后需要重新输入令牌。管理响应禁止缓存。
 
 生产环境应经 HTTPS 反向代理访问，并将 `/admin`、`/admin/` 下的资源和 `/api/admin/` 限制在管理网、VPN 或受信任代理之后；不要记录 `Authorization`。首版为单个共享管理员凭据，不区分个人和角色；写入领域审计的操作者为 `control_panel`。通过更新环境变量并重启服务轮换令牌。
 
@@ -75,21 +75,29 @@ cargo run --locked -p cvbbmso-server -- --listen-addr 127.0.0.1:8080 --database-
 | `POST` | `/exams` | `201 CreatedExam`，请求为 `CreateExam` |
 | `GET` | `/exams/{exam_id}` | `200 ExamDetail` |
 | `GET` | `/exams/{exam_id}/roster` | `200 RosterEntry[]`，按用户 ID 升序 |
+| `GET` | `/exams/{exam_id}/student-identities` | `200 StudentIdentity[]`，有运行记录的考生显示身份 |
 | `POST` | `/exams/{exam_id}/participants` | `200 ImportedParticipants`，请求为 `ImportParticipants` |
 | `DELETE` | `/exams/{exam_id}/participants/{oj_user_id}` | `204`，只允许在开考前撤销 |
+| `GET` | `/exams/{exam_id}/student-enrollments` | `200 StudentEnrollment[]`，包含学号、绑定的用户 ID 和报名状态 |
+| `POST` | `/exams/{exam_id}/student-enrollments` | `200 ImportedParticipants`，按学号批量报名 |
+| `DELETE` | `/exams/{exam_id}/student-enrollments/{student_number}` | `204`，考前撤销尚未绑定的学号 |
 | `GET` | `/exams/{exam_id}/incidents` | `200 Incident[]`，支持 `?oj_user_id=...` |
 | `GET` | `/exams/{exam_id}/students/{oj_user_id}/events` | `200 Event[]`，按序号升序 |
 | `GET` | `/exams/{exam_id}/students/{oj_user_id}/recording` | `200 RecordingSummary`，无摘要时返回 `404` |
 
-管理载荷由 `cvbbmso_protocol::admin` 定义。创建考试的标题去掉首尾空白后为 1–120 个字符，起止时间使用带时区的 RFC 3339，`policy` 使用现有 `RecordingPolicy`。报名导入支持逐个或批量提交，单次为 1–1,000 个正 `i64` 用户 ID，使用 `{"oj_user_ids":["12345"]}`；重复报名忽略，响应 `count` 仅统计新增。管理 JSON 请求体上限为 64 KiB。JSON 中的考生 ID 和事件序号用十进制字符串传输，避免浏览器损失 64 位整数精度。
+管理载荷由 `cvbbmso_protocol::admin` 定义。创建考试的标题去掉首尾空白后为 1–120 个字符，起止时间使用带时区的 RFC 3339，`policy` 使用现有 `RecordingPolicy`。控制面板提交 `{"student_numbers":["00001234"]}`，每批 1–1,000 项，逐项为 1–20 位 ASCII 数字字符串，保留前导零。数字 ID 管理接口仍接收 `{"oj_user_ids":["12345"]}`。重复导入已生效的报名会跳过，`count` 只统计本次新增或恢复的报名。管理 JSON 请求体上限为 64 KiB。JSON 中的考生 ID 和事件序号用十进制字符串传输，避免浏览器损失 64 位整数精度。
+
+学号在管理员查看名单后刚好完成绑定时，按学号撤销会返回 `409 CONFLICT`。面板立即刷新，管理员可再次撤销，更新后的操作按绑定的用户 ID 走现有的 Hub 撤销流程。未绑定学号和单独的数字 ID 报名分别撤销。同一账号绑定学号后共用一条有效报名，撤销用户 ID 会同时停用学号报名，已保存的绑定和考试历史仍可查询。
 
 名单合并当前报名和运行记录；`runtime: null` 代表从未连接，`runtime.connected: false` 代表有历史记录但当前离线，`enrolled: false` 代表报名已撤销但仍有运行记录。面板可见时每 5 秒轮询考生状态，异常与事件按需查询。首版历史查询未分页，不提供录像上传、下载或播放。
+
+异常记录和可靠事件按 Accoding ID 关联考生，界面显示学号和 Accoding 的 `nickname`。学号优先使用该场考试已有的绑定，缺少绑定时使用复验返回的校园登录名推导的学号。已验证账号请求报名列表或通过 WebSocket 升级前的资格检查时，服务端尽力刷新显示资料。旧记录在同一账号再次通过会话验证后补齐昵称。昵称是 Accoding 的显示名称。显示资料的保存不创建报名、绑定或运行记录。
 
 管理业务错误返回 `{"code":"..."}`：`401 ADMIN_AUTH_REQUIRED`、`400 INVALID_INPUT`、`404 NOT_FOUND`、`409 CONFLICT`、`413 BODY_TOO_LARGE`、`415 JSON_REQUIRED`、`503 STORAGE_BUSY`、`500 INTERNAL_ERROR`。路径或查询参数无法解析时由 Axum 拒绝；考生端错误格式保持不变。
 
 ## WebSocket 处理
 
-协议端点为 `wss://<监考服务端>/api/exams/{exam_id}/ws`。服务端在升级前从握手 Cookie 确认考生身份，失败时按上表返回同格式的 HTTP 错误。升级成功后，客户端先发送 `hello`，服务端调用 `ExamService::connect(exam_id, oj_user_id, hello)` 返回 `sync` 和待下发的新命令。后续 `heartbeat`、`status`、`event` 交给 `ExamService::receive`，会话校验 `command_result` 后交给 `ExamService::record_command_result`。
+协议端点为 `wss://<监考服务端>/api/exams/{exam_id}/ws`。服务端在升级前从握手 Cookie 确认考生身份，失败时按上表返回同格式的 HTTP 错误。升级成功后，客户端先发送 `hello`。Hub 用已验证的登录名重新核对报名，在入场事务内完成需要的绑定，返回 `sync` 和待下发的新命令。后续 `heartbeat`、`status`、`event` 交给 `ExamService::receive`，会话校验 `command_result` 后交给 `ExamService::record_command_result`。
 
 所有考试的入站 WebSocket 单帧载荷和重组后整条消息均以 64 KiB（65,536 字节）为上限，超限时返回 `PROTOCOL_ERROR` 并关闭连接。每条连接最多有一条应用消息在共享队列中等待或处理。所有消息字段见 [cvbbmso-protocol](cvbbmso-protocol.md)。
 

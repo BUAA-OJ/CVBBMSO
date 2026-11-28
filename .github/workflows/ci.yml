@@ -76,12 +76,21 @@ jobs:
         run: |
           rustc -Vv
           cargo check --locked --workspace --all-targets
+      - name: Test macOS and Windows tunnel detection
+        run: cargo test --locked -p cvbbmso-network --lib tunnel::tests
       - name: Test Windows filter plans without installing WFP rules
         if: matrix.os == 'windows-latest'
         run: cargo test --locked -p cvbbmso-network --lib egress::backend::windows
       - name: Test macOS egress with substitutes and PF syntax checks
         if: matrix.os == 'macos-latest'
         run: cargo test --locked -p cvbbmso-network --lib 'egress::'
+      - name: Check the macOS App and its PF helper
+        if: matrix.os == 'macos-latest'
+        run: |
+          MACOSX_DEPLOYMENT_TARGET=14.0 cargo check --locked \
+            -p cvbbmso-client -p cvbbmso-network \
+            --bin cvbbmso-client --bin cvbbmso-pf
+          cargo test --locked -p cvbbmso-client --bin cvbbmso-client --test macos_authorization
 
   desktop-smoke:
     name: Desktop Release smoke (${{ matrix.os }})

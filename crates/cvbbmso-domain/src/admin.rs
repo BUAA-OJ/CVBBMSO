@@ -17,7 +17,7 @@ use crate::{
     DisconnectReason, DomainError, Service,
     db::{self, Runtime, StudentKey},
     entity::{audit as stored_audit, enrollment, event, exam, incident, runtime},
-    events as stored_events, exam as exam_service,
+    events as stored_events, exam as exam_service, student_profiles, student_registration,
 };
 
 /// A management operation to perform against the shared exam database.
@@ -68,6 +68,30 @@ pub enum AdminOperation {
     },
     /// Lists current enrollments for an exam.
     ParticipantsList {
+        /// The ID of the exam.
+        exam_id: Uuid,
+    },
+    /// Imports school student numbers and restores revoked invitations.
+    StudentEnrollmentsImport {
+        /// The ID of the exam.
+        exam_id: Uuid,
+        /// Student numbers as decimal strings.
+        student_numbers: Vec<String>,
+    },
+    /// Revokes an invitation that has not yet been bound to an Accoding user.
+    StudentEnrollmentRemove {
+        /// The ID of the exam.
+        exam_id: Uuid,
+        /// The student number to revoke.
+        student_number: String,
+    },
+    /// Lists the school registrations and their binding state.
+    StudentEnrollmentsList {
+        /// The ID of the exam.
+        exam_id: Uuid,
+    },
+    /// Lists display identities for students with recorded activity in an exam.
+    StudentIdentitiesList {
         /// The ID of the exam.
         exam_id: Uuid,
     },
@@ -146,6 +170,10 @@ pub enum AdminOutput {
     },
     /// Current exam enrollments.
     Participants(Vec<ParticipantRecord>),
+    /// School student numbers and their verified Accoding IDs, if bound.
+    StudentEnrollments(Vec<student_registration::StudentEnrollment>),
+    /// Display identities used to label exam evidence.
+    StudentIdentities(Vec<student_profiles::StudentIdentity>),
     /// All known runtimes for the exam.
     Students(Vec<StudentRuntime>),
     /// A student's current persisted runtime.
@@ -251,6 +279,8 @@ impl AdminService {
                 | AdminOperation::ParticipantsAdd { .. }
                 | AdminOperation::ParticipantsRemove { .. }
                 | AdminOperation::ParticipantsImport { .. }
+                | AdminOperation::StudentEnrollmentsImport { .. }
+                | AdminOperation::StudentEnrollmentRemove { .. }
         ) {
             db::write(&self.0.writer, |tx| {
                 let service = self.0.clone();
@@ -324,6 +354,7 @@ pub(crate) async fn mutate(
             if deleted.rows_affected == 0 {
                 return Err(DomainError::NotFound);
             }
+            student_registration::revoke_bound(tx, &key).await?;
             if let Some(runtime) = Runtime::find(tx, &key).await? {
                 exam_service::disconnect_with_last_seen(
                     tx,
@@ -342,6 +373,25 @@ pub(crate) async fn mutate(
         } => AdminOutput::ParticipantsImported {
             count: import_participants(tx, exam_id, oj_user_ids).await?,
         },
+        AdminOperation::StudentEnrollmentsImport {
+            exam_id,
+            ref student_numbers,
+        } => AdminOutput::ParticipantsImported {
+            count: student_registration::import(tx, exam_id, student_numbers).await?,
+        },
+        AdminOperation::StudentEnrollmentRemove {
+            exam_id,
+            ref student_number,
+        } => {
+            let exam_id = exam_id.to_string();
+            let exam = db::exam(tx, &exam_id).await?;
+            now = service.now();
+            if now >= db::parse_time(&exam.start_at)? {
+                return Err(DomainError::Conflict);
+            }
+            student_registration::revoke_pending(tx, exam_id, student_number).await?;
+            AdminOutput::ParticipantRemoved
+        }
         _ => return Err(DomainError::InvalidInput),
     };
     audit(tx, actor, op, &output, now).await?;
@@ -442,6 +492,12 @@ async fn query(
             })
         }
         AdminOperation::ParticipantsList { exam_id } => participants(tx, exam_id).await,
+        AdminOperation::StudentEnrollmentsList { exam_id } => Ok(AdminOutput::StudentEnrollments(
+            student_registration::list(tx, exam_id).await?,
+        )),
+        AdminOperation::StudentIdentitiesList { exam_id } => Ok(AdminOutput::StudentIdentities(
+            student_profiles::list(tx, exam_id).await?,
+        )),
         AdminOperation::StudentsStatus { exam_id } => students(tx, exam_id).await,
         AdminOperation::StudentsShow {
             exam_id,

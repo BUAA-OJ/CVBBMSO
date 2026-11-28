@@ -50,6 +50,10 @@ use peer::{TestPeer, result};
 
 const STUDENT: i64 = 17;
 const OTHER_STUDENT: i64 = 29;
+const SCHOOL_STUDENT: i64 = 91;
+const SCHOOL_NUMBER: &str = "00001234";
+const SCHOOL_COOKIE: &str = "connect.sid=school";
+const OTHER_SCHOOL_COOKIE: &str = "connect.sid=other-school";
 const COOKIE: &str = "site=\"%2B=\"; connect.sid=s%3Aexample==; aux=value";
 const START: i64 = 2_000_000_000;
 const END: i64 = START + 60;
@@ -72,6 +76,31 @@ impl Listener for MemoryListener {
     fn local_addr(&self) -> io::Result<Self::Addr> {
         Ok(())
     }
+}
+
+fn test_identity(cookies: &AccodingCookies) -> Result<AccodingUser, AccodingError> {
+    let header = cookies.header_value();
+    assert!(header.is_sensitive());
+    let (id, username) = match header.to_str().unwrap() {
+        COOKIE => (STUDENT, format!("student{STUDENT}")),
+        "connect.sid=other" => (OTHER_STUDENT, format!("student{OTHER_STUDENT}")),
+        SCHOOL_COOKIE => (SCHOOL_STUDENT, format!("{SCHOOL_NUMBER}@buaa.edu.cn")),
+        OTHER_SCHOOL_COOKIE => (SCHOOL_STUDENT + 1, format!("{SCHOOL_NUMBER}@buaa.edu.cn")),
+        "connect.sid=school-suffix" => (
+            SCHOOL_STUDENT + 2,
+            format!("{SCHOOL_NUMBER}@buaa.edu.cn.example.test"),
+        ),
+        "connect.sid=school-no-leading-zeros" => (SCHOOL_STUDENT + 3, "1234@buaa.edu.cn".into()),
+        "connect.sid=expired" => return Err(AccodingError::Unauthenticated),
+        "connect.sid=upstream" => return Err(AccodingError::InvalidResponse(None)),
+        "connect.sid=upstream-json" => {
+            let error =
+                serde_json::from_str::<i64>(r#""private test upstream response""#).unwrap_err();
+            return Err(AccodingError::InvalidResponse(Some(error)));
+        }
+        _ => panic!("unexpected synthetic cookie"),
+    };
+    Ok(AccodingUser::new(id, username, "Student".into()).unwrap())
 }
 
 struct Fixture {
@@ -136,24 +165,7 @@ impl Fixture {
         let batch_waiting = Arc::clone(&manager.batch_waiting);
         let state = AppState {
             exam,
-            verifier: Arc::new(IdentityVerifier::Test(Box::new(|cookies| {
-                let header = cookies.header_value();
-                assert!(header.is_sensitive());
-                let id = match header.to_str().unwrap() {
-                    COOKIE => STUDENT,
-                    "connect.sid=other" => OTHER_STUDENT,
-                    "connect.sid=expired" => return Err(AccodingError::Unauthenticated),
-                    "connect.sid=upstream" => return Err(AccodingError::InvalidResponse(None)),
-                    "connect.sid=upstream-json" => {
-                        let error =
-                            serde_json::from_str::<i64>(r#""private test upstream response""#)
-                                .unwrap_err();
-                        return Err(AccodingError::InvalidResponse(Some(error)));
-                    }
-                    _ => panic!("unexpected synthetic cookie"),
-                };
-                Ok(AccodingUser::new(id, format!("student{id}"), "Student".into()).unwrap())
-            }))),
+            verifier: Arc::new(IdentityVerifier::Test(Box::new(test_identity))),
             auth_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             auth_wait_timeout: Duration::from_secs(5),
             hub,
@@ -217,6 +229,18 @@ impl Fixture {
             .admin("staff".into(), operation)
             .await
             .unwrap()
+    }
+
+    async fn student_identities(&self) -> Vec<cvbbmso_domain::StudentIdentity> {
+        let AdminOutput::StudentIdentities(rows) = self
+            .admin(AdminOperation::StudentIdentitiesList {
+                exam_id: self.exam_id,
+            })
+            .await
+        else {
+            panic!("expected exam identities");
+        };
+        rows
     }
 }
 
@@ -497,6 +521,111 @@ async fn upgrades_require_a_valid_exam_and_enrollment() {
             serde_json::from_slice(response.body().as_ref().unwrap()).unwrap();
         assert_eq!(body["error"]["code"], code);
     }
+}
+
+#[tokio::test]
+async fn school_roster_checks_identity_and_binds_only_after_a_valid_hello() {
+    let fixture = Fixture::new().await;
+    let import = || AdminOperation::StudentEnrollmentsImport {
+        exam_id: fixture.exam_id,
+        student_numbers: vec![SCHOOL_NUMBER.into()],
+    };
+    let invitation = || async {
+        let AdminOutput::StudentEnrollments(rows) = fixture
+            .admin(AdminOperation::StudentEnrollmentsList {
+                exam_id: fixture.exam_id,
+            })
+            .await
+        else {
+            panic!("expected school roster");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].student_number, SCHOOL_NUMBER);
+        (rows[0].enrolled, rows[0].oj_user_id)
+    };
+    fixture.admin(import()).await;
+    for (cookie, count) in [
+        (SCHOOL_COOKIE, 1),
+        ("connect.sid=school-suffix", 0),
+        ("connect.sid=school-no-leading-zeros", 0),
+    ] {
+        let response = fixture
+            .request(
+                Request::get("/api/exams")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body(response).await["items"].as_array().unwrap().len(),
+            count
+        );
+    }
+    let path = fixture.path();
+    let mut invalid = fixture.upgrade(&path, SCHOOL_COOKIE).await.unwrap();
+    invalid.send(Message::Text("{".into())).await.unwrap();
+    socket_error(&mut invalid, error_code::PROTOCOL_ERROR).await;
+    assert_eq!(invitation().await, (true, None));
+    let mut first = fixture.upgrade(&path, SCHOOL_COOKIE).await.unwrap();
+    let mut second = fixture.upgrade(&path, OTHER_SCHOOL_COOKIE).await.unwrap();
+    assert_eq!(invitation().await, (true, None));
+    assert!(fixture.student_identities().await.is_empty());
+    fixture
+        .admin(AdminOperation::StudentEnrollmentRemove {
+            exam_id: fixture.exam_id,
+            student_number: SCHOOL_NUMBER.into(),
+        })
+        .await;
+    let state = hello(ExecutionState::Ready, RecordingState::Idle);
+    send(&mut first, &state).await;
+    socket_error(&mut first, error_code::NOT_ENROLLED).await;
+    assert_eq!(invitation().await, (false, None));
+
+    fixture.admin(import()).await;
+    let mut first = fixture.upgrade(&path, SCHOOL_COOKIE).await.unwrap();
+    send(&mut first, &state).await;
+    assert!(matches!(
+        message(&mut first).await,
+        ServerMessage::Sync { .. }
+    ));
+    assert_eq!(invitation().await, (true, Some(SCHOOL_STUDENT)));
+    send(&mut second, &state).await;
+    socket_error(&mut second, error_code::NOT_ENROLLED).await;
+    let rows = fixture.student_identities().await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].oj_user_id, SCHOOL_STUDENT);
+    assert_eq!(rows[0].student_number.as_deref(), Some(SCHOOL_NUMBER));
+    assert_eq!(rows[0].nickname.as_deref(), Some("Student"));
+    assert!(matches!(
+        fixture
+            .state
+            .hub
+            .admin(
+                "staff".into(),
+                AdminOperation::StudentEnrollmentRemove {
+                    exam_id: fixture.exam_id,
+                    student_number: SCHOOL_NUMBER.into(),
+                }
+            )
+            .await,
+        Err(DomainError::Conflict)
+    ));
+    fixture
+        .admin(AdminOperation::ParticipantsRemove {
+            exam_id: fixture.exam_id,
+            oj_user_id: SCHOOL_STUDENT,
+        })
+        .await;
+    socket_error(&mut first, error_code::NOT_ENROLLED).await;
+    assert_eq!(invitation().await, (false, Some(SCHOOL_STUDENT)));
+    fixture.admin(import()).await;
+    assert_eq!(invitation().await, (true, Some(SCHOOL_STUDENT)));
+    let Err(ClientError::Http(rejected)) = fixture.upgrade(&path, OTHER_SCHOOL_COOKIE).await else {
+        panic!("another user must not inherit a previous binding");
+    };
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

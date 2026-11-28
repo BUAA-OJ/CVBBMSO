@@ -18,6 +18,7 @@ pub(crate) async fn run(
     socket: WebSocket,
     hub: Hub,
     student: StudentKey,
+    username: String,
     request_id: Uuid,
     timeout: Duration,
 ) {
@@ -26,12 +27,18 @@ pub(crate) async fn run(
         id: Uuid::new_v4(),
         request_id,
     };
-    session(socket, hub, connection, timeout)
+    session(socket, hub, connection, username, timeout)
         .instrument(connection.span())
         .await;
 }
 
-async fn session(mut socket: WebSocket, hub: Hub, connection: Connection, timeout: Duration) {
+async fn session(
+    mut socket: WebSocket,
+    hub: Hub,
+    connection: Connection,
+    username: String,
+    timeout: Duration,
+) {
     let hello = match first_message(&mut socket, timeout).await {
         Ok(Some(hello)) => hello,
         Ok(None) => return,
@@ -54,6 +61,7 @@ async fn session(mut socket: WebSocket, hub: Hub, connection: Connection, timeou
         .connect(
             connection,
             hello,
+            username,
             Peer {
                 frames,
                 close,

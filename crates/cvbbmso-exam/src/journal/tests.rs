@@ -3,8 +3,10 @@ use cvbbmso_protocol::{
     RecordingSummary, SegmentMeta, Sha256Digest,
 };
 use time::OffsetDateTime;
+use uuid::Uuid;
 
-use super::{CORRUPT_FILE, JOURNAL_FILE, Journal, RUNTIME_DIR};
+use super::{CORRUPT_FILE, JOURNAL_FILE, Journal, RUNTIME_DIR, candidate_dir};
+use crate::{Exam, ExamError};
 
 fn at(seconds: i64) -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(1_797_729_600 + seconds).unwrap()
@@ -50,6 +52,59 @@ fn seqs(journal: &Journal) -> Vec<i64> {
 
 async fn open(dir: &tempfile::TempDir) -> Journal {
     Journal::open(dir.path()).await.unwrap()
+}
+
+#[tokio::test]
+async fn pending_finalization_discovery_leaves_valid_and_corrupt_snapshots_untouched() {
+    use std::{fs, io::ErrorKind};
+
+    let app_data = tempfile::tempdir().unwrap();
+    let exam_id = Uuid::from_u128(0x10);
+    let user_id = 42;
+    let candidate = candidate_dir(app_data.path(), exam_id, user_id).unwrap();
+    let mut journal = Journal::open(&candidate).await.unwrap();
+    let runtime = candidate.join(RUNTIME_DIR);
+    let path = runtime.join(JOURNAL_FILE);
+
+    for state in [
+        capturing(),
+        ClientState {
+            execution: ExecutionState::Finalizing,
+            recording: RecordingState::Finalizing,
+        },
+    ] {
+        journal.set_state(state);
+        journal.save().await.unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(
+            Exam::has_pending_finalization(app_data.path(), exam_id, user_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    journal.set_state(ClientState {
+        execution: ExecutionState::Ready,
+        recording: RecordingState::Capturing,
+    });
+    journal.save().await.unwrap();
+    let inconsistent = fs::read(&path).unwrap();
+
+    for invalid in [inconsistent.as_slice(), b"{"] {
+        fs::write(&path, invalid).unwrap();
+        assert!(matches!(
+            Exam::has_pending_finalization(app_data.path(), exam_id, user_id).await,
+            Err(ExamError::Storage(error)) if error.kind() == ErrorKind::InvalidData
+        ));
+        assert_eq!(fs::read(&path).unwrap(), invalid);
+        assert!(!runtime.join(CORRUPT_FILE).exists());
+    }
+    assert!(matches!(
+        Exam::has_pending_finalization(app_data.path(), exam_id, 0).await,
+        Err(ExamError::Storage(error)) if error.kind() == ErrorKind::InvalidInput
+    ));
+    assert!(!candidate.with_file_name("0").exists());
 }
 
 fn write_legacy_snapshot(dir: &tempfile::TempDir, seq: u64) {

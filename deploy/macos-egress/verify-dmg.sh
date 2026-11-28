@@ -20,29 +20,36 @@ trap 'exit 1' HUP INT TERM
 attached=true
 
 app="$mount/CVBBMSO.app"
+client="$app/Contents/MacOS/cvbbmso-client"
+helper="$app/Contents/Helpers/cvbbmso-pf"
 info="$app/Contents/Info.plist"
-label=edu.buaa.accoding.cvbbmso.egress
-daemon="$app/Contents/Library/LaunchDaemons/$label.plist"
-key() { /usr/bin/plutil -extract "$1" raw "$2"; }
+app_id=edu.buaa.accoding.cvbbmso
+key() { /usr/bin/plutil -extract "$1" raw "$info"; }
 [[ -L "$mount/Applications" && $(/usr/bin/readlink "$mount/Applications") == /Applications ]]
-[[ $(key CFBundleIdentifier "$info") == edu.buaa.accoding.cvbbmso ]]
-[[ $(key CFBundleExecutable "$info") == cvbbmso-client ]]
-[[ $(key CVBBMSOPrivilegedServiceVersion "$info") == 1 ]]
-[[ $(key LSMinimumSystemVersion "$info") == 14.0 ]]
-[[ -x "$app/Contents/MacOS/cvbbmso-client" ]]
-[[ $(key Label "$daemon") == "$label" ]]
-program=$(key BundleProgram "$daemon")
-[[ $program == Contents/MacOS/cvbbmso-egress-service && -x "$app/$program" ]]
-[[ $(/usr/libexec/PlistBuddy -c "Print :MachServices:$label" "$daemon") == true ]]
-[[ $(key SpawnConstraint.signing-identifier "$daemon") == "$label" ]]
-[[ $(key SpawnConstraint.validation-category "$daemon") == 6 ]]
-team=$(key SpawnConstraint.team-identifier "$daemon")
+[[ $(key CFBundleIdentifier) == "$app_id" && $(key CFBundleExecutable) == cvbbmso-client ]]
+[[ $(key LSMinimumSystemVersion) == 14.0 ]]
+revision=$(key CVBBMSOBuildRevision)
+[[ $revision =~ ^[a-f0-9]{40}$ ]]
+[[ -f $mount/README.md && ! -d $app/Contents/Library/LaunchDaemons ]]
+arch=$(/usr/bin/lipo -archs "$client")
+[[ $arch == arm64 || $arch == x86_64 ]]
+for file in "$client" "$helper"; do
+    [[ -x $file && $(/usr/bin/lipo -archs "$file") == "$arch" ]]
+    /usr/bin/xcrun vtool -show-build "$file" | /usr/bin/awk '
+        $1 == "platform" && $2 == "MACOS" { mac = 1 }
+        $1 == "minos" && ($2 == "14.0" || $2 == "14.0.0") { supported = 1 }
+        END { exit !(mac && supported) }
+    '
+    if [[ -n ${CVBBMSO_SERVER_ORIGIN:-} ]]; then
+        LC_ALL=C /usr/bin/grep -aFq -- "$CVBBMSO_SERVER_ORIGIN" "$file"
+    fi
+done
+/usr/bin/codesign --verify --strict --deep --all-architectures -- "$app"
 if [[ $mode == release ]]; then
+    team=${CVBBMSO_MACOS_TEAM_ID:?Set the expected Apple Team ID.}
     [[ $team =~ ^[A-Z0-9]{10}$ ]]
-    /usr/bin/codesign --verify --strict --deep --all-architectures "$app"
-    /usr/bin/codesign --verify --test-requirement="=anchor apple generic and identifier \"$label\" and certificate leaf[subject.OU] = \"$team\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists" "$app/$program"
+    /usr/bin/codesign --verify --test-requirement="=anchor apple generic and identifier \"$app_id\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$team\"" "$app"
+    /usr/bin/codesign --verify --test-requirement="=anchor apple generic and identifier \"$app_id.pf\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$team\"" "$helper"
     /usr/bin/xcrun stapler validate "$image"
-else
-    [[ -z $team ]]
 fi
-printf 'Verified %s disk image. Installed service path: /Applications/CVBBMSO.app/%s\n' "$mode" "$program"
+printf 'Verified the CVBBMSO %s disk image (%s, macOS 14.0+) at %s.\n' "$mode" "$arch" "$revision"

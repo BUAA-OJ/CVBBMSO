@@ -6,7 +6,7 @@ const phases = { scheduled: "未开始", running: "进行中", ended: "已结束
 const stages = { ready: "就绪", recording: "录像中", finalizing: "收尾中", finished: "已结束" };
 const errorMessages = {
   ADMIN_AUTH_REQUIRED: "管理员令牌无效或已轮换，请重新登录。",
-  INVALID_INPUT: "输入无效，请检查考试时间、录像参数或用户 ID。",
+  INVALID_INPUT: "输入无效，请检查考试时间、录像参数或学号。",
   NOT_FOUND: "未找到对应记录。",
   CONFLICT: "考试状态已变化，当前操作无法执行。",
   STORAGE_BUSY: "服务端正在处理其他写入，请稍后重试。",
@@ -44,6 +44,8 @@ function resetSession() {
   element("import-form").reset();
   element("exam-select").replaceChildren();
   element("exam-summary").textContent = "请选择一场考试";
+  element("refresh-dashboard").disabled = false;
+  element("refresh-dashboard").textContent = "刷新";
   renderRoster([], null);
   clearEvidence("请选择考试");
   element("dashboard").hidden = true;
@@ -72,7 +74,11 @@ async function request(path, { method = "GET", data, allowMissing = false } = {}
   if (response.status === 204) return null;
   const result = await response.json().catch(() => null);
   active.controller.signal.throwIfAborted();
-  if (!response.ok) throw new Error(errorMessages[result?.code] ?? `请求失败（HTTP ${response.status}）。`);
+  if (!response.ok) {
+    const error = new Error(errorMessages[result?.code] ?? `请求失败（HTTP ${response.status}）。`);
+    error.code = result?.code;
+    throw error;
+  }
   if (result === null) throw new Error("服务端返回了无效的响应。");
   return result;
 }
@@ -89,7 +95,7 @@ function showExams(exams, preferred) {
   picker.replaceChildren(...exams.map((exam) => option(exam.id, `${exam.title} · ${phases[exam.phase] ?? exam.phase}`)));
   if (exams.some((exam) => exam.id === retained)) picker.value = retained;
   if (!exams.length) picker.append(option("", "暂无考试"));
-  chooseExam();
+  if (picker.value !== selection?.id) chooseExam();
 }
 
 function chooseExam() {
@@ -115,28 +121,72 @@ function selectView(name) {
   }
 }
 
-function renderRoster(rows, exam) {
+async function refreshDashboard() {
+  const active = session;
+  const button = element("refresh-dashboard");
+  if (!active || button.disabled) return;
+  button.disabled = true;
+  button.textContent = "刷新中…";
+  try {
+    const exams = await request("/exams");
+    if (active !== session) return;
+    const current = selection;
+    showExams(exams);
+    if (current && selection === current) {
+      await Promise.all([
+        refreshRoster(true),
+        view === "evidence" ? loadEvidence() : null,
+      ]);
+    }
+  } catch (error) {
+    if (active === session) report(error);
+  } finally {
+    if (active === session) {
+      button.disabled = false;
+      button.textContent = "刷新";
+    }
+  }
+}
+
+function renderRoster(rows, exam, studentEnrollments = []) {
   const enrollments = [];
   const tableRows = [];
   const picker = element("student-select");
   const previousStudent = picker.value;
   const options = [option("", "全部考生（仅异常）")];
-  for (const row of rows) {
+  const numbersByUser = new Map();
+  const pending = [];
+  for (const entry of studentEnrollments) {
+    if (entry.oj_user_id !== null) {
+      numbersByUser.set(entry.oj_user_id, entry.student_number);
+    } else if (entry.enrolled) {
+      pending.push({ ...entry, runtime: null });
+    }
+  }
+  for (const row of [...pending, ...rows]) {
     const id = row.oj_user_id;
+    const number = row.student_number ?? numbersByUser.get(id);
+    const label = number ?? id;
     if (row.enrolled) {
-      const item = node("li", id);
+      const item = node("li", id === null ? label + "（待绑定）" : label);
       const remove = node("button", "撤销报名");
       remove.disabled = exam?.phase !== "scheduled";
       remove.addEventListener("click", async () => {
-        if (!window.confirm(`撤销用户 ${id} 的报名？`)) return;
+        if (!window.confirm(`撤销 ${label} 的报名？`)) return;
         const current = selection;
         remove.disabled = true;
         try {
-          await request(`/exams/${current.id}/participants/${id}`, { method: "DELETE" });
-          if (current === selection) notice(`已撤销用户 ${id} 的报名。`);
+          const entry = id === null ? `student-enrollments/${encodeURIComponent(number)}` : `participants/${id}`;
+          await request(`/exams/${current.id}/${entry}`, { method: "DELETE" });
+          if (current === selection) notice(`已撤销 ${label} 的报名。`);
           await refreshRoster(true);
         } catch (error) {
-          report(error);
+          if (id === null && error.code === "CONFLICT" && current === selection) {
+            notice("报名状态已变化，请在刷新后的名单中再次撤销。", true);
+            await refreshRoster(true).catch(report);
+          } else {
+            report(error);
+          }
         } finally {
           remove.disabled = exam?.phase !== "scheduled";
         }
@@ -147,14 +197,15 @@ function renderRoster(rows, exam) {
     const tableRow = node("tr");
     const runtime = row.runtime;
     const connection = runtime ? (runtime.connected ? "在线" : "离线") : "未连接过";
-    for (const value of [id, row.enrolled ? "已报名" : "已撤销", connection,
+    const enrollment = row.enrolled ? (id === null ? "待绑定" : "已报名") : "已撤销";
+    for (const value of [label, enrollment, connection,
       runtime ? (stages[runtime.execution] ?? runtime.execution) : "—", formatTime(runtime?.last_seen_at)]) {
       tableRow.append(node("td", value));
     }
     const detail = node("td");
     const open = node("button", "查看记录");
     open.disabled = !runtime;
-    if (runtime) options.push(option(id, id));
+    if (runtime) options.push(option(id, label));
     open.addEventListener("click", () => {
       selectView("evidence");
       picker.value = id;
@@ -187,16 +238,17 @@ async function refreshRoster(force = false) {
   }
   current.pending = true;
   try {
-    const [detail, rows] = await Promise.all([
+    const [detail, rows, studentEnrollments] = await Promise.all([
       request(`/exams/${current.id}`), request(`/exams/${current.id}/roster`),
+      request(`/exams/${current.id}/student-enrollments`),
     ]);
     if (current !== selection) return;
     const exam = detail.summary;
     element("exam-summary").textContent = `${exam.title} · ${phases[exam.phase] ?? exam.phase} · ${formatTime(exam.start_at)} 至 ${formatTime(exam.end_at)} · ${detail.policy.fps} FPS / ${detail.policy.segment_duration_secs} 秒分片`;
     element("poll-status").textContent = `更新于 ${formatTime(Date.now())} · 每 5 秒刷新`;
-    const key = JSON.stringify([exam.phase, rows]);
+    const key = JSON.stringify([exam.phase, rows, studentEnrollments]);
     if (key !== current.rendered) {
-      renderRoster(rows, exam);
+      renderRoster(rows, exam, studentEnrollments);
       current.rendered = key;
     }
   } catch (error) {
@@ -218,6 +270,12 @@ function clearEvidence(message) {
   element("recording").textContent = message;
 }
 
+function evidenceIdentity(id, identities) {
+  const identity = identities.get(id);
+  const number = identity?.student_number ?? `账号 ${id}（学号未登记）`;
+  return `${number} · ${identity?.nickname ?? "昵称待同步"}`;
+}
+
 async function loadEvidence() {
   const current = selection;
   const marker = {};
@@ -228,17 +286,19 @@ async function loadEvidence() {
   const studentPath = `/exams/${current.id}/students/${id}`;
   clearEvidence("正在加载…");
   try {
-    const [incidents, events, recording] = await Promise.all([
+    const [incidents, events, recording, students] = await Promise.all([
       request(`/exams/${current.id}/incidents${query}`),
       id ? request(`${studentPath}/events`) : [],
       id ? request(`${studentPath}/recording`, { allowMissing: true }) : null,
+      request(`/exams/${current.id}/student-identities`),
     ]);
     if (current !== selection || marker !== evidenceRequest) return;
+    const identities = new Map(students.map((student) => [student.oj_user_id, student]));
     element("incidents").replaceChildren(...(incidents.length ? incidents.map((item) => node("li",
-      `${formatTime(item.occurred_at)} · ${item.oj_user_id} · ${item.source === "server" ? "服务端" : "客户端"} · ${item.kind}${item.detail ? ` · ${item.detail}` : ""}`
+      `${formatTime(item.occurred_at)} · ${evidenceIdentity(item.oj_user_id, identities)} · ${item.source === "server" ? "服务端" : "客户端"} · ${item.kind}${item.detail ? ` · ${item.detail}` : ""}`
     )) : [node("li", "暂无异常记录")]));
     element("events").replaceChildren(...(events.length ? events.map((item) => {
-      const entry = node("li", `#${item.seq} · ${formatTime(item.received_at)}`);
+      const entry = node("li", `#${item.seq} · ${formatTime(item.received_at)} · ${evidenceIdentity(id, identities)}`);
       const details = node("details");
       details.append(node("summary", item.event.kind), node("pre", JSON.stringify(item.event, null, 2)));
       entry.append(details);
@@ -302,7 +362,7 @@ handleForm("create-form", async (fields, form) => {
     showExams(await request("/exams"), result.exam_id);
   } catch (error) {
     if (session && error.name !== "AbortError") {
-      notice("考试已创建，但列表未能刷新；请重新登录后查看。", true);
+      notice("考试已创建。列表刷新失败，请点击页面上的「刷新」重试。", true);
     }
   }
 });
@@ -310,18 +370,21 @@ handleForm("create-form", async (fields, form) => {
 handleForm("import-form", async (fields, form) => {
   const current = selection;
   if (!current) return;
-  const ids = fields.get("ids").trim().split(/[\s,，]+/);
-  if (ids.length > 1000 || ids.some((id) => !/^[1-9][0-9]{0,18}$/.test(id))) {
-    throw new Error("请输入 1–1,000 个有效的正整数用户 ID。");
+  const studentNumbers = fields.get("student_numbers").trim().split(/[\s,，]+/);
+  if (studentNumbers.length > 1000 || studentNumbers.some((number) => !/^[0-9]{1,20}$/.test(number))) {
+    throw new Error("请输入 1–1,000 个学号，每个学号为 1–20 位数字。");
   }
-  const result = await request(`/exams/${current.id}/participants`, { method: "POST", data: { oj_user_ids: ids } });
+  const result = await request(`/exams/${current.id}/student-enrollments`, {
+    method: "POST", data: { student_numbers: studentNumbers },
+  });
   if (current !== selection) return;
   form.reset();
-  notice(`新增 ${result.count} 人，重复报名已跳过。`);
+  notice(`已添加 ${result.count} 人，重复报名已跳过。`);
   await refreshRoster(true);
 });
 
 element("logout").addEventListener("click", resetSession);
+element("refresh-dashboard").addEventListener("click", refreshDashboard);
 element("exam-select").addEventListener("change", chooseExam);
 element("student-select").addEventListener("change", loadEvidence);
 element("refresh-evidence").addEventListener("click", loadEvidence);

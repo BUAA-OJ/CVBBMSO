@@ -44,6 +44,35 @@ pub struct ImportParticipants {
     pub oj_user_ids: Vec<String>,
 }
 
+/// Request to enroll students by their school student numbers.
+#[derive(Debug, Deserialize)]
+pub struct ImportStudentEnrollments {
+    /// Student numbers as decimal strings, including any leading zeros.
+    pub student_numbers: Vec<String>,
+}
+
+/// A school roster invitation and its verified account binding.
+#[derive(Debug, Serialize)]
+pub struct StudentEnrollment {
+    /// Decimal school student number.
+    pub student_number: String,
+    /// Decimal Accoding user ID, or null before the student enters.
+    pub oj_user_id: Option<String>,
+    /// Whether the invitation is active.
+    pub enrolled: bool,
+}
+
+/// Staff-only display metadata for a student with evidence in an exam.
+#[derive(Debug, Serialize)]
+pub struct StudentIdentity {
+    /// Decimal Accoding user ID used to join with evidence records.
+    pub oj_user_id: String,
+    /// Decimal school student number, if known.
+    pub student_number: Option<String>,
+    /// The account display name supplied by Accoding, if known.
+    pub nickname: Option<String>,
+}
+
 /// Result of importing participants.
 #[derive(Debug, Serialize)]
 pub struct ImportedParticipants {

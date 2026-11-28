@@ -78,4 +78,4 @@ username=user%40example.com&password=<url-encoded-password>&_csrf=<url-encoded-c
 
 ## 与其他 crate 的边界
 
-`cvbbmso-client` 读取原生 Cookie Store 并创建 `AccodingCookies`；`cvbbmso-exam` 在监考服务器 WSS 握手时发送 Cookie；`cvbbmso-server` 从 HTTP 请求头构造 `AccodingCookies`，调用 `Verifier::verify`，将 `AccodingUser.id` 交给 `cvbbmso-domain`。本 crate 的职责限于 Cookie 和身份复验。
+`cvbbmso-client` 读取原生 Cookie Store 并创建 `AccodingCookies`。`cvbbmso-exam` 在监考服务器 WSS 握手时发送 Cookie。`cvbbmso-server` 调用 `Verifier::verify`，将复验得到的 `id` 和 `username` 交给报名流程。学号匹配依赖 Accoding 正确发放校园账号。本 crate 校验 Accoding 会话，由考务方维护学校报名名单。

@@ -144,7 +144,7 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
                 (Monitor::new(None), None)
             } else {
                 let (monitor, connections) =
-                    start_monitor(requests.clone(), exam_identity.as_deref())?;
+                    start_monitor(case, requests.clone(), exam_identity.as_deref())?;
                 (Ok(monitor), connections)
             };
             let base = Url::parse(&format!("http://{fixture}/"))?;
@@ -190,6 +190,7 @@ pub(super) fn run(case: Case, exam_identity: Option<PathBuf>) -> tauri::Result<(
                     } else {
                         check_admission_retry(&ui, &admission).await?;
                         exercise(&app, &ui, &base, foreign, &hits, &mut decisions).await?;
+                        check_runtime_network_timeout(&ui, &admission).await?;
                     }
                     check_close_confirmation(&ui, &admission).await
                 }
@@ -258,11 +259,11 @@ async fn check_admission_retry(ui: &WebviewWindow, admission: &FakeAdmission) ->
     ui.eval("document.querySelector('#admission-retry').click()")?;
     #[cfg(target_os = "macos")]
     {
-        wait_for(ui, "!document.querySelector('#admission-retry').hidden && document.querySelector('#admission-status').textContent.includes('录制屏幕')", "screen permission denial").await?;
+        wait_for(ui, "!document.querySelector('#admission-retry').hidden && document.querySelector('#admission-status').textContent.includes('PF 配置')", "PF configuration denial").await?;
         assert_eq!(admission.installs(), 0);
         check_environment_gate(ui).await?;
+        admission.enable_pf();
         ui.eval("document.querySelector('#admission-retry').click()")?;
-        check_helper_approval(ui, admission).await?;
     }
     timeout(DEADLINE, admission.install_started()).await?;
     ui.eval(r"
@@ -281,6 +282,13 @@ async fn check_admission_retry(ui: &WebviewWindow, admission: &FakeAdmission) ->
     assert_eq!(admission.installs(), 1);
     admission.resume();
 
+    #[cfg(target_os = "macos")]
+    {
+        wait_for(ui, "!document.querySelector('#admission-retry').hidden && document.querySelector('#admission-status').textContent.includes('录制屏幕')", "screen permission denial with an attached guard").await?;
+        check_environment_gate(ui).await?;
+        ui.eval("document.querySelector('#admission-retry').click()")?;
+    }
+
     wait_for(
         ui,
         "!document.querySelector('#admitted-controls').hidden",
@@ -290,44 +298,6 @@ async fn check_admission_retry(ui: &WebviewWindow, admission: &FakeAdmission) ->
     assert_eq!(admission.installs(), 1);
     assert_eq!(admission.shutdowns(), 0);
     println!("Startup checks preceded installation; concurrent retries installed one guard.");
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-async fn check_helper_approval(ui: &WebviewWindow, fake: &FakeAdmission) -> Result<(), Error> {
-    wait_for(
-        ui,
-        "!document.querySelector('#admission-settings').hidden && document.querySelector('#admission-status').textContent.includes('登录项与扩展')",
-        "the native helper approval prompt",
-    )
-    .await?;
-    check_environment_gate(ui).await?;
-    assert_eq!(fake.installs(), 0);
-    assert_eq!(fake.settings_opens(), 0);
-
-    ui.eval("document.querySelector('#admission-settings').click()")?;
-    timeout(DEADLINE, fake.settings_opened()).await?;
-    assert_eq!(fake.settings_opens(), 1);
-    check_environment_gate(ui).await?;
-    assert_eq!(fake.installs(), 0);
-
-    fake.grant_approval();
-    let app = ui.app_handle();
-    app.state::<admission::Admission>().recheck_approval(app);
-    wait_for(
-        ui,
-        "document.querySelector('#admission-settings').hidden && !document.querySelector('#admission-retry').hidden && document.querySelector('#admission-status').textContent.includes('PF 配置')",
-        "PF configuration blocking the approved helper",
-    )
-    .await?;
-    check_environment_gate(ui).await?;
-    assert_eq!(fake.installs(), 0);
-
-    fake.enable_pf();
-    ui.eval("document.querySelector('#admission-retry').click()")?;
-    println!(
-        "A pending approval and unavailable PF both blocked admission; only the local settings action opened settings."
-    );
     Ok(())
 }
 
@@ -353,6 +323,37 @@ async fn check_environment_gate(ui: &WebviewWindow) -> Result<(), Error> {
         "Rust rejecting direct IPC while admission is blocked",
     )
     .await
+}
+
+async fn check_runtime_network_timeout(
+    ui: &WebviewWindow,
+    admission: &FakeAdmission,
+) -> Result<(), Error> {
+    let restricted = "document.querySelector('#admission-status').textContent.includes('网络环境检查超时') && document.querySelector('#admitted-controls').hidden";
+    admission.pause_runtime_network();
+    timeout(DEADLINE, admission.runtime_network_paused()).await?;
+    wait_for(ui, restricted, "network check timeout").await?;
+    check_environment_gate(ui).await?;
+
+    let checks = admission.network_checks();
+    let verifies = admission.verifies();
+    sleep(Duration::from_secs(4)).await;
+    assert_eq!(admission.network_checks(), checks);
+    assert!(admission.verifies() > verifies);
+
+    admission.resume_runtime_network();
+    wait_for(
+        ui,
+        "document.querySelector('#admission-panel').hidden && !document.querySelector('#admitted-controls').hidden",
+        "fresh network check restoring admission",
+    )
+    .await?;
+    assert!(admission.network_checks() > checks);
+
+    admission.pause_runtime_network();
+    timeout(DEADLINE, admission.runtime_network_paused()).await?;
+    // The existing close-confirmation flow must clean up while this probe remains hung.
+    wait_for(ui, restricted, "restriction before exit with a hung check").await
 }
 
 async fn check_exit_during_install(
@@ -446,6 +447,13 @@ async fn check_guard_loss(
     peer: oneshot::Receiver<()>,
 ) -> Result<(), Error> {
     assert!(admission.verifies() > 0);
+    admission.set_runtime_proxy(true);
+    wait_for(ui, "document.querySelector('#admission-status').textContent.includes('检测到系统代理') && document.querySelector('#admitted-controls').hidden && !document.querySelector('#current-exam').hidden && document.querySelector('#admission-retry').hidden", "runtime proxy restriction retaining the active exam").await?;
+    check_environment_gate(ui).await?;
+    admission.set_runtime_proxy(false);
+    wait_for(ui, "document.querySelector('#admission-panel').hidden && !document.querySelector('#admitted-controls').hidden && !document.querySelector('#current-exam').hidden", "automatic recovery after clearing the system proxy").await?;
+    assert_eq!(admission.installs(), 1);
+    assert_eq!(admission.shutdowns(), 0);
     admission.lose_guard();
     wait_for(ui, "document.querySelector('#admission-status').textContent.includes('联系监考人员') && document.querySelector('#admitted-controls').hidden", "terminal guard loss").await?;
     check_environment_gate(ui).await?;
@@ -488,11 +496,12 @@ fn check_deployment(data_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn start_monitor(
+    case: Case,
     requests: Arc<AtomicUsize>,
     exam_identity: Option<&Path>,
 ) -> io::Result<(Monitor, Option<exams::Fixture>)> {
     let exam_smoke = exam_identity.is_some();
-    let auth = Arc::new(exams::Auth::new());
+    let auth = Arc::new(exams::Auth::new(case == Case::RestoredRecording));
     let http_auth = auth.clone();
     let router = Router::new().route(
         "/api/exams",
@@ -504,7 +513,7 @@ fn start_monitor(
                 if exam_smoke {
                     auth.enrollment(&headers)
                 } else {
-                    exam_list(&headers, false)
+                    exam_list(&headers, false, false)
                 }
             }
         }),
@@ -646,7 +655,7 @@ fn fixture_relogin(mode: &str) -> Response {
     ([(header::SET_COOKIE, cookie)], Html(page)).into_response()
 }
 
-fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
+fn exam_list(headers: &HeaderMap, include_second_exam: bool, restoring: bool) -> Response {
     let cookie = headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -671,19 +680,35 @@ fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
         }
         _ => return StatusCode::UNAUTHORIZED.into_response(),
     };
-    let start_at = OffsetDateTime::from_unix_timestamp(1_797_729_600).unwrap();
-    let end_at = OffsetDateTime::from_unix_timestamp(1_797_733_200).unwrap();
-    let summary = |id, title: &str| {
-        ExamSummary::new(id, title.into(), start_at, end_at, ExamPhase::Scheduled).unwrap()
+    let start_at = OffsetDateTime::now_utc() + time::Duration::minutes(5);
+    let end_at = start_at + time::Duration::hours(1);
+    let summary = |id, title: &str, phase| {
+        let start_at = if phase == ExamPhase::Running {
+            start_at - time::Duration::minutes(10)
+        } else {
+            start_at
+        };
+        ExamSummary::new(id, title.into(), start_at, end_at, phase).unwrap()
     };
     let mut items = vec![];
     if enrolled {
-        items.push(summary(exams::FIRST, EXAM_TITLE));
+        let phase = if restoring {
+            ExamPhase::Ended
+        } else if include_second_exam {
+            ExamPhase::Running
+        } else {
+            ExamPhase::Scheduled
+        };
+        items.push(summary(exams::FIRST, EXAM_TITLE, phase));
         if include_second_exam {
-            items.push(summary(exams::SECOND, "Second fixture exam"));
+            items.push(summary(
+                exams::SECOND,
+                "Second fixture exam",
+                ExamPhase::Scheduled,
+            ));
             items.push(
                 ExamSummary::new(
-                    Uuid::from_u128(0x30),
+                    exams::ENDED,
                     "Ended fixture exam".into(),
                     start_at,
                     end_at,
@@ -691,6 +716,13 @@ fn exam_list(headers: &HeaderMap, include_second_exam: bool) -> Response {
                 )
                 .unwrap(),
             );
+            if restoring {
+                items.push(summary(
+                    Uuid::from_u128(0x31),
+                    "No journal fixture exam",
+                    ExamPhase::Ended,
+                ));
+            }
         }
     }
     Json(ExamListResponse {
@@ -1060,7 +1092,7 @@ async fn check_ipc(ui: &WebviewWindow, oj: &WebviewWindow) -> Result<(), Error> 
             const results = await Promise.allSettled([
                 invoke("vm_preflight", { retry: true }),
                 invoke("admission_status", { retry: true }),
-                invoke("open_helper_approval_settings"),
+                invoke("authorize_macos_egress"),
                 invoke("inspect_session"),
                 invoke("list_exams"),
                 invoke("open_exam", { exam_id: "00000000-0000-0000-0000-000000000010" }),

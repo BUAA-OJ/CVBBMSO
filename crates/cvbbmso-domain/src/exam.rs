@@ -1,6 +1,6 @@
 use cvbbmso_protocol::{
-    ClientHello, ClientMessage, ClientState, CommandName, CommandStatus, ExamEvent, ExamSummary,
-    ExecutionState, RecordingState, ServerMessage,
+    AccodingUser, ClientHello, ClientMessage, ClientState, CommandName, CommandStatus, ExamEvent,
+    ExamSummary, ExecutionState, RecordingState, ServerMessage,
 };
 use sea_orm::{
     ConnectionTrait, DatabaseTransaction, DbBackend, EntityTrait, FromQueryResult, Set, Statement,
@@ -14,7 +14,7 @@ use crate::{
     AdminOperation, AdminOutput, AdminService, DomainError, Service, admin, commands,
     db::{self, Runtime, StudentKey},
     entity::{enrollment, exam as exam_table, runtime},
-    events,
+    events, student_profiles, student_registration,
 };
 
 /// A committed connection snapshot and the commands due on that connection.
@@ -71,6 +71,21 @@ pub enum BatchWrite {
         /// Client handshake payload.
         hello: ClientHello,
         /// Server UTC timestamp when `hello` was accepted.
+        observed_at: OffsetDateTime,
+    },
+    /// Admits a connection after checking its verified account and binding its registration.
+    ConnectVerified {
+        /// Exam identifier.
+        exam_id: Uuid,
+        /// Authenticated Accoding account ID.
+        oj_user_id: i64,
+        /// Login name from the same verified Accoding identity.
+        username: String,
+        /// Server-assigned connection generation UUID.
+        connection_id: Uuid,
+        /// Client handshake payload.
+        hello: ClientHello,
+        /// Server UTC timestamp when the hello was accepted.
         observed_at: OffsetDateTime,
     },
     /// Marks a student offline and records loss if unfinished.
@@ -269,6 +284,55 @@ impl ExamService {
     pub async fn list_for(&self, oj_user_id: i64) -> Result<Vec<ExamSummary>, DomainError> {
         db::validate_user(oj_user_id)?;
         db::exams(&self.0.reader, Some(oj_user_id), self.0.now()).await
+    }
+
+    /// Lists exams available to an authenticated account, including unbound invitations.
+    /// # Errors
+    /// Returns an error for an invalid user ID or failed database read.
+    pub async fn list_for_verified(
+        &self,
+        user: &AccodingUser,
+    ) -> Result<Vec<ExamSummary>, DomainError> {
+        db::validate_user(user.id)?;
+        let now = self.0.now();
+        student_registration::list_for(
+            &self.0.reader,
+            user.id,
+            student_registration::school_number(&user.username),
+        )
+        .await?
+        .into_iter()
+        .map(|exam| exam.summary(now))
+        .collect()
+    }
+
+    /// Updates display metadata for a verified account with current eligibility or saved exam activity.
+    /// This does not create an enrollment, a binding, or a runtime.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid account ID or failed storage operation.
+    pub async fn remember_verified_profile(
+        &self,
+        user: &AccodingUser,
+        has_current_eligibility: bool,
+    ) -> Result<(), DomainError> {
+        student_profiles::remember(&self.0, user, has_current_eligibility).await
+    }
+
+    /// Checks an authenticated account's eligibility without binding an invitation.
+    /// # Errors
+    /// Returns an error if the exam or enrollment is missing, the ID is invalid, or storage fails.
+    pub async fn check_verified_enrollment(
+        &self,
+        exam_id: Uuid,
+        user: &AccodingUser,
+    ) -> Result<(), DomainError> {
+        let key = StudentKey::new(exam_id, user.id)?;
+        let number = student_registration::school_number(&user.username).map(str::to_owned);
+        db::transaction(&self.0.reader, |tx| {
+            Box::pin(async move { student_registration::check(tx, &key, number.as_deref()).await })
+        })
+        .await
     }
 
     /// Checks enrollment and returns the scheduled exam duration.
@@ -552,9 +616,22 @@ async fn apply_batch_write(
         } => {
             let key = StudentKey::new(exam_id, oj_user_id)?;
             validate_state(hello.state)?;
-            connect(tx, &key, Some(connection_id), &hello, observed_at)
+            return connect(tx, &key, Some(connection_id), &hello, observed_at)
                 .await
-                .map(BatchOutput::Connected)
+                .map(BatchOutput::Connected);
+        }
+        BatchWrite::ConnectVerified {
+            exam_id,
+            oj_user_id,
+            username,
+            connection_id,
+            hello,
+            observed_at,
+        } => {
+            let key = StudentKey::new(exam_id, oj_user_id)?;
+            return connect_verified(tx, &key, connection_id, &hello, observed_at, &username)
+                .await
+                .map(BatchOutput::Connected);
         }
         BatchWrite::Disconnect {
             exam_id,
@@ -565,14 +642,8 @@ async fn apply_batch_write(
             last_seen_at,
         } => {
             let key = StudentKey::new(exam_id, oj_user_id)?;
-            let runtime = Runtime::get(tx, &key).await?;
-            if let Some(expected) = connection_id
-                && runtime.connection_id.as_deref() != Some(&expected.to_string())
-            {
-                return Ok(BatchOutput::Ack);
-            }
-            disconnect_with_last_seen(tx, &runtime, reason, observed_at, last_seen_at).await?;
-            Ok(BatchOutput::Ack)
+            disconnect_generation(tx, &key, connection_id, reason, observed_at, last_seen_at)
+                .await?;
         }
         BatchWrite::Status {
             exam_id,
@@ -589,7 +660,6 @@ async fn apply_batch_write(
                 service.now(),
             )
             .await?;
-            Ok(BatchOutput::Ack)
         }
         BatchWrite::Event {
             exam_id,
@@ -608,7 +678,6 @@ async fn apply_batch_write(
                 observed_at,
             )
             .await?;
-            Ok(BatchOutput::Ack)
         }
         BatchWrite::CommandResult {
             exam_id,
@@ -621,16 +690,48 @@ async fn apply_batch_write(
         } => {
             let key = StudentKey::new(exam_id, oj_user_id)?;
             commands::record(tx, key, connection_id, command_id, name, status, error_code).await?;
-            Ok(BatchOutput::Ack)
         }
         BatchWrite::Admin {
             actor,
             op,
             last_seen_at,
-        } => admin::mutate(tx, service, &actor, &op, last_seen_at)
-            .await
-            .map(BatchOutput::Admin),
+        } => {
+            return admin::mutate(tx, service, &actor, &op, last_seen_at)
+                .await
+                .map(BatchOutput::Admin);
+        }
     }
+    Ok(BatchOutput::Ack)
+}
+
+async fn connect_verified(
+    tx: &DatabaseTransaction,
+    key: &StudentKey,
+    connection_id: Uuid,
+    hello: &ClientHello,
+    observed_at: OffsetDateTime,
+    username: &str,
+) -> Result<ConnectOutcome, DomainError> {
+    validate_state(hello.state)?;
+    student_registration::bind(tx, key, student_registration::school_number(username)).await?;
+    connect(tx, key, Some(connection_id), hello, observed_at).await
+}
+
+async fn disconnect_generation(
+    tx: &DatabaseTransaction,
+    key: &StudentKey,
+    connection_id: Option<Uuid>,
+    reason: DisconnectReason,
+    observed_at: OffsetDateTime,
+    last_seen_at: Option<OffsetDateTime>,
+) -> Result<(), DomainError> {
+    let runtime = Runtime::get(tx, key).await?;
+    if let Some(expected) = connection_id
+        && runtime.connection_id.as_deref() != Some(&expected.to_string())
+    {
+        return Ok(());
+    }
+    disconnect_with_last_seen(tx, &runtime, reason, observed_at, last_seen_at).await
 }
 
 async fn flush_heartbeats(

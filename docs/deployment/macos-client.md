@@ -1,32 +1,39 @@
 # macOS 客户端部署
 
-正式版本以 DMG 分发，支持 macOS 14 及以上。打开映像，将 `CVBBMSO.app` 拖到同一窗口的「应用程序」入口，退出映像，再从 `/Applications` 双击应用。使用系统的应用安装权限完成复制。客户端只接受标准 `/Applications/CVBBMSO.app` 位置及经过验证的签名。直接从映像、App Translocation 或用户安装目录启动时无法注册特权服务。
+CVBBMSO 提供 Apple Silicon 和 Intel 两种 DMG，要求 macOS 14 或更新版本。监考服务须使用 macOS 已信任的 HTTPS 证书，并支持 WSS。
 
-## 授权与网络准入
+## 考前启动
 
-客户端在普通会话完成前置检查，再通过 `SMAppService` 注册随应用签名的 LaunchDaemon。系统需要批准时，在「系统设置 → 通用 → 登录项与扩展」允许 CVBBMSO 的后台服务，回客户端重试。服务核对调用方的签名，使用同一版本内置的 Accoding 和监考 HTTPS 来源。守卫成功安装并通过内核规则检查后，客户端才能继续准入。启动前应退出旧客户端或另一场会话。
+1. 从监考方取得适合设备架构的 DMG 和 SHA-256。用 `shasum -a 256 -c <校验文件>` 核对后，打开映像，将 `CVBBMSO.app` 拖到「应用程序」。推出映像，再从「应用程序」双击 CVBBMSO。
+2. 客户端通过设备和网络检查后会自动请求一次系统管理员授权。管理员在 macOS 提示框中授权。需要退出时先取消授权。取消或失败后，控制窗可重试，Accoding 和考试入口保持关闭。
+3. 授权成功后，系统安装或更新受保护的应用副本，并启动网络守卫。守卫以当前桌面用户身份启动客户端，引导窗口随接棒结束。若系统要求录屏权限，在「系统设置 → 隐私与安全性」允许 CVBBMSO 录制屏幕。需要重启时先退出客户端，再从「应用程序」双击 CVBBMSO。
 
-`edu.buaa.accoding.cvbbmso.egress` 是签名标识、launchd 标签和 XPC Mach 服务名。plist 位于 `Contents/Library/LaunchDaemons`，执行文件位于 `/Applications/CVBBMSO.app/Contents/MacOS/cvbbmso-egress-service`。launchd 按 Team ID、签名标识和 Developer ID 类型执行 SpawnConstraint，签名校验也覆盖 App 封存和 helper。系统授权后，daemon 在 root 保护的 `/Library/Application Support/com.cvbbmso` 内保存验签且与运行中代码匹配的恢复副本。副本版本不匹配时原子替换。daemon 确认副本支持 V2 租约后，为看门狗和 launchd 恢复任务分配同一个独立代次，登记后才改变主 PF 规则。两个恢复进程均从这份副本启动。[Apple launchd 启动约束](https://developer.apple.com/documentation/security/applying-launch-environment-and-library-constraints)
+受保护的客户端在连接守卫前遇到网络预检失败时，请检查网络和代理设置，退出客户端后从「应用程序」重新打开。管理员授权前的网络检查仍可在原窗口重试。
 
-### PF 与恢复
+从试用版或更早的正式部署迁移时，先退出旧客户端并等待其守卫恢复。新入口使用 `edu.buaa.accoding.cvbbmso` 应用标识。旧安装、Cookie 与录像仍在原位置，权限变更可能需要重新授予录屏权限。
 
-应用优先使用已加载且符合 Network 契约的双向 `anchor "com.cvbbmso.egress"` 入口。自动激活限于已匹配的 macOS 原始规则和当前未启用的 PF。服务检查启用引用、规则、表和状态。对原厂启动规则，Apple 的 AirDrop 和应用防火墙调度入口可保留，实际子规则必须为空。对空内核规则集，只加入 CVBBMSO 入口。两种情况均先经 `pfctl -n` 解析，再只加载过滤段。系统配置文件继续由宿主维护。正常退出时，服务先清空自己的规则和表，释放自己的 PF 引用，再尝试恢复原过滤段。异常退出还由看门狗及租约负责清理。每次更新和关停由持有守卫的 XPC 会话独占。
+## 守卫与恢复
 
-发现自定义 PF、规则变化或未知参考状态时，准入暂停。管理员应按宿主 PF 流程，将旧的 `out` 或 `out quick` 入口替换为[双向入口](../../deploy/macos-egress/README.md)，先确认旧守卫已退出，再检查新规则并加载。PF 与其它管理程序之间没有公开的原子比较并替换接口，自动激活前后都检查快照。管理员应在宿主策略更新完成后再启动客户端。
+应用安装在 `/Library/Application Support/com.cvbbmso-client/CVBBMSO.app`。包内的 `Contents/Helpers/cvbbmso-pf` 负责 PF、看门狗和 launchd 恢复。管理员操作先把 App 复制到 root 保护的临时目录，核验整包签名，并将签名摘要与正在运行的 App 对照。升级会先确认旧会话已恢复，并持有会话锁更换 App 和 helper。
 
-如果其他服务启用 PF 或规则在会话期间变化，清理先处理 CVBBMSO 的专用规则与启用引用。无法证明原规则可安全恢复时保留退出后的空入口以及 `/Library/Application Support/com.cvbbmso/managed-pf.v1`。管理员可检查恢复记录和宿主管理规则，按宿主流程恢复。从旧版升级时，新版只在持有受保护的 `managed-pf.v1` 且内核规则精确匹配旧版自动配置的空闲快照时，才会撤除旧的自动 `out` 入口。若无法核实，保留记录，由管理员按宿主流程恢复后重试。退出客户端并确认守卫及恢复任务已清理后，再移除应用或在系统设置中停用后台服务。
-
-## 构建和核验 DMG
-
-使用原生 macOS shell 和 macOS SDK。仓库的 `rust-toolchain.toml` 和 DMG 工作流均指定 Rust 1.99.1。在对应提交中运行脚本，生成本机架构的锁定 Release 构建，脚本输出 DMG 路径和 SHA-256。
+正常退出时等客户端清理守卫。异常退出时保留已安装的 App 和 `/Library/Application Support/com.cvbbmso/` 下的恢复记录，看门狗和 launchd 会继续尝试恢复。确认客户端已经退出后，管理员可手动触发恢复。
 
 ```sh
+sudo '/Library/Application Support/com.cvbbmso-client/CVBBMSO.app/Contents/Helpers/cvbbmso-pf' recover
+```
+
+自定义 PF 主过滤规则应在首条过滤规则位置保留双向 `anchor "com.cvbbmso.egress"`。宿主规则有冲突，或 CVBBMSO 无法确认原规则可恢复时，管理员按原有宿主管理流程核对内核规则和恢复记录。详见 [Network 的 PF 契约](../design/crates/cvbbmso-network.md)。
+
+## 构建和核验
+
+使用对应架构的原生 macOS、macOS SDK 和 `rust-toolchain.toml` 指定的 Rust 工具链。以下命令生成临时签名的候选 DMG 和独立 SHA-256 文件。
+
+```sh
+export CVBBMSO_SERVER_ORIGIN=https://monitor.example.edu/
 ./deploy/macos-egress/build-dmg.sh candidate
 ./deploy/macos-egress/verify-dmg.sh "$IMAGE" candidate
 ```
 
-`candidate` 生成 `-unsigned-candidate.dmg`，用于检查映像内容。候选不包含生产 Team 或监考配置，系统特权服务拒绝运行。映像只读挂载进行检查，核对拖放入口、App、plist、Mach 服务名及安装后解析的执行路径。
+`IMAGE` 为构建脚本输出的 DMG 路径。正式签名交付使用同一脚本的 `release` 模式，设置 `CVBBMSO_MACOS_TEAM_ID`、`CVBBMSO_MACOS_SIGN_IDENTITY` 和 `CVBBMSO_MACOS_NOTARY_PROFILE`。脚本用 Developer ID 依次签 helper、App 和 DMG，然后提交 Apple 公证并装订票据。密钥和公证凭据存放在发布密钥链。[Apple 分发打包文档](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution)
 
-正式分发改用 `build-dmg.sh release`。发布环境从可信配置提供 `CVBBMSO_MACOS_TEAM_ID`、`CVBBMSO_MACOS_SIGN_IDENTITY`、`CVBBMSO_MACOS_NOTARY_PROFILE` 和 `CVBBMSO_SERVER_ORIGIN`。脚本先用 Developer ID Application 和 Hardened Runtime 签 helper，再封存 App，最后签 DMG、提交 Apple 公证并装订票据。密钥和 notary 凭据留在发布密钥链，监考来源由发布环境注入。[Apple 分发打包文档](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution)
-
-开发检查使用 `test-authorization.sh`、Network 测试替身和 `verify-dmg.sh`。签名授权、Finder 拖入后的实际系统授权路径、实际守卫和宿主流量仍须在隔离环境使用正式签名版本检查。
+构建检查会只读挂载映像，核对「应用程序」入口、App 标识、源码提交、嵌套签名、架构和最低系统版本。管理员授权、录屏权限、实际 PF 续期及异常恢复须在隔离实体 Mac 验收。

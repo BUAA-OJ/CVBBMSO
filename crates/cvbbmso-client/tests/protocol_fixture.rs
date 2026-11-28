@@ -241,7 +241,7 @@ async fn websocket_checks_identity_and_answers_hello_with_sync() {
 }
 
 #[tokio::test]
-async fn monitor_validates_the_https_exam_list_and_returns_only_items() {
+async fn monitor_validates_the_https_exam_list_and_its_verified_user() {
     let (addr, cert, server) = fixture().await;
     let origin = url::Url::parse(&format!("https://{addr}"))
         .unwrap()
@@ -250,9 +250,10 @@ async fn monitor_validates_the_https_exam_list_and_returns_only_items() {
     let monitor = Monitor::with_root_certificate(origin.clone(), root).unwrap();
     assert_eq!(monitor.server_base().as_str(), format!("https://{addr}/"));
 
-    let items = monitor.list_exams(&cookie("enrolled")).await.unwrap();
+    let list = monitor.list_exams(&cookie("enrolled")).await.unwrap();
+    assert_eq!(list.user.id, 42);
     assert_eq!(
-        items,
+        list.items,
         [ExamSummary::new(
             EXAM_ID,
             "Synthetic exam".into(),
@@ -263,7 +264,11 @@ async fn monitor_validates_the_https_exam_list_and_returns_only_items() {
         .unwrap()]
     );
     assert_eq!(
-        monitor.list_exams(&cookie("without-exams")).await.unwrap(),
+        monitor
+            .list_exams(&cookie("without-exams"))
+            .await
+            .unwrap()
+            .items,
         Vec::<ExamSummary>::new()
     );
     assert!(matches!(
@@ -327,7 +332,7 @@ async fn monitor_accepts_the_size_limit_and_stops_reading_chunked_overflow() {
     let root = reqwest::Certificate::from_der(cert.as_ref()).unwrap();
     let monitor = Monitor::with_root_certificate(origin, root).unwrap();
 
-    let items = monitor.list_exams(&cookie("at-limit")).await.unwrap();
+    let items = monitor.list_exams(&cookie("at-limit")).await.unwrap().items;
     assert_eq!(items, Vec::<ExamSummary>::new());
     assert!(matches!(
         timeout(LIMIT, monitor.list_exams(&cookie("oversized")))

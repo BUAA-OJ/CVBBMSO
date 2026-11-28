@@ -11,8 +11,8 @@ name = "cvbbmso_network"
 path = "src/lib.rs"
 
 [[bin]]
-name = "cvbbmso-egress-watchdog"
-path = "src/bin/cvbbmso-egress-watchdog.rs"
+name = "cvbbmso-pf"
+path = "src/bin/cvbbmso-pf.rs"
 
 [dependencies]
 reqwest.workspace = true
@@ -27,6 +27,7 @@ core-foundation.workspace = true
 libc.workspace = true
 system-configuration.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "process", "signal", "sync"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
@@ -44,7 +45,7 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 url.workspace = true
 wiremock.workspace = true
 

@@ -4,6 +4,8 @@ pub use sea_orm_migration::prelude::*;
 
 mod m20261121_043144_initial;
 mod m20261126_000001_add_connection_id;
+mod m20261127_000001_student_enrollments;
+mod m20261127_000002_student_profiles;
 
 /// Applies the exam schema migrations in order.
 pub struct Migrator;
@@ -14,6 +16,8 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20261121_043144_initial::Migration),
             Box::new(m20261126_000001_add_connection_id::Migration),
+            Box::new(m20261127_000001_student_enrollments::Migration),
+            Box::new(m20261127_000002_student_profiles::Migration),
         ]
     }
 }

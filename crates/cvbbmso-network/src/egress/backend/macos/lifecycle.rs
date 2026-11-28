@@ -1,8 +1,7 @@
 //! Owns installation and recovery across the client and its privileged helpers.
 
 use std::fs::File;
-use std::path::Path;
-use std::process::{Child, ExitCode, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,101 +9,53 @@ use crate::NetworkError;
 use crate::egress::backend::InstallResult;
 use crate::egress::cleanup::Job;
 use crate::egress::commands::{Commands, Diagnostic, SystemCommands};
+use crate::egress::policy::Plan;
+use crate::egress::session::{HELPER, check_helper};
 use crate::egress::state::{self, Generation, GuardState};
-use crate::egress::{managed, policy::Plan};
 
 use super::{
     ANCHOR, PFCTL, PfGuard, RULES, TOKEN, has_enable_record, install_with, local_addresses,
-    managed_pf, recover_with, verify_deployment,
+    managed_pf, recover_with,
 };
 
-const HELPER: &str = "/Library/PrivilegedHelperTools/com.cvbbmso.egress-watchdog";
 const CAPABILITIES: &str = "--capabilities";
 const LEASE_CAPABILITY: &str = "cvbbmso-egress-leases-v2";
 
-pub(crate) struct Prepared {
-    lock: File,
-    helper: &'static str,
-    versioned_helper: bool,
-}
+pub(crate) struct Prepared(File);
 
 impl Prepared {
     pub(crate) fn new() -> Result<Self, NetworkError> {
-        // SAFETY: geteuid has no preconditions.
-        if unsafe { libc::geteuid() } != 0 {
-            return Err(NetworkError::PermissionDenied);
-        }
-        for path in ["/", "/Library", "/Library/PrivilegedHelperTools"] {
-            state::check_protected(Path::new(path), true)?;
-        }
-        state::check_protected(Path::new(HELPER), false)?;
-        let commands = SystemCommands::new(None);
-        let versioned_helper = supports_versioned_leases(&commands, HELPER)?;
-        verify_deployment(&commands)?;
-        let lock = state::lock()?;
-        let commands = SystemCommands::new(Some(&lock));
-        verify_deployment(&commands)?;
-        if state::read(&commands)?
-            .is_some_and(|state| !state.expired() && process_alive(state.parent))
-        {
-            return Err(NetworkError::Platform);
-        }
-        recover(&commands, false)?;
-        Ok(Self {
-            lock,
-            helper: HELPER,
-            versioned_helper,
-        })
-    }
-
-    pub(crate) fn managed() -> Result<Self, NetworkError> {
-        let lock = prepare_managed(true)?;
-        Ok(Self {
-            lock,
-            helper: managed::RECOVERY_SERVICE,
-            versioned_helper: true,
-        })
-    }
-
-    pub(crate) fn clean_before_resolution() -> Result<(), NetworkError> {
-        prepare_managed(false).map(drop)
+        prepare(true).map(Self)
     }
 
     pub(crate) fn install(self, plan: &Plan) -> Result<InstallResult, NetworkError> {
-        let commands = SystemCommands::new(Some(&self.lock));
-        let generation = self
-            .versioned_helper
-            .then(|| Generation::allocate(&commands))
-            .transpose()?;
-        let mut guard_state = GuardState::new(std::process::id(), generation.clone());
-        let job = Job::new(generation);
+        let commands = SystemCommands::new(Some(&self.0));
+        let generation = Generation::allocate(&commands)?;
+        let mut guard_state = GuardState::new(std::process::id(), Some(generation.clone()));
+        let job = Job::Lease(generation.clone());
         state::write(&commands, &guard_state)?;
-        let managed = self.helper == managed::RECOVERY_SERVICE;
-        let mut watchdog = match Watchdog::start(job.clone(), self.helper) {
+        let mut watchdog = match Watchdog::start(&generation) {
             Ok(watchdog) => watchdog,
             Err(error) => {
-                recover_job(&commands, &job, managed)?;
+                recover_job(&commands, &job)?;
                 return Err(error);
             }
         };
         guard_state.watchdog = watchdog.child.id();
         let result = (|| {
             state::write(&commands, &guard_state)?;
-            job.schedule(&commands, self.helper)?;
-            // Make the recovery lease durable before modifying the main PF ruleset.
-            if managed {
-                managed_pf::authorize(&commands)?;
-            }
+            Job::schedule(&commands, &generation, HELPER)?;
+            // Register recovery before changing the main PF ruleset.
+            managed_pf::authorize(&commands)?;
             install_with(&commands, plan, &local_addresses()?)
         })();
         match result {
             Ok(expected) => Ok(Arc::new(PfGuard {
                 expected: Mutex::new(expected),
                 watchdog: Mutex::new(Some(watchdog)),
-                managed,
             })),
             Err(error) => {
-                recover_job(&commands, &job, managed)?;
+                recover_job(&commands, &job)?;
                 watchdog.stop();
                 Err(error)
             }
@@ -112,11 +63,8 @@ impl Prepared {
     }
 }
 
-fn prepare_managed(installing: bool) -> Result<File, NetworkError> {
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } != 0 {
-        return Err(NetworkError::PermissionDenied);
-    }
+pub(super) fn prepare(installing: bool) -> Result<File, NetworkError> {
+    check_helper()?;
     let lock = state::lock()?;
     let commands = SystemCommands::new(Some(&lock));
     let previous = state::read(&commands)?;
@@ -131,29 +79,17 @@ fn prepare_managed(installing: bool) -> Result<File, NetworkError> {
         || has_guard_records(&commands)?
         || managed_pf::has_journal(&commands)?;
     if installing || needs_recovery {
-        managed::stage_recovery()?;
-        require_managed_helper(&commands)?;
+        require_helper(&commands)?;
     }
     if needs_recovery {
-        recover(&commands, true)?;
+        recover(&commands)?;
     }
     Ok(lock)
 }
 
-fn require_managed_helper(commands: &dyn Commands) -> Result<(), NetworkError> {
-    if supports_versioned_leases(commands, managed::RECOVERY_SERVICE)? {
-        Ok(())
-    } else {
-        Err(NetworkError::Platform)
-    }
-}
-
-fn supports_versioned_leases(commands: &dyn Commands, helper: &str) -> Result<bool, NetworkError> {
-    match commands.diagnostic(helper, &[CAPABILITIES])? {
-        Diagnostic::Success(output) if output.trim() == LEASE_CAPABILITY => Ok(true),
-        Diagnostic::Rejected(output) if output.trim() == NetworkError::Policy.to_string() => {
-            Ok(false)
-        }
+fn require_helper(commands: &dyn Commands) -> Result<(), NetworkError> {
+    match commands.diagnostic(HELPER, &[CAPABILITIES])? {
+        Diagnostic::Success(output) if output.trim() == LEASE_CAPABILITY => Ok(()),
         _ => Err(NetworkError::Platform),
     }
 }
@@ -164,24 +100,19 @@ fn has_guard_records(commands: &dyn Commands) -> Result<bool, NetworkError> {
         || has_enable_record(commands)?)
 }
 
-pub(super) fn recover(commands: &dyn Commands, managed: bool) -> Result<(), NetworkError> {
+pub(super) fn recover(commands: &dyn Commands) -> Result<(), NetworkError> {
     if let Some(state) = state::read(commands)? {
-        recover_job(commands, &Job::new(state.generation), managed)
+        recover_job(commands, &Job::new(state.generation))
     } else if let Some(pending) = Job::pending(commands)? {
         pending.finish_cleanup(commands)
     } else {
-        recover_job(commands, &Job::Legacy, managed)
+        recover_job(commands, &Job::Legacy)
     }
 }
 
-pub(super) fn recover_job(
-    commands: &dyn Commands,
-    job: &Job,
-    managed: bool,
-) -> Result<(), NetworkError> {
+pub(super) fn recover_job(commands: &dyn Commands, job: &Job) -> Result<(), NetworkError> {
     // An interrupted managed setup can have an owner before any anchor exists.
-    if !managed
-        || has_guard_records(commands)?
+    if has_guard_records(commands)?
         || commands
             .output(PFCTL, &["-s", "Anchors"])?
             .lines()
@@ -201,19 +132,19 @@ pub(super) struct Watchdog {
 }
 
 impl Watchdog {
-    fn start(job: Job, helper: &str) -> Result<Self, NetworkError> {
+    fn start(generation: &Generation) -> Result<Self, NetworkError> {
         let parent = std::process::id().to_string();
-        let mut command = std::process::Command::new(helper);
-        match &job {
-            Job::Legacy => command.args(["--watch", &parent]),
-            Job::Lease(generation) => command.args(["--watch-lease", &parent, generation.as_str()]),
-        };
-        let child = command
+        let child = std::process::Command::new(HELPER)
+            .args(["--watch-lease", &parent, generation.as_str()])
             .env_clear()
             .stdin(Stdio::piped())
+            .stdout(Stdio::null())
             .spawn()
             .map_err(|_| NetworkError::Io)?;
-        Ok(Self { child, job })
+        Ok(Self {
+            child,
+            job: Job::Lease(generation.clone()),
+        })
     }
 
     pub(super) fn check(&mut self) -> Result<GuardState, NetworkError> {
@@ -253,52 +184,37 @@ fn process_alive(pid: u32) -> bool {
             || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }
 
-pub(crate) fn watchdog_entry() -> ExitCode {
-    run_watchdog(false)
-}
-
-pub(crate) fn managed_watchdog_entry() -> ExitCode {
-    run_watchdog(true)
-}
-
-fn run_watchdog(managed: bool) -> ExitCode {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let result = match args.as_slice() {
+pub(crate) fn run_watchdog(args: &[String]) -> Result<(), NetworkError> {
+    match args {
         [flag] if flag == CAPABILITIES => {
             println!("{LEASE_CAPABILITY}");
             Ok(())
         }
-        [flag] if flag == "--recover" => recovery_tick(&Job::Legacy, None, managed).map(drop),
+        [flag] if flag == "--recover" => recovery_tick(&Job::Legacy, None).map(drop),
         [flag, generation] if flag == "--recover-lease" => {
             Generation::try_from(generation.to_owned())
-                .and_then(|generation| recovery_tick(&Job::Lease(generation), None, managed))
+                .and_then(|generation| recovery_tick(&Job::Lease(generation), None))
                 .map(drop)
         }
         [flag, parent] if flag == "--watch" => parent
             .parse::<u32>()
             .map_err(|_| NetworkError::Policy)
-            .map(|parent| watch_until_recovered(&Job::Legacy, parent, managed)),
+            .map(|parent| watch_until_recovered(&Job::Legacy, parent)),
         [flag, parent, generation] if flag == "--watch-lease" => {
             Generation::try_from(generation.to_owned()).and_then(|generation| {
                 let parent = parent.parse::<u32>().map_err(|_| NetworkError::Policy)?;
-                watch_until_recovered(&Job::Lease(generation), parent, managed);
+                watch_until_recovered(&Job::Lease(generation), parent);
                 Ok(())
             })
         }
         _ => Err(NetworkError::Policy),
-    };
-    if let Err(error) = result {
-        eprintln!("{error}");
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
     }
 }
 
-fn watch_until_recovered(job: &Job, parent: u32, managed: bool) {
+fn watch_until_recovered(job: &Job, parent: u32) {
     let mut reported = false;
     loop {
-        match recovery_tick(job, Some(parent), managed) {
+        match recovery_tick(job, Some(parent)) {
             Ok(true) => return,
             Ok(false) => reported = false,
             Err(error) if !reported => {
@@ -311,20 +227,19 @@ fn watch_until_recovered(job: &Job, parent: u32, managed: bool) {
     }
 }
 
-fn recovery_tick(job: &Job, parent: Option<u32>, managed: bool) -> Result<bool, NetworkError> {
+fn recovery_tick(job: &Job, parent: Option<u32>) -> Result<bool, NetworkError> {
     let lock = state::lock()?;
     let commands = SystemCommands::new(Some(&lock));
-    recovery_tick_with(&commands, job, parent, managed)
+    recovery_tick_with(&commands, job, parent)
 }
 
 fn recovery_tick_with(
     commands: &dyn Commands,
     job: &Job,
     parent: Option<u32>,
-    managed: bool,
 ) -> Result<bool, NetworkError> {
     let Some(state) = state::read(commands)? else {
-        return recover_without_owner(commands, job, parent, managed);
+        return recover_without_owner(commands, job, parent);
     };
     if !matches_job(&state, job) {
         return retire_if_scheduled(commands, job, parent);
@@ -344,7 +259,7 @@ fn recovery_tick_with(
         None => state.expired() || !process_alive(state.parent),
     };
     if recover_now {
-        recover_job(commands, job, managed)?;
+        recover_job(commands, job)?;
     }
     Ok(recover_now)
 }
@@ -353,7 +268,6 @@ pub(super) fn recover_without_owner(
     commands: &dyn Commands,
     job: &Job,
     parent: Option<u32>,
-    managed: bool,
 ) -> Result<bool, NetworkError> {
     if let Some(pending) = Job::pending(commands)? {
         // PF and its owner record were already cleared. The watchdog or
@@ -365,11 +279,9 @@ pub(super) fn recover_without_owner(
         }
     } else if *job != Job::Legacy {
         return retire_if_scheduled(commands, job, parent);
-    } else if parent.is_none()
-        || has_enable_record(commands)?
-        || (managed && managed_pf::has_journal(commands)?)
+    } else if parent.is_none() || has_enable_record(commands)? || managed_pf::has_journal(commands)?
     {
-        recover_job(commands, job, managed)?;
+        recover_job(commands, job)?;
     }
     Ok(true)
 }
@@ -422,49 +334,15 @@ mod tests {
     const DOMAIN: &str = "system/com.cvbbmso.egress-cleanup";
 
     #[test]
-    fn only_the_recognized_legacy_helper_allows_downgrade() {
-        let recorder = Recorder::default();
-        recorder.reply(&[CAPABILITIES], Ok(LEASE_CAPABILITY));
-        assert_eq!(supports_versioned_leases(&recorder, HELPER), Ok(true));
-        recorder.rejected(&[CAPABILITIES], &NetworkError::Policy.to_string());
-        assert_eq!(supports_versioned_leases(&recorder, HELPER), Ok(false));
-        recorder.rejected(&[CAPABILITIES], "Permission denied");
-        assert_eq!(
-            supports_versioned_leases(&recorder, HELPER),
-            Err(NetworkError::Platform)
-        );
-        recorder.reply(&[CAPABILITIES], Err(NetworkError::Io));
-        assert_eq!(
-            supports_versioned_leases(&recorder, HELPER),
-            Err(NetworkError::Io)
-        );
-        assert!(
-            recorder
-                .calls()
-                .iter()
-                .all(|call| matches!(call, Call::Output(program, _) if program == HELPER))
-        );
-    }
-
-    #[test]
-    fn managed_recovery_requires_v2_on_the_protected_helper() {
+    fn recovery_requires_v2_on_the_protected_helper() {
         let recorder = Recorder::default();
         recorder.rejected(&[CAPABILITIES], &NetworkError::Policy.to_string());
-        assert_eq!(
-            require_managed_helper(&recorder),
-            Err(NetworkError::Platform)
-        );
+        assert_eq!(require_helper(&recorder), Err(NetworkError::Platform));
         recorder.reply(&[CAPABILITIES], Ok(LEASE_CAPABILITY));
-        assert_eq!(require_managed_helper(&recorder), Ok(()));
+        assert_eq!(require_helper(&recorder), Ok(()));
         assert_eq!(
             recorder.calls(),
-            vec![
-                Call::Output(
-                    managed::RECOVERY_SERVICE.to_owned(),
-                    vec![CAPABILITIES.to_owned()],
-                );
-                2
-            ]
+            vec![Call::Output(HELPER.to_owned(), vec![CAPABILITIES.to_owned()]); 2]
         );
     }
 
@@ -504,25 +382,24 @@ mod tests {
                 ),
             )
             .unwrap();
-            recorder.reply(&["bootstrap", "system", &first_path], Err(NetworkError::Io));
-            assert_eq!(first.schedule(&recorder, HELPER), Err(NetworkError::Io));
+            // The interrupted install left its existing job definition.
+            recorder.write(&first_path, "old job definition").unwrap();
             recorder.reply(&["bootout", &first_domain], Err(NetworkError::Io));
-            assert_eq!(recover(&recorder, false), Err(NetworkError::Io));
+            assert_eq!(recover(&recorder), Err(NetworkError::Io));
             assert_eq!(Job::pending(&recorder).unwrap(), Some(first.clone()));
             assert!(state::read(&recorder).unwrap().is_none());
             assert!(recorder.contents(&first_path).is_none());
             recorder.rejected(&["bootout", &first_domain], "Boot-out failed");
             recorder.rejected(&["print", &first_domain], &absence);
-            recover(&recorder, false).unwrap();
+            recover(&recorder).unwrap();
 
             let generation = Generation::allocate(&recorder).unwrap();
-            let next = Job::Lease(generation.clone());
             state::write(
                 &recorder,
                 &GuardState::new(u32::MAX, Some(generation.clone())),
             )
             .unwrap();
-            next.schedule(&recorder, HELPER).unwrap();
+            Job::schedule(&recorder, &generation, HELPER).unwrap();
             recorder.write(RULES, "next lease owns PF").unwrap();
             let next_label = format!("com.cvbbmso.egress-cleanup.v2.{}", generation.as_str());
             let next_domain = format!("system/{next_label}");
@@ -537,11 +414,8 @@ mod tests {
             assert!(loaded.contains(next_domain.as_str()));
 
             recorder.calls.borrow_mut().clear();
-            assert_eq!(
-                recovery_tick_with(&recorder, &first, Some(1234), false),
-                Ok(true)
-            );
-            assert_eq!(recovery_tick_with(&recorder, &first, None, false), Ok(true));
+            assert_eq!(recovery_tick_with(&recorder, &first, Some(1234)), Ok(true));
+            assert_eq!(recovery_tick_with(&recorder, &first, None), Ok(true));
             assert!(
                 recorder
                     .calls()
@@ -597,7 +471,7 @@ mod tests {
                 )),
             );
             assert_eq!(
-                recover_without_owner(&recorder, &Job::Legacy, Some(1234), false),
+                recover_without_owner(&recorder, &Job::Legacy, Some(1234)),
                 result
             );
             let releases = recorder
@@ -624,14 +498,14 @@ mod tests {
             let recorder = Recorder::default();
             state::write(&recorder, &GuardState::new(1234, None)).unwrap();
             recorder.reply(&["bootout", DOMAIN], Err(NetworkError::Io));
-            assert_eq!(recover(&recorder, false), Err(NetworkError::Io));
+            assert_eq!(recover(&recorder), Err(NetworkError::Io));
             assert!(state::read(&recorder).unwrap().is_none());
             assert_eq!(Job::pending(&recorder).unwrap(), Some(Job::Legacy));
 
             recorder.calls.borrow_mut().clear();
             recorder.reply(&["bootout", DOMAIN], Err(NetworkError::Io));
             assert_eq!(
-                recover_without_owner(&recorder, &Job::Legacy, parent, false),
+                recover_without_owner(&recorder, &Job::Legacy, parent),
                 Err(NetworkError::Io)
             );
             assert_eq!(Job::pending(&recorder).unwrap(), Some(Job::Legacy));
@@ -643,7 +517,7 @@ mod tests {
                 "Could not find service \"com.cvbbmso.egress-cleanup\" in domain for system",
             );
             assert_eq!(
-                recover_without_owner(&recorder, &Job::Legacy, parent, false),
+                recover_without_owner(&recorder, &Job::Legacy, parent),
                 Ok(true)
             );
             assert_eq!(Job::pending(&recorder).unwrap(), None);

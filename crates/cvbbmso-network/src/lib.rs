@@ -32,28 +32,22 @@ mod egress;
 mod endpoint;
 mod inspector;
 mod proxy;
+#[cfg(any(target_os = "macos", windows))]
+#[cfg_attr(windows, path = "tunnel/windows.rs")]
+#[cfg_attr(
+    windows,
+    allow(unsafe_code, reason = "the adapter reads Windows IP Helper tables")
+)]
+mod tunnel;
 
-#[cfg(target_os = "macos")]
-pub use self::egress::managed::MacosEgressGuard;
 pub use self::egress::{EgressGuard, EgressPolicy};
 
-/// Entry point for the signed macOS `LaunchDaemon` and its recovery subprocess.
+/// Entry point for the administrator-launched macOS helper and recovery jobs.
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 #[must_use]
-pub fn macos_egress_service_main() -> std::process::ExitCode {
-    egress::managed::service_main()
-}
-
-/// Entry point of the `cvbbmso-egress-watchdog` helper binary.
-///
-/// The helper is a separate compilation unit, so it cannot call crate-private
-/// items; this entry point exists only for it and is hidden from the
-/// documentation.
-#[doc(hidden)]
-#[must_use = "return the watchdog status to the operating system"]
-pub fn watchdog_main() -> std::process::ExitCode {
-    egress::watchdog_entry()
+pub fn macos_pf_main() -> std::process::ExitCode {
+    egress::session::main()
 }
 pub use self::endpoint::EndpointState;
 pub use self::inspector::{Inspector, NetworkReport};
@@ -83,21 +77,17 @@ pub enum NetworkError {
     /// A name required by the egress policy could not be resolved.
     #[error("the egress policy address could not be resolved")]
     Resolution,
-    /// The signed app service requires macOS 14 or later.
+    /// The administrator-launched helper requires macOS 14 or later.
     #[cfg(target_os = "macos")]
     #[error("the macOS egress service requires macOS 14 or later")]
     MacosUnsupported,
-    /// The build, signature or app location is ineligible for privileged use.
+    /// The installed helper, App or deployment configuration cannot be trusted.
     #[cfg(target_os = "macos")]
-    #[error("the signed macOS egress service or app installation could not be trusted")]
+    #[error("the macOS egress helper or app installation could not be trusted")]
     MacosUntrustedInstallation,
-    /// An administrator must approve the registered system service.
+    /// The administrator-launched session could not be contacted or validated.
     #[cfg(target_os = "macos")]
-    #[error("approve the egress service in macOS Login Items & Extensions")]
-    MacosApprovalRequired,
-    /// The registered service could not be contacted or validated.
-    #[cfg(target_os = "macos")]
-    #[error("the macOS egress service is unavailable")]
+    #[error("the macOS egress session is unavailable")]
     MacosServiceUnavailable,
     /// The live or persistent host PF policy requires administrator review.
     #[cfg(target_os = "macos")]

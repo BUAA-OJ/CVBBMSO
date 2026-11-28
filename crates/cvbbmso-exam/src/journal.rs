@@ -25,6 +25,7 @@ use cvbbmso_protocol::{
     SegmentMeta, Sha256Digest,
 };
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use uuid::Uuid;
 
 use crate::ExamError;
 
@@ -37,6 +38,24 @@ const CORRUPT_FILE: &str = "journal.json.corrupt";
 const MAX_WIRE_SEQ: u64 = i64::MAX.cast_unsigned();
 /// Old snapshots can store numbers above the current wire limit.
 const LEGACY_EXHAUSTED: u128 = (u64::MAX as u128) + 1;
+
+/// Resolves local storage for the verified candidate.
+pub(crate) fn candidate_dir(
+    app_data_dir: &Path,
+    exam_id: Uuid,
+    oj_user_id: i64,
+) -> Result<PathBuf, ExamError> {
+    if oj_user_id <= 0 {
+        return Err(ExamError::Storage(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Accoding user id must be positive",
+        )));
+    }
+    Ok(app_data_dir
+        .join("exams")
+        .join(exam_id.to_string())
+        .join(oj_user_id.to_string()))
+}
 
 /// Durable runtime state of one candidate in one exam.
 pub(crate) struct Journal {
@@ -200,6 +219,31 @@ impl Journal {
         Ok(Self { dir, data })
     }
 
+    /// Reads a pending journal without creating or repairing local data.
+    pub(crate) async fn open_pending(candidate_dir: &Path) -> Result<Option<Self>, ExamError> {
+        let dir = candidate_dir.join(RUNTIME_DIR);
+        tokio::task::spawn_blocking(move || {
+            let Some(bytes) = read_snapshot(&dir.join(JOURNAL_FILE))? else {
+                return Ok(None);
+            };
+            let journal = Self {
+                dir,
+                data: decode_snapshot(&bytes)?,
+            };
+            Ok(journal.has_pending_finalization().then_some(journal))
+        })
+        .await
+        .map_err(|error| ExamError::Storage(io::Error::other(error)))?
+        .map_err(ExamError::Storage)
+    }
+
+    pub(crate) fn has_pending_finalization(&self) -> bool {
+        matches!(
+            self.state().execution,
+            ExecutionState::Recording | ExecutionState::Finalizing
+        )
+    }
+
     /// Writes the current state durably.
     ///
     /// Callers save after every change and before sending the corresponding
@@ -307,16 +351,33 @@ impl Journal {
 fn load(dir: &Path) -> io::Result<Data> {
     fs::create_dir_all(dir)?;
     let path = dir.join(JOURNAL_FILE);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Data::default()),
-        Err(error) => return Err(error),
+    let Some(bytes) = read_snapshot(&path)? else {
+        return Ok(Data::default());
     };
-    match serde_json::from_slice::<Data>(&bytes) {
-        Ok(data) if data.is_valid() => Ok(data),
-        Ok(_) => recover_corrupt(dir, &path, &"inconsistent snapshot"),
+    match decode_snapshot(&bytes) {
+        Ok(data) => Ok(data),
         Err(error) => recover_corrupt(dir, &path, &error),
     }
+}
+
+fn read_snapshot(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn decode_snapshot(bytes: &[u8]) -> io::Result<Data> {
+    let data = serde_json::from_slice::<Data>(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if !data.is_valid() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "inconsistent runtime journal",
+        ));
+    }
+    Ok(data)
 }
 
 fn recover_corrupt(dir: &Path, path: &Path, error: &impl std::fmt::Display) -> io::Result<Data> {

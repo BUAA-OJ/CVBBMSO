@@ -76,6 +76,8 @@ impl Desktop {
 pub fn run() -> tauri::Result<()> {
     #[cfg(test)]
     {
+        #[cfg(target_os = "macos")]
+        admission::fixture::check_startup_network_recovery();
         match std::env::args().nth(1).as_deref() {
             Some("--native-smoke") => return smoke::run(smoke::Case::Desktop, None),
             Some("--native-smoke-detected") => return smoke::run(smoke::Case::Detected, None),
@@ -118,6 +120,14 @@ pub fn run() -> tauri::Result<()> {
     }
     #[cfg(not(test))]
     {
+        #[cfg(target_os = "macos")]
+        if platform::is_root() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "CVBBMSO must run as the current console user",
+            )
+            .into());
+        }
         let app = builder()
             .setup(|app| {
                 let data_dir = app.path().app_local_data_dir()?;
@@ -145,7 +155,7 @@ fn builder() -> tauri::Builder<Wry> {
             vm_preflight,
             admission::admission_status,
             #[cfg(target_os = "macos")]
-            admission::open_helper_approval_settings,
+            admission::authorize_macos_egress,
             open_accoding,
             inspect_session,
             list_exams,
@@ -155,15 +165,18 @@ fn builder() -> tauri::Builder<Wry> {
             confirm_exit,
         ])
         .on_window_event(|window, event| {
-            #[cfg(target_os = "macos")]
-            if window.label() == UI && matches!(event, WindowEvent::Focused(true)) {
-                let app = window.app_handle();
-                app.state::<admission::Admission>().recheck_approval(app);
-            }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 match window.label() {
                     UI => {
                         api.prevent_close();
+                        #[cfg(target_os = "macos")]
+                        if window
+                            .app_handle()
+                            .state::<admission::Admission>()
+                            .is_authorizing()
+                        {
+                            return;
+                        }
                         let _ = window.app_handle().emit_to(
                             EventTarget::webview(UI),
                             "confirm-exit",
@@ -447,5 +460,6 @@ async fn list_exams(app: AppHandle) -> Result<Vec<ExamSummary>, ListExamsError> 
     monitor
         .list_exams(&cookies)
         .await
+        .map(|response| response.items)
         .map_err(|error| ListExamsError::from(&error))
 }
