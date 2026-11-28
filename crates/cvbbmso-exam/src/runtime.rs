@@ -109,6 +109,7 @@ pub(crate) struct Launch {
     pub(crate) cookies: AccodingCookies,
     pub(crate) monitor: Monitor,
     pub(crate) timing: Timing,
+    pub(crate) finalizing_user: Option<i64>,
 }
 
 /// Verifies enrollment, opens the journal, connects, waits for the first
@@ -125,16 +126,11 @@ where
         cookies,
         monitor,
         timing,
+        finalizing_user,
     } = launch;
     let (oj_user_id, phase) = monitor.enrollment(&cookies, exam_id).await?;
     let candidate_dir = candidate_dir(&config.app_data_dir, exam_id, oj_user_id)?;
-    let journal = if phase == ExamPhase::Ended {
-        Journal::open_pending(&candidate_dir)
-            .await?
-            .ok_or(ExamError::ExamEnded)?
-    } else {
-        Journal::open(&candidate_dir).await?
-    };
+    let journal = open_journal(&candidate_dir, phase, oj_user_id, finalizing_user).await?;
     let state = resumed(journal.state());
 
     let (inbound_tx, mut inbound) = mpsc::channel(64);
@@ -158,8 +154,10 @@ where
         return Err(ExamError::WebSocket(None));
     };
     // The exam may have ended since the HTTP enrollment check.
-    if *phase == ExamPhase::Ended && !journal.has_pending_finalization() {
-        return Err(ExamError::ExamEnded);
+    match (*phase, finalizing_user) {
+        (ExamPhase::Ended, None) => return Err(ExamError::ExamEnded),
+        (ExamPhase::Ended, Some(_)) | (_, None) => {}
+        (_, Some(_)) => return Err(ExamError::WebSocket(None)),
     }
     let (capture, recorder) = open(oj_user_id, candidate_dir, *recording_policy)
         .await
@@ -219,6 +217,23 @@ where
         view,
         task,
     })
+}
+
+async fn open_journal(
+    candidate_dir: &std::path::Path,
+    phase: ExamPhase,
+    oj_user_id: i64,
+    finalizing_user: Option<i64>,
+) -> Result<Journal, ExamError> {
+    match finalizing_user {
+        Some(user) if user != oj_user_id => Err(ExamError::Auth),
+        Some(_) if phase != ExamPhase::Ended => Err(ExamError::NotEnrolled),
+        Some(_) => Journal::open_pending(candidate_dir)
+            .await?
+            .ok_or(ExamError::ExamEnded),
+        None if phase == ExamPhase::Ended => Err(ExamError::ExamEnded),
+        None => Journal::open(candidate_dir).await,
+    }
 }
 
 /// Waits for the session to open, sends `hello`, and returns the first `sync`.

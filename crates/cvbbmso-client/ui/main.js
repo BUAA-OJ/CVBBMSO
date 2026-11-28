@@ -217,7 +217,6 @@ const currentExamStatus = document.querySelector("#current-exam-status");
 const closeExam = document.querySelector("#close-exam");
 const examListRefreshMs = 30_000;
 let exams = [];
-let pendingFinalizations = new Set();
 let examListTimer;
 let examView = null;
 let examSelection = null;
@@ -280,8 +279,7 @@ function renderTime(timestamp) {
 
 function renderExamEntry(button) {
   const entered = button.dataset.examId === examView?.exam_id;
-  button.textContent = entered ? "已进入"
-    : pendingFinalizations.has(button.dataset.examId) ? "继续收尾" : "进入考试";
+  button.textContent = entered ? "已进入" : "进入考试";
   button.disabled = !examEventsReady || examBusy || examView !== null;
 }
 
@@ -305,7 +303,7 @@ function renderExam(exam) {
 }
 
 function canOpenExam(exam) {
-  return exam.phase !== "ended" || pendingFinalizations.has(exam.id);
+  return exam.phase !== "ended";
 }
 
 function renderExamList() {
@@ -322,9 +320,6 @@ function renderExamList() {
 }
 
 function renderExamSession() {
-  if (examView?.state.execution === "finished" && pendingFinalizations.delete(examView.exam_id)) {
-    renderExamList();
-  }
   for (const button of examList.querySelectorAll(".open-exam")) {
     renderExamEntry(button);
   }
@@ -411,7 +406,8 @@ async function changeExamSession(exam) {
     }
     examFeedback.textContent = "";
   } catch (error) {
-    if (exam && error === "exam_ended" && pendingFinalizations.delete(exam.id)) {
+    if (exam && error === "exam_ended") {
+      exams = exams.filter(({ id }) => id !== exam.id);
       renderExamList();
     }
     examFeedback.textContent = examSessionErrors.get(error) ?? examErrors.get(error) ?? "考试操作失败，请重试。";
@@ -430,22 +426,14 @@ async function refreshExamList(manual) {
   clearTimeout(examListTimer);
   if (manual) {
     exams = [];
-    pendingFinalizations.clear();
     examList.replaceChildren();
     examList.setAttribute("aria-busy", "true");
     examStatus.textContent = "正在加载报名列表…";
   }
   try {
-    const result = await core.invoke("list_exams_with_finalization");
-    exams = result.items;
-    pendingFinalizations = new Set(result.pending_finalizations);
-    if (examView?.state.execution === "finished") pendingFinalizations.delete(examView.exam_id);
+    exams = await core.invoke("list_exams");
     renderExamList();
   } catch (error) {
-    if (pendingFinalizations.size > 0) {
-      pendingFinalizations.clear();
-      renderExamList();
-    }
     if (manual) examStatus.textContent = examErrors.get(error) ?? "获取报名列表失败，请重试。";
   } finally {
     examList.removeAttribute("aria-busy");

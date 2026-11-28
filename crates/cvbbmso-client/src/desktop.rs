@@ -6,8 +6,8 @@ mod exam;
 mod smoke;
 
 use cvbbmso_accoding::{AccodingCookies, AccodingError};
-use cvbbmso_exam::{Exam, ExamError};
-use cvbbmso_protocol::{ExamListResponse, ExamPhase, ExamSummary};
+use cvbbmso_exam::ExamError;
+use cvbbmso_protocol::ExamSummary;
 use reqwest::StatusCode;
 use serde::Serialize;
 use tauri::{
@@ -15,7 +15,6 @@ use tauri::{
     WindowEvent, Wry, async_runtime, webview::NewWindowResponse,
 };
 use url::Url;
-use uuid::Uuid;
 
 use crate::{
     host_probe,
@@ -160,7 +159,6 @@ fn builder() -> tauri::Builder<Wry> {
             open_accoding,
             inspect_session,
             list_exams,
-            list_exams_with_finalization,
             exam::open_exam,
             exam::get_exam_status,
             exam::close_exam,
@@ -439,38 +437,6 @@ impl From<&MonitorError> for ListExamsError {
 
 #[tauri::command]
 async fn list_exams(app: AppHandle) -> Result<Vec<ExamSummary>, ListExamsError> {
-    Ok(verified_exam_list(&app).await?.items)
-}
-
-#[derive(Serialize)]
-struct ExamListWithFinalization {
-    items: Vec<ExamSummary>,
-    pending_finalizations: Vec<Uuid>,
-}
-
-#[tauri::command]
-async fn list_exams_with_finalization(
-    app: AppHandle,
-) -> Result<ExamListWithFinalization, ListExamsError> {
-    let ExamListResponse { user, items } = verified_exam_list(&app).await?;
-    let desktop = app.state::<Desktop>();
-    let mut pending_finalizations = Vec::new();
-    for item in items.iter().filter(|item| item.phase == ExamPhase::Ended) {
-        if let Ok(true) = Exam::has_pending_finalization(&desktop.data_dir, item.id, user.id).await
-        {
-            pending_finalizations.push(item.id);
-        }
-    }
-    if !app.state::<admission::Admission>().is_ready() {
-        return Err(ListExamsError::PreflightBlocked);
-    }
-    Ok(ExamListWithFinalization {
-        items,
-        pending_finalizations,
-    })
-}
-
-async fn verified_exam_list(app: &AppHandle) -> Result<ExamListResponse, ListExamsError> {
     if !app.state::<Preflight>().is_admitted() {
         return Err(ListExamsError::PreflightBlocked);
     }
@@ -482,7 +448,7 @@ async fn verified_exam_list(app: &AppHandle) -> Result<ExamListResponse, ListExa
         }
         monitor => monitor.map_err(ListExamsError::from)?,
     };
-    let cookies = current_cookies(app).await.map_err(|error| match error {
+    let cookies = current_cookies(&app).await.map_err(|error| match error {
         ReadSessionError::BrowserClosed
         | ReadSessionError::Invalid(AccodingError::MissingSession) => {
             ListExamsError::SignInRequired
@@ -494,5 +460,6 @@ async fn verified_exam_list(app: &AppHandle) -> Result<ExamListResponse, ListExa
     monitor
         .list_exams(&cookies)
         .await
+        .map(|response| response.items)
         .map_err(|error| ListExamsError::from(&error))
 }

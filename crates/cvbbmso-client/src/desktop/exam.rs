@@ -26,6 +26,8 @@ use super::{
 };
 use crate::{monitor::MonitorError, policy::denied_target_origin, preflight::Preflight};
 
+mod recovery;
+
 const STATUS_EVENT: &str = "cvbbmso-status";
 const COOKIE_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -394,11 +396,15 @@ async fn run(
 ) {
     let mut opening: Option<Opening> = None;
     let mut active: Option<Active> = None;
+    let mut recovery = None;
     let sessions = app.state::<ExamSession>();
     let admission = app.state::<Admission>();
     let mut admission_updates = admission.subscribe();
     let mut guard_close_failed = false;
     loop {
+        if admission.is_ready() && opening.is_none() && active.is_none() && recovery.is_none() {
+            recovery = Some(recovery::Worker::start(app.clone(), instance_id));
+        }
         let (view_updates, delivery) = active.as_mut().map_or((None, None), |active| {
             (
                 Some(&mut active.updates),
@@ -416,6 +422,7 @@ async fn run(
                         continue;
                     }
                     admission.begin_exit(&app);
+                    recovery::stop(&mut recovery).await;
                     let result = clear(&sessions, &mut opening, &mut active, &snapshot).await;
                     let cleanup = admission.shutdown().await;
                     let failed = result.is_err() || cleanup.is_err() || guard_close_failed;
@@ -426,6 +433,9 @@ async fn run(
             }
             _ = admission_updates.changed() => {
                 let status = *admission_updates.borrow_and_update();
+                if status != Status::Ready {
+                    recovery::stop(&mut recovery).await;
+                }
                 if status == Status::Blocked(Failure::GuardLost) {
                     guard_close_failed |= clear(&sessions, &mut opening, &mut active, &snapshot)
                         .await.is_err();
@@ -439,6 +449,7 @@ async fn run(
                     let _ = reply.send(Err(ExamCommandError::SessionBusy));
                 }
                 Some(Request::Open(exam_id, reply)) => {
+                    recovery::stop(&mut recovery).await;
                     opening = Some(Opening {
                         task: tokio::spawn(connect(app.clone(), exam_id, instance_id)),
                         reply,
@@ -451,6 +462,7 @@ async fn run(
                     let _ = reply.send(clear(&sessions, &mut opening, &mut active, &snapshot).await);
                 }
                 None => {
+                    recovery::stop(&mut recovery).await;
                     let _ = clear(&sessions, &mut opening, &mut active, &snapshot).await;
                     return;
                 }
@@ -570,11 +582,6 @@ async fn connect(
     exam_id: Uuid,
     instance_id: Uuid,
 ) -> Result<ConnectedExam, ExamCommandError> {
-    let desktop = app.state::<Desktop>();
-    let monitor = desktop.monitor.as_ref().map_err(|error| match error {
-        MonitorError::Configuration => ExamCommandError::MonitorUnconfigured,
-        _ => ExamCommandError::ConnectionFailed,
-    })?;
     let cookies = current_cookies(&app).await.map_err(|error| match error {
         ReadSessionError::BrowserClosed
         | ReadSessionError::Invalid(AccodingError::MissingSession) => {
@@ -584,21 +591,29 @@ async fn connect(
             ExamCommandError::SessionUnreadable
         }
     })?;
+    Exam::connect(config(&app, instance_id).await?, exam_id, cookies.clone())
+        .await
+        .map(|handle| (handle, cookies))
+        .map_err(ExamCommandError::from)
+}
+
+async fn config(app: &AppHandle, instance_id: Uuid) -> Result<ExamConfig, ExamCommandError> {
+    let desktop = app.state::<Desktop>();
+    let monitor = desktop.monitor.as_ref().map_err(|error| match error {
+        MonitorError::Configuration => ExamCommandError::MonitorUnconfigured,
+        _ => ExamCommandError::ConnectionFailed,
+    })?;
     let device_dir = desktop.data_dir.clone();
     let device_id = async_runtime::spawn_blocking(move || load_device_id(&device_dir))
         .await
         .map_err(|_| ExamCommandError::StorageFailed)?
         .map_err(|_| ExamCommandError::StorageFailed)?;
-    let config = ExamConfig {
+    Ok(ExamConfig {
         server_base: monitor.server_base().clone(),
         app_data_dir: desktop.data_dir.clone(),
         device_id,
         instance_id,
-    };
-    Exam::connect(config, exam_id, cookies.clone())
-        .await
-        .map(|handle| (handle, cookies))
-        .map_err(ExamCommandError::from)
+    })
 }
 
 fn load_device_id(data_dir: &Path) -> io::Result<Uuid> {

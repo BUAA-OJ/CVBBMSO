@@ -67,6 +67,7 @@ pub(super) struct Auth {
     stale_handshake: Notify,
     renewed_checks: AtomicUsize,
     other_checks: AtomicUsize,
+    other_verified: Notify,
     other_handshakes: AtomicUsize,
 }
 
@@ -78,6 +79,7 @@ impl Auth {
             stale_handshake: Notify::new(),
             renewed_checks: AtomicUsize::new(0),
             other_checks: AtomicUsize::new(0),
+            other_verified: Notify::new(),
             other_handshakes: AtomicUsize::new(0),
         }
     }
@@ -94,6 +96,7 @@ impl Auth {
             }
             Some(Candidate::Other) => {
                 self.other_checks.fetch_add(1, Ordering::Relaxed);
+                self.other_verified.notify_one();
             }
             _ => {}
         }
@@ -331,7 +334,6 @@ fn sync() -> ServerMessage {
 async fn open_enrolled_fixture(
     app: &AppHandle,
     ui: &WebviewWindow,
-    restoring: bool,
 ) -> Result<WebviewWindow, Error> {
     let oj = open_fixture_browser(app, ui).await?;
     check_ipc(ui, &oj).await?;
@@ -351,11 +353,7 @@ async fn open_enrolled_fixture(
           .then(() => document.querySelector('#refresh-exams').click());
         ",
     )?;
-    if restoring {
-        wait_for(ui, "document.querySelectorAll('.open-exam:enabled').length === 2 && document.querySelector('.open-exam').textContent === '继续收尾' && document.querySelector('.exam-phase').textContent === '已结束' && !document.querySelector('#exams').textContent.includes('Ended fixture exam') && !document.querySelector('#exams').textContent.includes('No journal fixture exam')", "only the pending ended exam and the scheduled exam are offered").await?;
-    } else {
-        wait_for(ui, "document.querySelectorAll('.open-exam:enabled').length === 2 && document.querySelector('.exam-phase').textContent === '进行中' && !document.querySelector('#exams').textContent.includes('Ended fixture exam')", "server-confirmed exam phases with a fast local clock").await?;
-    }
+    wait_for(ui, "document.querySelectorAll('.open-exam:enabled').length === 2 && document.querySelector('.exam-phase').textContent === '进行中' && !document.querySelector('#exams').textContent.includes('Ended fixture exam')", "server-confirmed exam phases with a fast local clock").await?;
 
     Ok(oj)
 }
@@ -375,7 +373,7 @@ pub(super) async fn exercise(
     ) {
         return recording::exercise(app, ui, fixture, case == super::Case::Recording).await;
     }
-    let oj = open_enrolled_fixture(app, ui, false).await?;
+    let oj = open_enrolled_fixture(app, ui).await?;
 
     let initial_hello = check_pending_open(ui, &mut fixture.incoming).await?;
     ui.eval("document.querySelector('.open-exam').click()")?;

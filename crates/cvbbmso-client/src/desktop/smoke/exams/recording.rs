@@ -13,10 +13,10 @@ use sha2::{Digest, Sha256};
 use tauri::Manager;
 
 use super::{
-    AppHandle, ClientMessage, CommandName, CommandStatus, Connection, DEADLINE, ENDED, Error,
-    ExamEvent, ExamPhase, FIRST, Fixture, OffsetDateTime, RecordingPolicy, ServerMessage, Uuid,
-    WebviewWindow, check_pending_close, connection, io, oneshot, open_enrolled_fixture, probe,
-    probe_value, timeout, wait_for,
+    AppHandle, Candidate, ClientMessage, CommandName, CommandStatus, Connection, DEADLINE, ENDED,
+    Error, ExamEvent, ExamPhase, FIRST, Fixture, OffsetDateTime, Ordering, RecordingPolicy,
+    ServerMessage, Uuid, WebviewWindow, check_pending_close, connection, io, oneshot,
+    open_enrolled_fixture, open_fixture_browser, probe, probe_value, timeout, wait_for,
 };
 use crate::desktop::{Desktop, smoke::FIXTURE_USER_ID};
 
@@ -26,12 +26,19 @@ pub(super) async fn exercise(
     mut fixture: Fixture,
     capture_display: bool,
 ) -> Result<oneshot::Receiver<()>, Error> {
-    let recording_dir = open_recording_fixture(app, ui, capture_display).await?;
-    ui.set_focus()?;
-    ui.eval("document.querySelector('.open-exam').click()")?;
+    let recording_dir = open_recording_fixture(app, ui, &fixture, capture_display).await?;
+    if capture_display {
+        ui.set_focus()?;
+        ui.eval("document.querySelector('.open-exam').click()")?;
+    }
     let mut connection = connection(&mut fixture.incoming, FIRST).await?;
     if !capture_display {
+        assert_eq!(connection.candidate, Candidate::Renewed);
+        assert!(fixture.auth.renewed_checks.load(Ordering::Relaxed) >= 3);
+        assert_eq!(fixture.auth.other_handshakes.load(Ordering::Relaxed), 0);
         assert_eq!(connection.hello.state.execution, ExecutionState::Recording);
+        probe(ui, "window.__TAURI__.core.invoke('get_exam_status')")?;
+        assert_eq!(probe_value(ui).await?, json!({ "value": null }));
     }
     let now = OffsetDateTime::now_utc();
     connection
@@ -53,18 +60,13 @@ pub(super) async fn exercise(
             ack_event_through: 0,
         })
         .await?;
-    wait_for(
-        ui,
-        if capture_display {
-            "window.examEvents.at(-1)?.state.execution === 'ready'"
-        } else {
-            "window.examEvents.at(-1)?.connected === true"
-        },
-        "the recording exercise receiving initial sync",
-    )
-    .await?;
-
     if capture_display {
+        wait_for(
+            ui,
+            "window.examEvents.at(-1)?.state.execution === 'ready'",
+            "the recording exercise receiving initial sync",
+        )
+        .await?;
         start_capture(ui, &mut connection, now).await?;
     }
     let (first_seq, first) = next_recording_event(&mut connection).await?;
@@ -85,16 +87,18 @@ pub(super) async fn exercise(
         "Expected both restored recording segments",
     )?;
     expect_completed(&mut connection, end).await?;
-    wait_for(
-        ui,
-        "window.examEvents.at(-1)?.state.execution === 'finalizing' && window.examEvents.at(-1)?.state.recording === 'complete'",
-        "the successful recording waiting for the end acknowledgement",
-    )
-    .await?;
-    check_pending_close(ui).await?;
-    app.exit(0);
-    wait_for(ui, "document.querySelector('#exit-confirmation').open && document.querySelector('#confirm-exit').disabled", "application exit being rejected before the final ACK").await?;
-    ui.eval("document.querySelector('#exit-confirmation button').click()")?;
+    let data_dir = &app.state::<Desktop>().data_dir;
+    if capture_display {
+        wait_for(ui, "window.examEvents.at(-1)?.state.execution === 'finalizing' && window.examEvents.at(-1)?.state.recording === 'complete'", "the successful recording waiting for the end acknowledgement").await?;
+        check_pending_close(ui).await?;
+        app.exit(0);
+        wait_for(ui, "document.querySelector('#exit-confirmation').open && document.querySelector('#confirm-exit').disabled", "application exit being rejected before the final ACK").await?;
+        ui.eval("document.querySelector('#exit-confirmation button').click()")?;
+    } else {
+        assert!(
+            cvbbmso_exam::Exam::has_pending_finalization(data_dir, FIRST, FIXTURE_USER_ID).await?
+        );
+    }
     tokio::task::spawn_blocking(move || {
         verify_recording(&recording_dir, &segments, &summary.merged_sha256)
     })
@@ -104,19 +108,24 @@ pub(super) async fn exercise(
         .outgoing
         .send(ServerMessage::CommandAck { command_id: end })
         .await?;
-    wait_for(
-        ui,
-        "window.examEvents.at(-1)?.state.execution === 'finished' && window.examEvents.at(-1)?.state.recording === 'complete'",
-        "end acknowledgement finishing the exam with complete recording",
-    )
-    .await?;
     if capture_display {
+        wait_for(ui, "window.examEvents.at(-1)?.state.execution === 'finished' && window.examEvents.at(-1)?.state.recording === 'complete'", "end acknowledgement finishing the exam with complete recording").await?;
         ui.eval("clearInterval(window.recordingPaint)")?;
     } else {
+        timeout(DEADLINE, async {
+            while cvbbmso_exam::Exam::has_pending_finalization(data_dir, FIRST, FIXTURE_USER_ID)
+                .await?
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Ok::<_, cvbbmso_exam::ExamError>(())
+        })
+        .await??;
+        ui.eval("document.querySelector('#refresh-exams').click()")?;
         wait_for(
             ui,
-            "document.querySelectorAll('.open-exam').length === 1 && !document.querySelector('#exams').textContent.includes('继续收尾')",
-            "final ACK removing the completed exam's recovery entry",
+            "document.querySelectorAll('.open-exam:enabled').length === 1 && document.querySelector('#exams').textContent.includes('Second fixture exam') && document.querySelector('#current-exam').hidden",
+            "only the scheduled exam appearing in the foreground",
         )
         .await?;
     }
@@ -127,6 +136,7 @@ pub(super) async fn exercise(
 async fn open_recording_fixture(
     app: &AppHandle,
     ui: &WebviewWindow,
+    fixture: &Fixture,
     capture_display: bool,
 ) -> Result<PathBuf, Error> {
     let data_dir = app.state::<Desktop>().data_dir.clone();
@@ -139,10 +149,9 @@ async fn open_recording_fixture(
         seed_recording(&recording_dir)?;
         seed_journal(&data_dir, FIRST, "recording", "capturing")?;
         seed_journal(&data_dir, ENDED, "finished", "failed")?;
-    }
-    let oj = open_enrolled_fixture(app, ui, !capture_display).await?;
-    if !capture_display {
-        check_recovery_account(ui, &oj).await?;
+        check_recovery_account(app, ui, fixture).await?;
+    } else {
+        open_enrolled_fixture(app, ui).await?;
     }
     Ok(recording_dir)
 }
@@ -165,30 +174,32 @@ fn seed_journal(root: &Path, exam_id: Uuid, execution: &str, recording: &str) ->
     fs::write(runtime.join("journal.json"), snapshot.to_string())
 }
 
-async fn check_recovery_account(ui: &WebviewWindow, oj: &WebviewWindow) -> Result<(), Error> {
+async fn check_recovery_account(
+    app: &AppHandle,
+    ui: &WebviewWindow,
+    fixture: &Fixture,
+) -> Result<(), Error> {
+    let oj = open_fixture_browser(app, ui).await?;
     oj.eval("location.assign('/relogin/other')")?;
     wait_for(
-        oj,
+        &oj,
         "document.title === 'Fixture other candidate'",
         "another verified account",
     )
     .await?;
-    ui.eval("document.querySelector('#refresh-exams').click()")?;
-    wait_for(ui, "document.querySelectorAll('.open-exam:enabled').length === 1 && !document.querySelector('#exams').textContent.includes('继续收尾')", "the other account cannot see the original account's pending exam").await?;
+    timeout(DEADLINE, fixture.auth.other_verified.notified()).await?;
     probe(
         ui,
         "window.__TAURI__.core.invoke('open_exam', { exam_id: '00000000-0000-0000-0000-000000000010' })",
     )?;
     assert_eq!(probe_value(ui).await?, json!({ "error": "exam_ended" }));
-    oj.eval("location.assign('/rotate')")?;
+    oj.eval("location.assign('/relogin/same')")?;
     wait_for(
-        oj,
-        "document.title === 'Fixture updated'",
+        &oj,
+        "document.title === 'Fixture renewed candidate'",
         "the original verified account",
     )
-    .await?;
-    ui.eval("document.querySelector('#refresh-exams').click()")?;
-    wait_for(ui, "document.querySelectorAll('.open-exam:enabled').length === 2 && document.querySelector('.open-exam').textContent === '继续收尾'", "the original account's recovery action").await
+    .await
 }
 
 async fn start_capture(

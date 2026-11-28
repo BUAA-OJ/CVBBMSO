@@ -251,7 +251,10 @@ impl Harness {
         path
     }
 
-    fn launch(&mut self) -> JoinHandle<Result<ExamHandle, ExamError>> {
+    fn launch(
+        &mut self,
+        finalizing_user: Option<i64>,
+    ) -> JoinHandle<Result<ExamHandle, ExamError>> {
         let config = ExamConfig {
             server_base: self.base.clone(),
             app_data_dir: self.data.path().to_owned(),
@@ -275,6 +278,7 @@ impl Harness {
                 cookies,
                 monitor,
                 timing: timing(),
+                finalizing_user,
             },
             move |_, _, _| async move {
                 if let Some(gate) = open_gate {
@@ -287,7 +291,7 @@ impl Harness {
     }
 
     async fn begin(&mut self, phase: ExamPhase) -> JoinHandle<Result<ExamHandle, ExamError>> {
-        let pending = self.launch();
+        let pending = self.launch((phase == ExamPhase::Ended).then_some(USER));
         self.answer_enrollment(SESSION, USER, phase).await;
         pending
     }
@@ -1258,6 +1262,35 @@ async fn the_first_sync_rejects_a_fresh_runtime_if_the_exam_ended_during_admissi
 }
 
 #[tokio::test]
+async fn finalization_requires_the_expected_account_and_ended_phase() {
+    for (finalizing_user, authenticated_user, phase, expected) in [
+        (Some(USER), USER + 1, ExamPhase::Ended, ExamError::Auth),
+        (Some(USER), USER, ExamPhase::Running, ExamError::NotEnrolled),
+        (None, USER, ExamPhase::Ended, ExamError::ExamEnded),
+    ] {
+        let mut harness = Harness::new().await;
+        let mut journal = Journal::open(&harness.candidate_dir()).await.unwrap();
+        journal.set_state(state(ExecutionState::Recording, RecordingState::Capturing));
+        journal.save().await.unwrap();
+
+        let pending = harness.launch(finalizing_user);
+        harness
+            .answer_enrollment(SESSION, authenticated_user, phase)
+            .await;
+        let result = timeout(WAIT, pending).await.unwrap().unwrap();
+        assert_eq!(
+            result.err().as_ref().map(std::mem::discriminant),
+            Some(std::mem::discriminant(&expected))
+        );
+        assert!(
+            Exam::has_pending_finalization(harness.data.path(), EXAM, USER)
+                .await
+                .unwrap()
+        );
+    }
+}
+
+#[tokio::test]
 async fn an_ended_exam_rejects_admission_without_the_authenticated_candidates_pending_journal() {
     for (authenticated_user, local_state) in [
         (USER, None),
@@ -1290,7 +1323,7 @@ async fn an_ended_exam_rejects_admission_without_the_authenticated_candidates_pe
                 .await
                 .unwrap()
         );
-        let pending = harness.launch();
+        let pending = harness.launch(Some(authenticated_user));
         harness
             .answer_enrollment(SESSION, authenticated_user, ExamPhase::Ended)
             .await;

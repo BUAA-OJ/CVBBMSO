@@ -309,13 +309,11 @@ async fn check_environment_gate(ui: &WebviewWindow) -> Result<(), Error> {
             const invoke = window.__TAURI__.core.invoke;
             const results = await Promise.allSettled([
                 invoke('open_accoding'), invoke('inspect_session'), invoke('list_exams'),
-                invoke('list_exams_with_finalization'),
                 invoke('open_exam', {exam_id: '00000000-0000-0000-0000-000000000010'})
             ]);
             window.gatedRequests = results.every(result => result.status === 'rejected')
                 && results[2].reason === 'preflight_blocked'
-                && results[3].reason === 'preflight_blocked'
-                && results[4].reason === 'admission_unavailable';
+                && results[3].reason === 'admission_unavailable';
         })();
     ",
     )?;
@@ -851,10 +849,9 @@ async fn check_blocked_preflight(
             invoke('open_accoding'),
             invoke('inspect_session'),
             invoke('list_exams'),
-            invoke('list_exams_with_finalization'),
             invoke('open_exam', { exam_id: '00000000-0000-0000-0000-000000000010' }),
           ]);
-          const denied = ['设备检查通过后才能继续。', '设备检查通过后才能继续。', 'preflight_blocked', 'preflight_blocked', 'preflight_blocked'];
+          const denied = ['设备检查通过后才能继续。', '设备检查通过后才能继续。', 'preflight_blocked', 'preflight_blocked'];
           window.blockedCommands = results.every(
             (result, index) => result.status === 'rejected' && result.reason === denied[index]
           ) ? 'rejected' : 'unexpected';
@@ -1098,7 +1095,6 @@ async fn check_ipc(ui: &WebviewWindow, oj: &WebviewWindow) -> Result<(), Error> 
                 invoke("authorize_macos_egress"),
                 invoke("inspect_session"),
                 invoke("list_exams"),
-                invoke("list_exams_with_finalization"),
                 invoke("open_exam", { exam_id: "00000000-0000-0000-0000-000000000010" }),
                 invoke("get_exam_status"),
                 invoke("close_exam"),

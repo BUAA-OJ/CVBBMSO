@@ -114,14 +114,13 @@ impl Exam {
     /// `(exam_id, oj_user_id)` candidate, connects the WebSocket, and returns
     /// after the first `sync`. Internal tasks then keep the connection, the
     /// recording, and the event queue going.
-    /// An ended exam can only resume a pending local journal.
     ///
     /// # Errors
     ///
     /// [`ExamError::Http`] when `server_base` is not an HTTPS origin or the monitor is
     /// unreachable, [`ExamError::Auth`] / [`ExamError::NotEnrolled`] when the
     /// session or enrollment is rejected, [`ExamError::ExamEnded`] when there
-    /// is no pending journal for an ended exam, [`ExamError::WebSocket`] when
+    /// the exam has ended, [`ExamError::WebSocket`] when
     /// the connection or the first `sync` fails, [`ExamError::Storage`] and
     /// [`ExamError::Recording`] when the local data or the recorder cannot be
     /// opened.
@@ -129,6 +128,35 @@ impl Exam {
         config: ExamConfig,
         exam_id: Uuid,
         cookies: AccodingCookies,
+    ) -> Result<ExamHandle, ExamError> {
+        Self::launch(config, exam_id, cookies, None).await
+    }
+
+    /// Resumes finalization of an ended exam for a previously verified candidate.
+    /// Existing journal data is retained until the server acknowledges completion.
+    ///
+    /// # Errors
+    /// Returns [`ExamError::Auth`] if the verified user has changed,
+    /// [`ExamError::NotEnrolled`] if the candidate is no longer enrolled or
+    /// the exam has not ended,
+    /// [`ExamError::ExamEnded`] if there is no pending journal, and
+    /// [`ExamError::WebSocket`] if the server does not confirm the ended phase
+    /// in its initial `sync`. Other connection and storage failures are as in
+    /// [`Self::connect`].
+    pub async fn resume_finalization(
+        config: ExamConfig,
+        exam_id: Uuid,
+        cookies: AccodingCookies,
+        expected_user: i64,
+    ) -> Result<ExamHandle, ExamError> {
+        Self::launch(config, exam_id, cookies, Some(expected_user)).await
+    }
+
+    async fn launch(
+        config: ExamConfig,
+        exam_id: Uuid,
+        cookies: AccodingCookies,
+        finalizing_user: Option<i64>,
     ) -> Result<ExamHandle, ExamError> {
         let monitor = Monitor::new(config.server_base.clone(), None)?;
         runtime::launch(
@@ -138,6 +166,7 @@ impl Exam {
                 cookies,
                 monitor,
                 timing: Timing::default(),
+                finalizing_user,
             },
             move |oj_user_id, candidate_dir, policy| {
                 Recorder::open(exam_id, oj_user_id, candidate_dir, policy)
