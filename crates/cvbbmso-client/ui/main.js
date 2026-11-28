@@ -61,7 +61,7 @@ const admissionErrors = new Map([
   ["elevation_required", "请以管理员身份启动客户端。"],
   ["macos_unsupported", "CVBBMSO 需要 macOS 14 或更新版本，请联系考试管理员。"],
   ["macos_untrusted_installation", "请将监考方提供的 CVBBMSO.app 拖入「应用程序」，再从那里打开。"],
-  ["macos_service_unavailable", "未能连接考试网络守卫。请退出客户端，再从「应用程序」打开 CVBBMSO。"],
+  ["macos_service_unavailable", "未能连接考试网络守卫。请退出客户端，再从「应用程序」重新打开 CVBBMSO。"],
   ["macos_network_restart_required", "网络预检未通过。请检查网络连接和代理设置，退出客户端后从「应用程序」重新打开 CVBBMSO。"],
   ["macos_authorization_required", "需要管理员授权才能部署考试网络守卫。"],
   ["macos_authorization_cancelled", "管理员授权已取消，可以重试。"],

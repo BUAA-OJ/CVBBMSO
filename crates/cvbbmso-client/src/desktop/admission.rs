@@ -109,7 +109,7 @@ impl Failure {
             }
             #[cfg(target_os = "macos")]
             Self::MacosServiceUnavailable => {
-                "未能连接考试网络守卫。请退出客户端，再从「应用程序」打开 CVBBMSO。"
+                "未能连接考试网络守卫。请退出客户端，再从「应用程序」重新打开 CVBBMSO。"
             }
             #[cfg(target_os = "macos")]
             Self::MacosNetworkRestartRequired => {
