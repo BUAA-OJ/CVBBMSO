@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use cvbbmso_accoding::AccodingCookies;
-use cvbbmso_protocol::ExamListResponse;
+use cvbbmso_protocol::{ExamListResponse, ExamPhase};
 use reqwest::{Certificate, Client, StatusCode, header, redirect};
 use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, handshake::client::Request};
 use url::Url;
@@ -125,12 +125,12 @@ impl Monitor {
         serde_json::from_slice(&body).map_err(|error| ExamError::InvalidExamList(Some(error)))
     }
 
-    /// Confirms enrollment in `exam_id` and returns the authenticated Accoding user id.
+    /// Confirms enrollment and returns the authenticated Accoding user id and exam phase.
     pub(crate) async fn enrollment(
         &self,
         cookies: &AccodingCookies,
         exam_id: Uuid,
-    ) -> Result<i64, ExamError> {
+    ) -> Result<(i64, ExamPhase), ExamError> {
         let list = self
             .list_exams(cookies)
             .await
@@ -139,11 +139,12 @@ impl Monitor {
                 ExamError::HttpStatus(_) | ExamError::InvalidExamList(_) => ExamError::Http(None),
                 error => error,
             })?;
-        if list.items.iter().any(|exam| exam.id == exam_id) {
-            Ok(list.user.id)
-        } else {
-            Err(ExamError::NotEnrolled)
-        }
+        let exam = list
+            .items
+            .iter()
+            .find(|exam| exam.id == exam_id)
+            .ok_or(ExamError::NotEnrolled)?;
+        Ok((list.user.id, exam.phase))
     }
 
     /// Builds the WebSocket handshake request for `exam_id`.

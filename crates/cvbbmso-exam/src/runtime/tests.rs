@@ -37,12 +37,15 @@ use url::Url;
 use uuid::Uuid;
 
 use super::{Capture, Clock, END_GRACE, Launch, Runtime, Timing, launch, session::Liveness};
-use crate::{ExamConfig, ExamError, ExamHandle, UiNotice, journal::Journal, monitor::Monitor};
+use crate::{
+    Exam, ExamConfig, ExamError, ExamHandle, UiNotice, journal::Journal, monitor::Monitor,
+};
 
 const EXAM: Uuid = Uuid::from_u128(0x10);
 const DEVICE: Uuid = Uuid::from_u128(0x20);
 const INSTANCE: Uuid = Uuid::from_u128(0x30);
 const USER: i64 = 42;
+const SESSION: &str = "connect.sid=session";
 const WAIT: Duration = Duration::from_secs(5);
 
 #[test]
@@ -269,12 +272,11 @@ impl Harness {
             Launch {
                 config,
                 exam_id: EXAM,
-                oj_user_id: USER,
                 cookies,
                 monitor,
                 timing: timing(),
             },
-            move |_, _| async move {
+            move |_, _, _| async move {
                 if let Some(gate) = open_gate {
                     gate.entered.send(()).unwrap();
                     gate.release.await.unwrap();
@@ -284,11 +286,17 @@ impl Harness {
         ))
     }
 
+    async fn begin(&mut self, phase: ExamPhase) -> JoinHandle<Result<ExamHandle, ExamError>> {
+        let pending = self.launch();
+        self.answer_enrollment(SESSION, USER, phase).await;
+        pending
+    }
+
     async fn accept(&self) -> Conn {
         self.accept_with(|_, response| Ok(response)).await
     }
 
-    async fn answer_enrollment(&self, expected_cookie: &str, user: i64) {
+    async fn answer_enrollment(&self, expected_cookie: &str, user: i64, phase: ExamPhase) {
         timeout(WAIT, async {
             let (tcp, _) = self.listener.accept().await.unwrap();
             let mut tcp = BufReader::new(tcp);
@@ -313,7 +321,7 @@ impl Harness {
             let body = serde_json::json!({
                 "user": { "id": user, "username": "candidate", "nickname": "Candidate" },
                 "items": [{
-                    "id": EXAM, "title": "Exam", "phase": "running",
+                    "id": EXAM, "title": "Exam", "phase": phase,
                     "start_at": "2026-12-20T01:00:00Z", "end_at": "2026-12-20T04:00:00Z"
                 }]
             }).to_string();
@@ -324,7 +332,7 @@ impl Harness {
             tcp.get_mut().write_all(response.as_bytes()).await.unwrap();
         })
         .await
-        .expect("runtime verifies the new cookies over HTTP");
+        .expect("runtime verifies enrollment over HTTP");
     }
 
     async fn accept_with(
@@ -352,7 +360,7 @@ impl Harness {
 
     /// Launches, accepts, answers `hello` with a `sync`, and returns the handle.
     async fn connected(&mut self, phase: ExamPhase) -> (Conn, ExamHandle) {
-        let pending = self.launch();
+        let pending = self.begin(phase).await;
         let mut conn = self.accept().await;
         assert!(matches!(conn.recv().await, ClientMessage::Hello(_)));
         conn.send(sync(phase, 0)).await;
@@ -451,7 +459,7 @@ async fn start_recording(conn: &mut Conn) {
 #[tokio::test]
 async fn connect_sends_hello_with_the_session_and_waits_for_sync() {
     let mut harness = Harness::new().await;
-    let pending = harness.launch();
+    let pending = harness.begin(ExamPhase::Scheduled).await;
     let mut conn = harness.accept().await;
 
     assert_eq!(conn.cookie.as_deref(), Some("connect.sid=session"));
@@ -607,7 +615,7 @@ async fn a_same_account_cookie_update_is_used_on_reconnect() {
         .await
         .unwrap();
     harness
-        .answer_enrollment("connect.sid=refreshed", USER)
+        .answer_enrollment("connect.sid=refreshed", USER, ExamPhase::Running)
         .await;
     timeout(
         WAIT,
@@ -657,7 +665,7 @@ async fn another_enrolled_account_cannot_send_the_original_candidates_events() {
         .await
         .unwrap();
     harness
-        .answer_enrollment("connect.sid=other", USER + 1)
+        .answer_enrollment("connect.sid=other", USER + 1, ExamPhase::Running)
         .await;
     timeout(
         WAIT,
@@ -714,7 +722,7 @@ async fn a_restarted_process_reports_the_lost_capture_and_resumes_it() {
     journal.set_state(state(ExecutionState::Recording, RecordingState::Capturing));
     journal.save().await.unwrap();
 
-    let pending = harness.launch();
+    let pending = harness.begin(ExamPhase::Running).await;
     let mut conn = harness.accept().await;
     let ClientMessage::Hello(hello) = conn.recv().await else {
         panic!("hello must come first");
@@ -746,7 +754,7 @@ async fn recorder_restoration_does_not_extend_the_server_deadline() {
         release: wait_for_release,
     });
 
-    let pending = harness.launch();
+    let pending = harness.begin(ExamPhase::Ended).await;
     let mut conn = harness.accept().await;
     assert!(matches!(conn.recv().await, ClientMessage::Hello(_)));
     let server_time = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(120);
@@ -916,7 +924,7 @@ async fn a_full_send_queue_cannot_hold_recording_past_the_offline_deadline() {
 #[tokio::test]
 async fn a_rejected_session_fails_connect_with_auth() {
     let mut harness = Harness::new().await;
-    let pending = harness.launch();
+    let pending = harness.begin(ExamPhase::Running).await;
 
     let conn = harness
         .accept_with(|_, _| {
@@ -1175,7 +1183,12 @@ async fn restart_replays_a_legacy_journal_before_replying_to_a_fresh_end_command
 
     let mut restarted = Harness::new().await;
     std::mem::swap(&mut restarted.data, &mut harness.data);
-    let pending = restarted.launch();
+    assert!(
+        Exam::has_pending_finalization(restarted.data.path(), EXAM, USER)
+            .await
+            .unwrap()
+    );
+    let pending = restarted.begin(ExamPhase::Ended).await;
     let mut conn = restarted.accept().await;
     let ClientMessage::Hello(hello) = conn.recv().await else {
         panic!("expected hello before sync");
@@ -1211,24 +1224,94 @@ async fn restart_replays_a_legacy_journal_before_replying_to_a_fresh_end_command
         state(ExecutionState::Finished, RecordingState::Complete)
     );
     assert_eq!(journal.messages_after(0).count(), 0);
+    assert!(
+        !Exam::has_pending_finalization(restarted.data.path(), EXAM, USER)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
-async fn reopening_a_finished_exam_closes_the_connection() {
+async fn the_first_sync_rejects_a_fresh_runtime_if_the_exam_ended_during_admission() {
     let mut harness = Harness::new().await;
-    let mut journal = Journal::open(&harness.candidate_dir()).await.unwrap();
-    journal.anchor(0);
-    journal.append(ExamEvent::RecordingFinalized(
-        RecordingSummary::new(1, Sha256Digest::parse(&"b".repeat(64)).unwrap()).unwrap(),
+    let (entered, mut opening_recorder) = oneshot::channel();
+    let (_release, wait_for_release) = oneshot::channel();
+    harness.open_gate = Some(OpenGate {
+        entered,
+        release: wait_for_release,
+    });
+
+    let pending = harness.begin(ExamPhase::Running).await;
+    let mut conn = harness.accept().await;
+    assert!(matches!(conn.recv().await, ClientMessage::Hello(_)));
+    conn.send(sync(ExamPhase::Ended, 0)).await;
+
+    assert!(matches!(
+        timeout(WAIT, pending).await.unwrap().unwrap(),
+        Err(ExamError::ExamEnded)
     ));
-    journal.clear_events();
-    journal.set_state(state(ExecutionState::Finished, RecordingState::Complete));
-    journal.save().await.unwrap();
-
-    let (mut conn, handle) = harness.connected(ExamPhase::Ended).await;
-
+    assert!(matches!(
+        opening_recorder.try_recv(),
+        Err(oneshot::error::TryRecvError::Closed)
+    ));
     conn.closed().await;
-    assert!(!handle.subscribe().borrow().connected);
+}
+
+#[tokio::test]
+async fn an_ended_exam_rejects_admission_without_the_authenticated_candidates_pending_journal() {
+    for (authenticated_user, local_state) in [
+        (USER, None),
+        (
+            USER,
+            Some(state(ExecutionState::Ready, RecordingState::Idle)),
+        ),
+        (
+            USER,
+            Some(state(ExecutionState::Finished, RecordingState::Failed)),
+        ),
+        (
+            USER + 1,
+            Some(state(ExecutionState::Recording, RecordingState::Capturing)),
+        ),
+    ] {
+        let mut harness = Harness::new().await;
+        let path = harness.candidate_dir().join("runtime/journal.json");
+        let stored = if let Some(state) = local_state {
+            let mut journal = Journal::open(&harness.candidate_dir()).await.unwrap();
+            journal.set_state(state);
+            journal.save().await.unwrap();
+            Some(std::fs::read(&path).unwrap())
+        } else {
+            None
+        };
+
+        assert!(
+            !Exam::has_pending_finalization(harness.data.path(), EXAM, authenticated_user)
+                .await
+                .unwrap()
+        );
+        let pending = harness.launch();
+        harness
+            .answer_enrollment(SESSION, authenticated_user, ExamPhase::Ended)
+            .await;
+        assert!(matches!(
+            timeout(WAIT, pending).await.unwrap().unwrap(),
+            Err(ExamError::ExamEnded)
+        ));
+        if let Some(bytes) = stored {
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        } else {
+            assert!(!harness.data.path().join("exams").exists());
+        }
+        if authenticated_user != USER {
+            assert!(
+                !harness
+                    .candidate_dir()
+                    .with_file_name(authenticated_user.to_string())
+                    .exists()
+            );
+        }
+    }
 }
 
 #[test]

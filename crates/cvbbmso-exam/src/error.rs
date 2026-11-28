@@ -27,6 +27,9 @@ pub enum ExamError {
     /// The authenticated student is not enrolled in the exam.
     #[error("student is not enrolled in the exam")]
     NotEnrolled,
+    /// The exam ended and this candidate has no pending journal to resume.
+    #[error("exam has ended and there is no pending local finalization")]
+    ExamEnded,
     /// The recorder could not be opened or driven.
     #[error("recording failed")]
     Recording(#[source] RecordingError),

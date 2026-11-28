@@ -26,6 +26,7 @@ pub enum ExamError {
     WebSocket(Option<tokio_tungstenite::tungstenite::Error>),
     Auth,
     NotEnrolled,
+    ExamEnded,
     Recording(cvbbmso_recorder::RecordingError),
     Storage(std::io::Error),
     Closed,
@@ -56,6 +57,13 @@ impl Monitor {
 }
 
 impl Exam {
+    /// 只读检查已验证账号是否有待收尾的本地日志。
+    pub async fn has_pending_finalization(
+        app_data_dir: &std::path::Path,
+        exam_id: uuid::Uuid,
+        oj_user_id: i64,
+    ) -> Result<bool, ExamError>;
+
     /// 用指定考试 ID 和 Accoding Cookie 建立或恢复考试运行时。
     /// 返回时已完成初始 sync；之后由内部任务持续维护连接、录屏与事件队列。
     pub async fn connect(
@@ -82,7 +90,11 @@ impl ExamHandle {
 
 列表接口把 HTTP 401 返回为 `Auth`，其他非 200 状态返回为 `HttpStatus`，不合规正文返回为 `InvalidExamList`。运行时把 HTTP 403 或列表缺少指定考试判为 `NotEnrolled`，把其余非预期状态和不合规正文映射为 `Http`，保持 `Exam::connect` 的错误分类。
 
-`Exam::connect` 首先调用 `GET /api/exams` 确认用户身份和考试报名，以返回的 `user.id` 定位本地 `(exam_id, oj_user_id)` 数据，然后建立 WSS 并等待初始 `sync`，再按 `sync.recording_policy` 打开/恢复 recorder。`ExamConfig.instance_id` 由客户端进程启动时生成，在该进程的所有重连中保持一致；`device_id` 是持久设备标识。`Exam::connect` 是该 crate 的唯一启动入口。
+`Exam::connect` 首先调用 `GET /api/exams` 确认用户身份、考试报名和服务端考试阶段，以返回的 `user.id` 定位本地 `(exam_id, oj_user_id)` 日志。考试已结束时，日志缺失或状态为 `ready`、`finished` 返回 `ExamEnded`，日志损坏或读取失败返回 `Storage`。通过检查后才建立 WSS，等待初始 `sync`，再按 `sync.recording_policy` 打开 recorder。`ExamConfig.instance_id` 由客户端进程启动时生成，在该进程的所有重连中保持一致。`device_id` 是持久设备标识。`Exam::connect` 是该 crate 的唯一启动入口。
+
+桌面可用 `Exam::has_pending_finalization` 和列表返回的正整数 `user.id` 判断是否提供「继续收尾」。有效日志的执行状态为 `recording` 或 `finalizing` 时返回 `true`，包括录像摘要已落盘、仍在等待结束命令 ACK 的情况。日志缺失或状态为 `ready`、`finished` 时返回 `false`。用户 ID 不合法、日志损坏或读取失败时返回 `Storage`。查询只读取指定账号的日志。已结束考试的入场沿用同一只读检查，通过后直接恢复所读取的日志。
+
+如果首次 `sync` 显示考试在入场期间结束，运行时在打开 recorder 前复用同一待收尾条件。无待收尾日志时关闭连接并返回 `ExamEnded`。
 
 `ExamError` 是运行时错误类别：`Auth` / `NotEnrolled` 对应认证与报名错误，`Http` / `WebSocket` / `Recording` / `Storage` 对应连接、录像或存储失败，并在有底层原因时携带它，供应用层通过 `anyhow` 输出完整 source 链；`Closed` 表示句柄已关闭。本地数据写盘失败时，运行时继续录屏，在内存中保留待保存事件，并通过 `ClientView.last_error_code` 显示 `INTERNAL_ERROR`。写盘恢复后按序发送积压事件，并清除存储错误提示。
 

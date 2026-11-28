@@ -39,7 +39,9 @@ pub(crate) use capture::Capture;
 use session::{Inbound, Liveness};
 
 use crate::{
-    ClientView, ExamConfig, ExamError, ExamHandle, UiNotice, journal::Journal, monitor::Monitor,
+    ClientView, ExamConfig, ExamError, ExamHandle, UiNotice,
+    journal::{Journal, candidate_dir},
+    monitor::Monitor,
 };
 
 /// Grace period after `end_at` before an offline client stops recording on
@@ -104,34 +106,35 @@ pub(crate) enum Request {
 pub(crate) struct Launch {
     pub(crate) config: ExamConfig,
     pub(crate) exam_id: Uuid,
-    pub(crate) oj_user_id: i64,
     pub(crate) cookies: AccodingCookies,
     pub(crate) monitor: Monitor,
     pub(crate) timing: Timing,
 }
 
-/// Opens the journal, connects, waits for the first `sync`, opens the
-/// recorder, and starts the runtime task.
+/// Verifies enrollment, opens the journal, connects, waits for the first
+/// `sync`, opens the recorder, and starts the runtime task.
 pub(crate) async fn launch<C, F, Fut>(launch: Launch, open: F) -> Result<ExamHandle, ExamError>
 where
     C: Capture,
-    F: FnOnce(PathBuf, RecordingPolicy) -> Fut,
+    F: FnOnce(i64, PathBuf, RecordingPolicy) -> Fut,
     Fut: Future<Output = Result<(C, mpsc::Receiver<RecorderEvent>), RecordingError>>,
 {
     let Launch {
         config,
         exam_id,
-        oj_user_id,
         cookies,
         monitor,
         timing,
     } = launch;
-    let candidate_dir = config
-        .app_data_dir
-        .join("exams")
-        .join(exam_id.to_string())
-        .join(oj_user_id.to_string());
-    let journal = Journal::open(&candidate_dir).await?;
+    let (oj_user_id, phase) = monitor.enrollment(&cookies, exam_id).await?;
+    let candidate_dir = candidate_dir(&config.app_data_dir, exam_id, oj_user_id)?;
+    let journal = if phase == ExamPhase::Ended {
+        Journal::open_pending(&candidate_dir)
+            .await?
+            .ok_or(ExamError::ExamEnded)?
+    } else {
+        Journal::open(&candidate_dir).await?
+    };
     let state = resumed(journal.state());
 
     let (inbound_tx, mut inbound) = mpsc::channel(64);
@@ -147,12 +150,18 @@ where
             .await
             .map_err(|_| ExamError::WebSocket(None))??;
     let ServerMessage::Sync {
-        recording_policy, ..
+        phase,
+        recording_policy,
+        ..
     } = &sync
     else {
         return Err(ExamError::WebSocket(None));
     };
-    let (capture, recorder) = open(candidate_dir, *recording_policy)
+    // The exam may have ended since the HTTP enrollment check.
+    if *phase == ExamPhase::Ended && !journal.has_pending_finalization() {
+        return Err(ExamError::ExamEnded);
+    }
+    let (capture, recorder) = open(oj_user_id, candidate_dir, *recording_policy)
         .await
         .map_err(ExamError::Recording)?;
 
@@ -365,7 +374,9 @@ impl<C: Capture> Runtime<C> {
                             let (exam_id, oj_user_id) = (self.exam_id, self.oj_user_id);
                             // Replacing the future cancels a superseded browser update.
                             cookie_check = Some(Box::pin(async move {
-                                if monitor.enrollment(&cookies, exam_id).await? != oj_user_id {
+                                let (updated_user_id, _) =
+                                    monitor.enrollment(&cookies, exam_id).await?;
+                                if updated_user_id != oj_user_id {
                                     return Err(ExamError::Auth);
                                 }
                                 Ok(cookies)

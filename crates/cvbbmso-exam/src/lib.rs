@@ -13,7 +13,7 @@ mod journal;
 mod monitor;
 mod runtime;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cvbbmso_accoding::AccodingCookies;
 use cvbbmso_protocol::ClientState;
@@ -88,19 +88,41 @@ pub struct ExamHandle {
 }
 
 impl Exam {
+    /// Checks whether this candidate has a local journal awaiting finalization.
+    ///
+    /// Pass the verified Accoding user id from the exam list. This only reads
+    /// the journal for that candidate. A missing, ready, or finished journal
+    /// returns `false`.
+    ///
+    /// # Errors
+    /// Returns [`ExamError::Storage`] for an invalid user id or an unreadable
+    /// or invalid journal.
+    pub async fn has_pending_finalization(
+        app_data_dir: &Path,
+        exam_id: Uuid,
+        oj_user_id: i64,
+    ) -> Result<bool, ExamError> {
+        let candidate_dir = journal::candidate_dir(app_data_dir, exam_id, oj_user_id)?;
+        Ok(journal::Journal::open_pending(&candidate_dir)
+            .await?
+            .is_some())
+    }
+
     /// Establishes or resumes the runtime of `exam_id` with the given cookies.
     ///
-    /// Confirms enrollment over HTTP, opens the local data of the
+    /// Confirms enrollment and exam phase over HTTP, opens the local data of the
     /// `(exam_id, oj_user_id)` candidate, connects the WebSocket, and returns
     /// after the first `sync`. Internal tasks then keep the connection, the
     /// recording, and the event queue going.
+    /// An ended exam can only resume a pending local journal.
     ///
     /// # Errors
     ///
     /// [`ExamError::Http`] when `server_base` is not an HTTPS origin or the monitor is
     /// unreachable, [`ExamError::Auth`] / [`ExamError::NotEnrolled`] when the
-    /// session or enrollment is rejected, [`ExamError::WebSocket`] when the
-    /// connection or the first `sync` fails, [`ExamError::Storage`] and
+    /// session or enrollment is rejected, [`ExamError::ExamEnded`] when there
+    /// is no pending journal for an ended exam, [`ExamError::WebSocket`] when
+    /// the connection or the first `sync` fails, [`ExamError::Storage`] and
     /// [`ExamError::Recording`] when the local data or the recorder cannot be
     /// opened.
     pub async fn connect(
@@ -109,17 +131,17 @@ impl Exam {
         cookies: AccodingCookies,
     ) -> Result<ExamHandle, ExamError> {
         let monitor = Monitor::new(config.server_base.clone(), None)?;
-        let oj_user_id = monitor.enrollment(&cookies, exam_id).await?;
         runtime::launch(
             Launch {
                 config,
                 exam_id,
-                oj_user_id,
                 cookies,
                 monitor,
                 timing: Timing::default(),
             },
-            move |candidate_dir, policy| Recorder::open(exam_id, oj_user_id, candidate_dir, policy),
+            move |oj_user_id, candidate_dir, policy| {
+                Recorder::open(exam_id, oj_user_id, candidate_dir, policy)
+            },
         )
         .await
     }
