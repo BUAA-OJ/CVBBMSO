@@ -315,7 +315,7 @@ async fn exposes_incident_and_event_evidence_but_no_recording_when_missing() {
 }
 
 #[tokio::test]
-async fn event_pages_are_bounded_and_new_events_do_not_shift_older_cursors() {
+async fn event_pages_hide_late_arrivals_until_a_new_snapshot() {
     let fixture = Fixture::new().await;
     let exam_id = fixture.create().await;
     let base = format!("/exams/{exam_id}");
@@ -345,30 +345,65 @@ async fn event_pages_are_bounded_and_new_events_do_not_shift_older_cursors() {
     let path = format!("{base}/students/12/events");
     let (status, empty) = fixture.request(Method::GET, &path, None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(empty, json!({"items": [], "next_before": null}));
-    for seq in 1..=40 {
+    assert_eq!(
+        empty,
+        json!({"items": [], "next_before": null, "snapshot": "0"})
+    );
+    for seq in (1..=61).filter(|seq| *seq != 41) {
         append(seq).await.unwrap();
     }
     let (status, latest) = fixture.request(Method::GET, &path, None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_event_order(&latest, 21..=40);
-    assert_eq!(latest["next_before"], "21");
+    assert_event_order(&latest, 42..=61);
+    assert_eq!(latest["next_before"], "42");
+    let snapshot = latest["snapshot"].as_str().unwrap();
+    let second = format!("{path}?before=42&snapshot={snapshot}");
+    let (status, older) = fixture.request(Method::GET, &second, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_event_order(&older, 21..=40);
+    assert_eq!(older["next_before"], "21");
 
     append(41).await.unwrap();
-    let (status, refreshed) = fixture.request(Method::GET, &path, None).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_event_order(&refreshed, 22..=41);
-
+    assert_eq!(
+        fixture.request(Method::GET, &second, None).await,
+        (StatusCode::OK, older)
+    );
     let (status, older) = fixture
-        .request(Method::GET, &format!("{path}?before=21"), None)
+        .request(
+            Method::GET,
+            &format!("{path}?before=21&snapshot={snapshot}"),
+            None,
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_event_order(&older, 1..=20);
     assert!(older["next_before"].is_null());
 
-    for invalid in ["0", "-1", "9223372036854775808", "invalid"] {
+    let (status, refreshed) = fixture.request(Method::GET, &path, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let refreshed_snapshot = refreshed["snapshot"].as_str().unwrap();
+    assert_ne!(snapshot, refreshed_snapshot);
+    let (status, refreshed) = fixture
+        .request(
+            Method::GET,
+            &format!("{path}?before=42&snapshot={refreshed_snapshot}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_event_order(&refreshed, 22..=41);
+    assert_eq!(refreshed["next_before"], "22");
+
+    for invalid in [
+        "before=0&snapshot=1",
+        "before=-1&snapshot=1",
+        "before=9223372036854775808&snapshot=1",
+        "before=1",
+        "snapshot=1",
+        "before=1&snapshot=0",
+    ] {
         let (status, _) = fixture
-            .request(Method::GET, &format!("{path}?before={invalid}"), None)
+            .request(Method::GET, &format!("{path}?{invalid}"), None)
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }

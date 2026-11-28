@@ -100,6 +100,8 @@ pub enum AdminOperation {
         oj_user_id: i64,
         /// Optional exclusive upper bound on event sequence.
         before: Option<i64>,
+        /// Optional write ID watermark captured on the first page.
+        snapshot: Option<i64>,
     },
     /// Lists incidents using optional student, kind and inclusive time filters.
     IncidentsList {
@@ -169,6 +171,8 @@ pub enum AdminOutput {
         items: Vec<EventRecord>,
         /// The exclusive bound for the next older page, if any.
         next_before: Option<i64>,
+        /// Maximum write ID visible when this snapshot was created.
+        snapshot: i64,
     },
     /// The matching incidents in occurrence order.
     Incidents(Vec<IncidentRecord>),
@@ -480,12 +484,16 @@ async fn query(
             exam_id,
             oj_user_id,
             before,
+            snapshot,
         } => {
-            if before.is_some_and(|seq| seq <= 0) {
+            if before.is_some() != snapshot.is_some()
+                || before.is_some_and(|seq| seq <= 0)
+                || snapshot.is_some_and(|id| id <= 0)
+            {
                 return Err(DomainError::InvalidInput);
             }
             let key = StudentKey::new(exam_id, oj_user_id)?;
-            events(tx, &key, EventOrder::Page { before }).await
+            events(tx, &key, EventOrder::Page { before, snapshot }).await
         }
         AdminOperation::IncidentsList {
             exam_id,
@@ -570,7 +578,10 @@ impl TryFrom<Runtime> for StudentRuntime {
 #[derive(Clone, Copy)]
 enum EventOrder {
     Ascending,
-    Page { before: Option<i64> },
+    Page {
+        before: Option<i64>,
+        snapshot: Option<i64>,
+    },
 }
 
 async fn events(
@@ -582,17 +593,33 @@ async fn events(
     let query = event::Entity::find()
         .filter(event::Column::ExamId.eq(key.exam.as_str()))
         .filter(event::Column::OjUserId.eq(key.user));
-    let query = match order {
-        EventOrder::Ascending => query.order_by_asc(event::Column::Seq),
-        EventOrder::Page { before } => query
-            .apply_if(before, |query, before| {
-                query.filter(event::Column::Seq.lt(before))
-            })
-            .order_by_desc(event::Column::Seq)
-            .limit(EVENT_PAGE_SIZE as u64 + 1),
+    let (query, snapshot) = match order {
+        EventOrder::Ascending => (query.order_by_asc(event::Column::Seq), None),
+        EventOrder::Page { before, snapshot } => {
+            let snapshot = match snapshot {
+                Some(snapshot) => snapshot,
+                None => event::Entity::find()
+                    .select_only()
+                    .column(event::Column::WriteId)
+                    .order_by_desc(event::Column::WriteId)
+                    .limit(1)
+                    .into_tuple::<i64>()
+                    .one(tx)
+                    .await?
+                    .unwrap_or_default(),
+            };
+            let query = query
+                .filter(event::Column::WriteId.lte(snapshot))
+                .apply_if(before, |query, before| {
+                    query.filter(event::Column::Seq.lt(before))
+                })
+                .order_by_desc(event::Column::Seq)
+                .limit(EVENT_PAGE_SIZE as u64 + 1);
+            (query, Some(snapshot))
+        }
     };
     let mut rows = query.all(tx).await?;
-    let next_before = if matches!(order, EventOrder::Page { .. }) && rows.len() > EVENT_PAGE_SIZE {
+    let next_before = if snapshot.is_some() && rows.len() > EVENT_PAGE_SIZE {
         rows.truncate(EVENT_PAGE_SIZE);
         rows.last().map(|row| row.seq)
     } else {
@@ -610,9 +637,13 @@ async fn events(
             })
         })
         .collect::<Result<_, _>>()?;
-    Ok(match order {
-        EventOrder::Ascending => AdminOutput::Events(items),
-        EventOrder::Page { .. } => AdminOutput::EventPage { items, next_before },
+    Ok(match snapshot {
+        None => AdminOutput::Events(items),
+        Some(snapshot) => AdminOutput::EventPage {
+            items,
+            next_before,
+            snapshot,
+        },
     })
 }
 

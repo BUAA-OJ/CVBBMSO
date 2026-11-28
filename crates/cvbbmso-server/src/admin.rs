@@ -277,6 +277,7 @@ async fn events(
             exam_id,
             oj_user_id,
             before: query.before,
+            snapshot: query.snapshot,
         },
     )
     .await
@@ -374,7 +375,11 @@ async fn execute(hub: &Hub, operation: AdminOperation) -> Result<Response, Admin
                 .collect::<Vec<_>>(),
         )
         .into_response(),
-        AdminOutput::EventPage { items, next_before } => Json(EventPage {
+        AdminOutput::EventPage {
+            items,
+            next_before,
+            snapshot,
+        } => Json(EventPage {
             items: items
                 .into_iter()
                 .map(|item| Event {
@@ -384,6 +389,7 @@ async fn execute(hub: &Hub, operation: AdminOperation) -> Result<Response, Admin
                 })
                 .collect(),
             next_before: next_before.map(|seq| seq.to_string()),
+            snapshot: snapshot.to_string(),
         })
         .into_response(),
         AdminOutput::Recording(summary) => Json(summary).into_response(),

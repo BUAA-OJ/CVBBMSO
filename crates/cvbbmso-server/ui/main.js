@@ -222,7 +222,7 @@ function clearEvidence(message) {
   element("recording").textContent = message;
 }
 
-async function loadEvidence() {
+async function loadEvidence({ keepPage = false } = {}) {
   const current = selection;
   const marker = {};
   evidenceRequest = marker;
@@ -230,9 +230,13 @@ async function loadEvidence() {
   const id = element("student-select").value;
   const query = id ? `?oj_user_id=${id}` : "";
   const studentPath = `/exams/${current.id}/students/${id}`;
-  clearEvidence("正在加载…");
-  if (id) {
-    eventState = { path: `${studentPath}/events`, cursors: [null], next: null };
+  const eventPath = `${studentPath}/events`;
+  const keepEvents = keepPage && eventState?.path === eventPath;
+  if (!keepEvents) clearEvidence("正在加载…");
+  if (id && !keepEvents) {
+    eventState = { path: eventPath, cursors: [null], next: null, snapshot: null };
+    loadEventPage();
+  } else if (keepEvents) {
     loadEventPage();
   } else {
     element("events").replaceChildren(node("li", "选择一位考生以查看事件"));
@@ -265,22 +269,35 @@ function renderEventControls(state, message) {
   element("event-refresh-status").textContent = message;
 }
 
-function renderEvents(items) {
+function renderEvents(items, automatic) {
   const list = element("events");
+  const retained = new Set(items.map((item) => item.seq));
+  const outgoing = [...list.children].filter((entry) => !retained.has(entry.dataset.seq));
+  if (automatic && outgoing.some((entry) => entry.querySelector("details[open]") || entry.contains(document.activeElement))) {
+    return false;
+  }
+  if (!items.length) {
+    if (list.firstElementChild?.textContent !== "暂无上报事件") {
+      list.replaceChildren(node("li", "暂无上报事件"));
+    }
+    return true;
+  }
+  for (const entry of outgoing) entry.remove();
   const existing = new Map([...list.children].map((entry) => [entry.dataset.seq, entry]));
-  const entries = items.map((item) => {
-    if (existing.has(item.seq)) return existing.get(item.seq);
+  let position = list.firstElementChild;
+  for (const item of items) {
+    if (existing.has(item.seq)) {
+      position = existing.get(item.seq).nextElementSibling;
+      continue;
+    }
     const entry = node("li", `#${item.seq} · ${formatTime(item.received_at)}`);
     entry.dataset.seq = item.seq;
     const details = node("details");
     details.append(node("summary", item.event.kind), node("pre", JSON.stringify(item.event, null, 2)));
     entry.append(details);
-    return entry;
-  });
-  if (!entries.length) entries.push(node("li", "暂无上报事件"));
-  if (entries.length !== list.children.length || entries.some((entry, index) => entry !== list.children[index])) {
-    list.replaceChildren(...entries);
+    list.insertBefore(entry, position);
   }
+  return true;
 }
 
 async function loadEventPage(cursors, automatic = false) {
@@ -295,11 +312,16 @@ async function loadEventPage(cursors, automatic = false) {
   if (!automatic) renderEventControls(state, "正在加载事件…");
   let message = status;
   try {
-    const page = await request(state.path + (before ? `?before=${before}` : ""));
+    const query = before ? `?before=${before}&snapshot=${state.snapshot}` : "";
+    const page = await request(state.path + query);
     if (state !== eventState || marker !== state.pending) return;
-    renderEvents(page.items);
+    if (!renderEvents(page.items, automatic)) {
+      message = "有新事件 · 关闭展开详情或移开焦点后更新，也可手动刷新";
+      return;
+    }
     state.cursors = target;
     state.next = page.next_before;
+    state.snapshot = page.snapshot;
     state.loaded = true;
   } catch (error) {
     if (state !== eventState || marker !== state.pending) return;
@@ -385,8 +407,8 @@ handleForm("import-form", async (fields, form) => {
 
 element("logout").addEventListener("click", resetSession);
 element("exam-select").addEventListener("change", chooseExam);
-element("student-select").addEventListener("change", loadEvidence);
-element("refresh-evidence").addEventListener("click", loadEvidence);
+element("student-select").addEventListener("change", () => loadEvidence());
+element("refresh-evidence").addEventListener("click", () => loadEvidence({ keepPage: true }));
 element("event-latest").addEventListener("click", () => loadEventPage([null]));
 element("event-newer").addEventListener("click", () => loadEventPage(eventState.cursors.slice(0, -1)));
 element("event-older").addEventListener("click", () => loadEventPage([...eventState.cursors, eventState.next]));

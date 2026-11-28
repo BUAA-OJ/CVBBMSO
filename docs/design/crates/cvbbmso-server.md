@@ -85,7 +85,7 @@ cargo run --locked -p cvbbmso-server -- --listen-addr 127.0.0.1:8080 --database-
 
 名单合并当前报名和运行记录；`runtime: null` 代表从未连接，`runtime.connected: false` 代表有历史记录但当前离线，`enrolled: false` 代表报名已撤销但仍有运行记录。面板可见时每 5 秒轮询考生状态。可靠事件的最新页同样每 5 秒刷新，仅在浏览器页面可见且打开该考生的事件列表时轮询；历史页不自动刷新。异常和录像摘要仍按需查询，不提供录像上传、下载或播放。
 
-事件响应为 `{"items":[...],"next_before":"21"}`，没有更早事件时 `next_before` 为 `null`。默认取最新页，使用 `?before=21` 取严格小于该事件序号的下一页。游标是正 `i64` 序号，浏览器按字符串传递。
+事件响应为 `{"items":[...],"next_before":"21","snapshot":"108"}`，没有更早事件时 `next_before` 为 `null`。默认取最新页并生成新快照；翻页须同时传入同一响应的 `before` 和 `snapshot`，例如 `?before=21&snapshot=108`。这样乱序补报不会改变已打开的历史页。手动刷新保留当前历史页和快照，回到最新后才重新查询新快照。自动刷新若会移除正在展开或聚焦的事件，则推迟更新并提示；仍在列表内的行不重新挂载。
 
 管理业务错误返回 `{"code":"..."}`：`401 ADMIN_AUTH_REQUIRED`、`400 INVALID_INPUT`、`404 NOT_FOUND`、`409 CONFLICT`、`413 BODY_TOO_LARGE`、`415 JSON_REQUIRED`、`503 STORAGE_BUSY`、`500 INTERNAL_ERROR`。路径或查询参数无法解析时由 Axum 拒绝；考生端错误格式保持不变。
 

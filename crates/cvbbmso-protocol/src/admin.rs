@@ -127,6 +127,8 @@ pub struct Event {
 pub struct EventPageQuery {
     /// Optional exclusive upper bound on the event sequence.
     pub before: Option<i64>,
+    /// Write watermark from the same page as the sequence cursor.
+    pub snapshot: Option<i64>,
 }
 
 /// A page of reliable events, newest sequence first.
@@ -136,6 +138,8 @@ pub struct EventPage {
     pub items: Vec<Event>,
     /// Decimal sequence cursor for the next older page, or null at the end.
     pub next_before: Option<String>,
+    /// Decimal write watermark to reuse when requesting older pages.
+    pub snapshot: String,
 }
 
 /// Error body for a rejected admin API operation.
